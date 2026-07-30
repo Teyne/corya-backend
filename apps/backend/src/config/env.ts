@@ -9,11 +9,13 @@
  * of invalid fields — NEVER the offending value — and exits with code 1.
  *
  * ---------------------------------------------------------------------------
- * Session-1 note (backend scaffold):
- *   Supabase / Retell / SMTP variables are declared OPTIONAL here so the
- *   server can boot without them. As each subsystem is implemented in a
- *   later session, the corresponding fields MUST be promoted to required.
- *   Track the promotions in this file's header when you do it.
+ * Promotion log (variables that started optional in session 1):
+ *   - session 2 (Retell webhook):
+ *       * SUPABASE_URL          -> REQUIRED (queries.ts uses it)
+ *       * SUPABASE_SERVICE_KEY  -> REQUIRED (queries.ts uses it)
+ *       * RETELL_WEBHOOK_SECRET -> REQUIRED (routes/webhooks.ts uses it)
+ *   SMTP + RETELL_API_KEY + SUPABASE_ANON_KEY + SUPABASE_JWT_SECRET remain
+ *   optional until their respective subsystems land.
  * ---------------------------------------------------------------------------
  */
 import { existsSync } from 'node:fs';
@@ -55,15 +57,15 @@ const envSchema = z.object({
     .min(1, 'CORS_ORIGIN must be a comma-separated list of allowed origins')
     .default('http://localhost:3001'),
 
-  // ---- Supabase (optional in session 1, promote in session covering DB) ----
-  SUPABASE_URL: z.string().url().optional(),
+  // ---- Supabase (promoted in session 2 — see header) ----
+  SUPABASE_URL: z.string().url(),
   SUPABASE_ANON_KEY: z.string().min(1).optional(),
-  SUPABASE_SERVICE_KEY: z.string().min(1).optional(),
+  SUPABASE_SERVICE_KEY: z.string().min(1),
   SUPABASE_JWT_SECRET: z.string().min(1).optional(),
 
-  // ---- Retell AI (optional in session 1, promote when webhook lands) ----
+  // ---- Retell AI (webhook secret promoted in session 2) ----
   RETELL_API_KEY: z.string().min(1).optional(),
-  RETELL_WEBHOOK_SECRET: z.string().min(1).optional(),
+  RETELL_WEBHOOK_SECRET: z.string().min(1),
 
   // ---- SMTP Infomaniak (optional in session 1, promote when email lands) ----
   SMTP_HOST: z.string().min(1).optional(),

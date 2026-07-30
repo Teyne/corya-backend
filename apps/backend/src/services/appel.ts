@@ -1,0 +1,194 @@
+/**
+ * End-to-end orchestration for a validated Retell `call_analyzed` payload.
+ *
+ * Runs entirely asynchronously — the HTTP layer has already returned 200 by
+ * the time this is invoked. Any thrown error MUST be caught and logged by
+ * the caller so Retell never sees a 5xx and never retries.
+ *
+ * Steps:
+ *   1. Resolve cabinet from `to_number`
+ *   2. Extract structured fields (patient, motif, rdv) from
+ *      `call_analysis.custom_analysis_data` — best-effort, all optional
+ *   3. Insert `appels` row (idempotent on retell_call_id)
+ *   4. Enqueue jobs: generate_pdf, send_email, purge_audio_retell@+48h
+ *
+ * PII handling:
+ *   - `patient_telephone` (raw) goes into DB (purged at J+7 by DB cron)
+ *   - `numero_appelant_hash` + `numero_appelant_masque` live longer for
+ *     analytics
+ *   - Nothing PII ever transits through log messages (only field names in
+ *     structured log objects, which the logger sanitizer censors)
+ */
+import { logger } from '../config/logger.js';
+import { env } from '../config/env.js';
+import {
+  enqueueJobIdempotent,
+  findCabinetByCoryaNumber,
+  insertAppelIdempotent,
+} from '../db/queries.js';
+import type {
+  AppelInsertRow,
+  AppelResultat,
+  RetellCallAnalyzed,
+  WebhookProcessResult,
+} from '../types/index.js';
+import { hashPhoneNumber, maskPhoneNumber } from '../utils/redact.js';
+
+const KNOWN_RESULTATS: ReadonlySet<AppelResultat> = new Set<AppelResultat>([
+  'rdv_pris',
+  'message',
+  'transfere',
+  'urgence',
+  'echec',
+  'refus',
+]);
+
+function pickString(
+  bag: Record<string, unknown> | undefined,
+  key: string,
+): string | null {
+  if (!bag) return null;
+  const v = bag[key];
+  return typeof v === 'string' && v.length > 0 ? v : null;
+}
+
+function pickResultat(
+  bag: Record<string, unknown> | undefined,
+): AppelResultat | null {
+  const raw = pickString(bag, 'resultat');
+  if (!raw) return null;
+  return KNOWN_RESULTATS.has(raw as AppelResultat)
+    ? (raw as AppelResultat)
+    : null;
+}
+
+function pickIsoDate(
+  bag: Record<string, unknown> | undefined,
+  key: string,
+): string | null {
+  const raw = pickString(bag, key);
+  if (!raw) return null;
+  const d = new Date(raw);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+/**
+ * Compute audio_expires_at = date_appel + AUDIO_RETENTION_HOURS.
+ * This MUST be set at insert time; the hourly pg_cron purge relies on it.
+ */
+function computeAudioExpiresAt(dateAppelIso: string): string {
+  const d = new Date(dateAppelIso);
+  d.setUTCMilliseconds(d.getUTCMilliseconds() + env.AUDIO_RETENTION_HOURS * 3_600_000);
+  return d.toISOString();
+}
+
+export async function processCallAnalyzed(
+  payload: RetellCallAnalyzed,
+): Promise<WebhookProcessResult> {
+  const call = payload.call;
+  const correlationId = call.call_id;
+
+  // 1. Cabinet lookup ----------------------------------------------------
+  if (!call.to_number) {
+    logger.warn(
+      { retell_call_id: correlationId },
+      'webhook_missing_to_number — cannot route to cabinet',
+    );
+    return { kind: 'cabinet_not_found', toNumber: '' };
+  }
+
+  const cabinet = await findCabinetByCoryaNumber(call.to_number);
+  if (!cabinet) {
+    // to_number is a Corya-owned line, safe to log (not a patient number).
+    logger.warn(
+      { retell_call_id: correlationId, to_number: call.to_number },
+      'webhook_no_cabinet_for_to_number',
+    );
+    return { kind: 'cabinet_not_found', toNumber: call.to_number };
+  }
+
+  // 2. Extract structured fields ----------------------------------------
+  const custom = call.call_analysis?.custom_analysis_data;
+
+  const dateAppelIso = new Date(call.start_timestamp).toISOString();
+  const dureeSecondes =
+    typeof call.duration_ms === 'number'
+      ? Math.round(call.duration_ms / 1000)
+      : null;
+
+  const numeroBrut = call.from_number ?? null;
+  const numeroHash = numeroBrut ? hashPhoneNumber(numeroBrut) : null;
+  const numeroMasque = numeroBrut ? maskPhoneNumber(numeroBrut) : null;
+
+  const audioUrl = call.recording_url ?? null;
+  const audioExpiresAt = audioUrl ? computeAudioExpiresAt(dateAppelIso) : null;
+
+  const row: AppelInsertRow = {
+    cabinet_id: cabinet.id,
+    retell_call_id: call.call_id,
+    date_appel: dateAppelIso,
+    duree_secondes: dureeSecondes,
+    numero_appelant_hash: numeroHash,
+    numero_appelant_masque: numeroMasque,
+    resultat: pickResultat(custom),
+    motif_appel: pickString(custom, 'motif_appel'),
+    patient_nom: pickString(custom, 'patient_nom'),
+    patient_prenom: pickString(custom, 'patient_prenom'),
+    // Prefer the number the patient GAVE the agent (custom analysis) over the
+    // caller-ID, which may be withheld. Fall back to caller-ID otherwise.
+    patient_telephone: pickString(custom, 'patient_telephone') ?? numeroBrut,
+    rdv_date: pickIsoDate(custom, 'rdv_date'),
+    rdv_praticien: pickString(custom, 'rdv_praticien'),
+    transcript: call.transcript ?? null,
+    transcript_anonymise: null, // filled later by an analytics job
+    audio_url: audioUrl,
+    audio_expires_at: audioExpiresAt,
+  };
+
+  // 3. Idempotent insert -------------------------------------------------
+  const { appelId, duplicate } = await insertAppelIdempotent(row);
+
+  if (duplicate) {
+    logger.info(
+      { retell_call_id: correlationId, appel_id: appelId },
+      'webhook_replay_ignored',
+    );
+    return { kind: 'duplicate', retellCallId: correlationId };
+  }
+
+  // 4. Enqueue post-processing jobs -------------------------------------
+  // Order: PDF first (email needs it), then email, then audio purge.
+  // Each call is independently idempotent thanks to the unique partial
+  // index on (type, appel_id) WHERE status IN ('pending','processing').
+
+  await enqueueJobIdempotent({
+    type: 'generate_pdf',
+    appel_id: appelId,
+    payload: {},
+  });
+
+  await enqueueJobIdempotent({
+    type: 'send_email',
+    appel_id: appelId,
+    payload: { to: cabinet.email_notification },
+  });
+
+  // Retell audio purge at date_appel + AUDIO_RETENTION_HOURS.
+  await enqueueJobIdempotent({
+    type: 'purge_audio_retell',
+    appel_id: appelId,
+    payload: { retell_call_id: call.call_id },
+    run_after: computeAudioExpiresAt(dateAppelIso),
+  });
+
+  logger.info(
+    {
+      retell_call_id: correlationId,
+      appel_id: appelId,
+      cabinet_id: cabinet.id,
+    },
+    'webhook_processed',
+  );
+
+  return { kind: 'inserted', appelId, cabinetId: cabinet.id };
+}

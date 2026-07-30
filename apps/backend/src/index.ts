@@ -21,6 +21,7 @@ import express, {
 import { pinoHttp } from 'pino-http';
 import { env } from './config/env.js';
 import { logger } from './config/logger.js';
+import { webhooksRouter } from './routes/webhooks.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -61,7 +62,17 @@ app.use(
   }),
 );
 
-app.use(express.json({ limit: '1mb' }));
+// Capture the raw body Buffer for downstream signature verification
+// (Retell HMAC-SHA256). The parsed JSON still lands in `req.body` for
+// normal use; `req.rawBody` is consumed by the webhook route.
+app.use(
+  express.json({
+    limit: '1mb',
+    verify: (req, _res, buf) => {
+      (req as unknown as { rawBody: Buffer }).rawBody = Buffer.from(buf);
+    },
+  }),
+);
 
 app.use(
   pinoHttp({
@@ -79,6 +90,8 @@ app.use(
 // ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
+app.use('/webhooks', webhooksRouter);
+
 app.get('/health', (_req: Request, res: Response) => {
   res.status(200).json({
     status: 'ok',
