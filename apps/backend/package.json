@@ -14,7 +14,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint .",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "diag:retell": "tsx scripts/diagnose-retell-signature.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.111.0",
