@@ -70,7 +70,7 @@ Base : `@typescript-eslint` preset `recommended-type-checked`, plus :
 | Composant | Choix verrouillé | Alternative écartée |
 |---|---|---|
 | DB | Supabase (PostgreSQL 15 managé) | Firebase (US), Neon (US) |
-| Région | Frankfurt eu-central-1 | US, Asia |
+| Région | Zurich (Central EU), `eu-central-2` | Frankfurt, US, Asia |
 | Migrations | Supabase CLI | Prisma migrate, custom |
 | Auth | Supabase Auth | Auth0, Firebase Auth |
 | Storage | Supabase Storage | AWS S3, Cloudflare R2 |
@@ -112,7 +112,10 @@ Au démarrage, les queries sont simples. Un ORM ajoute une couche d'abstraction 
 Écosystème massif, RSC (Server Components) mature, très bonne intégration Supabase, communauté large pour dépanner. SvelteKit était considéré mais moins de composants tout faits.
 
 **Pourquoi Supabase et pas hosted Postgres + Auth0 ?**
-Supabase = DB + Auth + Storage + Realtime dans un seul service, région Frankfurt disponible, tarification prévisible. Coût zéro au démarrage.
+Supabase = DB + Auth + Storage + Realtime dans un seul service, région suisse disponible, tarification prévisible. Coût zéro au démarrage.
+
+**Pourquoi Zurich et pas Frankfurt ?**
+Choix motivé par le positionnement commercial suisse et la latence optimale pour la clientèle romande. Alternative Frankfurt écartée. Concrètement : les données médicales ne quittent jamais le territoire suisse, ce qui simplifie l'argumentaire face aux cabinets et la documentation des transferts au sens des art. 16-18 nLPD.
 
 **Pourquoi Puppeteer et pas pdfkit ?**
 Puppeteer = HTML/CSS pour le template (facile à modifier, testable dans un navigateur), qualité de rendu supérieure. Le coût mémoire du headless Chrome est acceptable pour un usage occasionnel (< 100 PDFs/heure au MVP).

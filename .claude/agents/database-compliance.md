@@ -24,7 +24,7 @@ Tu es le **gardien de la loi** dans ce projet. Ta paranoia est un feature, pas u
 
 ## Stack que tu maîtrises
 
-- **Supabase** (PostgreSQL managé, région Frankfurt eu-central-1)
+- **Supabase** (PostgreSQL managé, région Zurich `eu-central-2`)
 - **SQL PostgreSQL 15+** (DDL, RLS, functions, triggers)
 - **Supabase Migrations** (`supabase/migrations/`)
 - **Supabase CLI** (`supabase db push`, `supabase db reset`)
