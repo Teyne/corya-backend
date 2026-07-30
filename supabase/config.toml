@@ -1,0 +1,45 @@
+# Supabase project configuration — Corya
+# La région du projet distant (Zurich vs Frankfurt) est configurée côté dashboard
+# Supabase par le fondateur. Aucune référence à une région n'est codée ici.
+# Ce fichier ne contient que la configuration locale pour la CLI.
+
+project_id = "corya"
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public", "storage"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+shadow_port = 54320
+major_version = 15
+
+[db.pooler]
+enabled = false
+
+[studio]
+enabled = true
+port = 54323
+
+[inbucket]
+enabled = true
+port = 54324
+
+[storage]
+enabled = true
+file_size_limit = "50MiB"
+
+[auth]
+enabled = true
+site_url = "http://localhost:3001"
+additional_redirect_urls = ["http://localhost:3001/**"]
+jwt_expiry = 3600
+enable_signup = false
+
+[auth.email]
+enable_signup = false
+double_confirm_changes = true
+enable_confirmations = true
