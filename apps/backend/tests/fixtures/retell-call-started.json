@@ -1,0 +1,12 @@
+{
+  "event": "call_started",
+  "call": {
+    "call_id": "call_test_started_0f7d4a2e9b1c4",
+    "call_type": "phone_call",
+    "agent_id": "agent_test_abc123",
+    "agent_name": "Corya Tea Test",
+    "call_status": "ongoing",
+    "start_timestamp": 1785450205000
+  },
+  "event_timestamp": 1785450205245
+}

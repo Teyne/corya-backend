@@ -6,12 +6,58 @@
  */
 
 /**
- * The single Retell webhook event we handle today. `call_analyzed` is the
- * moment where the transcript and structured analysis are ready — we do NOT
- * subscribe to `call_ended` because it fires earlier and lacks analysis.
+ * Retell emits THREE events per phone call:
+ *   1. `call_started`  — agent picked up (no transcript/analysis)
+ *   2. `call_ended`    — call finished (still no analysis)
+ *   3. `call_analyzed` — analysis complete, transcript + custom fields ready
  *
- * Fields marked optional here reflect Retell's contract: e.g. `from_number`
- * is absent on web calls, `recording_url` may take a few seconds to appear.
+ * Only `call_analyzed` drives business logic; the other two are logged and
+ * acknowledged with 200. All three arrive on the same endpoint (see
+ * routes/webhooks.ts).
+ *
+ * Fields marked optional on `call_analyzed` reflect Retell's contract:
+ * e.g. `from_number` is absent on web calls, `recording_url` may take a few
+ * seconds to appear.
+ */
+
+/**
+ * `call_started` — minimal shape. We only rely on `call_id` for correlation
+ * logs. Any additional field Retell adds is tolerated (validation uses
+ * passthrough).
+ */
+export interface RetellCallStarted {
+  event: 'call_started';
+  call: {
+    call_id: string;
+    call_type?: 'phone_call' | 'web_call';
+    agent_id?: string;
+    agent_name?: string;
+    call_status?: string;
+    start_timestamp?: number;
+    [key: string]: unknown;
+  };
+  event_timestamp?: number;
+  [key: string]: unknown;
+}
+
+/**
+ * `call_ended` — same minimal contract as `call_started`. Kept as a distinct
+ * type to make the discriminated union in retell.ts unambiguous.
+ */
+export interface RetellCallEnded {
+  event: 'call_ended';
+  call: {
+    call_id: string;
+    call_type?: 'phone_call' | 'web_call';
+    [key: string]: unknown;
+  };
+  event_timestamp?: number;
+  [key: string]: unknown;
+}
+
+/**
+ * `call_analyzed` — the event we actually process. This IS a strict shape:
+ * anything the backend reads is validated by zod.
  */
 export interface RetellCallAnalyzed {
   event: 'call_analyzed';
@@ -37,6 +83,12 @@ export interface RetellCallAnalyzed {
     };
   };
 }
+
+/** Discriminated union of every Retell event we accept. */
+export type RetellWebhookEvent =
+  | RetellCallStarted
+  | RetellCallEnded
+  | RetellCallAnalyzed;
 
 /**
  * Result of a webhook processing run. Purely for internal logging + tests;

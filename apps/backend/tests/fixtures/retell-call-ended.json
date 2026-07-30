@@ -1,0 +1,13 @@
+{
+  "event": "call_ended",
+  "call": {
+    "call_id": "call_test_ended_0f7d4a2e9b1c4",
+    "call_type": "phone_call",
+    "agent_id": "agent_test_abc123",
+    "call_status": "ended",
+    "start_timestamp": 1785450205000,
+    "end_timestamp": 1785450297345,
+    "disconnect_reason": "user_hangup"
+  },
+  "event_timestamp": 1785450297500
+}

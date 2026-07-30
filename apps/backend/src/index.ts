@@ -22,6 +22,7 @@ import { pinoHttp } from 'pino-http';
 import { env } from './config/env.js';
 import { logger } from './config/logger.js';
 import { webhooksRouter } from './routes/webhooks.js';
+import { logRetellSecretSourceOnce } from './services/retell.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -134,6 +135,10 @@ if (isEntryPoint) {
       { port: env.PORT, env: env.NODE_ENV, version },
       'corya-backend listening',
     );
+    // Emit the "which secret are we signing with?" log EXACTLY ONCE per
+    // process (not per request). Placed here so it appears right after the
+    // listening line — easy to spot in Jelastic logs.
+    logRetellSecretSourceOnce();
   });
 
   const shutdown = (signal: NodeJS.Signals): void => {
