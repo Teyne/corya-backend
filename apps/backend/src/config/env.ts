@@ -13,9 +13,14 @@
  *   - session 2 (Retell webhook):
  *       * SUPABASE_URL          -> REQUIRED (queries.ts uses it)
  *       * SUPABASE_SERVICE_KEY  -> REQUIRED (queries.ts uses it)
- *       * RETELL_WEBHOOK_SECRET -> REQUIRED (routes/webhooks.ts uses it)
- *   SMTP + RETELL_API_KEY + SUPABASE_ANON_KEY + SUPABASE_JWT_SECRET remain
- *   optional until their respective subsystems land.
+ *   - session 2.1 (real Retell traffic captured via ngrok):
+ *       * RETELL_WEBHOOK_SECRET AND RETELL_API_KEY are BOTH optional in
+ *         isolation, but the superRefine at the bottom of the schema
+ *         requires AT LEAST ONE of them. The signature verifier picks
+ *         whichever is set (webhook secret first, api key as fallback).
+ *       * RETELL_SIGNATURE_MAX_AGE_SECONDS added (default 300).
+ *   SMTP + SUPABASE_ANON_KEY + SUPABASE_JWT_SECRET remain optional until
+ *   their respective subsystems land.
  * ---------------------------------------------------------------------------
  */
 import { existsSync } from 'node:fs';
@@ -63,9 +68,24 @@ const envSchema = z.object({
   SUPABASE_SERVICE_KEY: z.string().min(1),
   SUPABASE_JWT_SECRET: z.string().min(1).optional(),
 
-  // ---- Retell AI (webhook secret promoted in session 2) ----
+  // ---- Retell AI --------------------------------------------------------
+  // Both secrets are individually OPTIONAL in the schema, but the refinement
+  // below (see envSchema.superRefine) requires that AT LEAST ONE of them be
+  // present. Rationale: modern Retell accounts sign webhooks with
+  // RETELL_WEBHOOK_SECRET, legacy accounts (and Retell's own SDK examples)
+  // sign with RETELL_API_KEY. The signature service picks whichever is set,
+  // preferring the webhook secret.
   RETELL_API_KEY: z.string().min(1).optional(),
-  RETELL_WEBHOOK_SECRET: z.string().min(1),
+  RETELL_WEBHOOK_SECRET: z.string().min(1).optional(),
+  // Anti-replay window in SECONDS (bidirectional). 5 min default matches
+  // Retell's own guidance and Stripe convention. Bounded to avoid a typo
+  // silently disabling replay protection.
+  RETELL_SIGNATURE_MAX_AGE_SECONDS: z.coerce
+    .number()
+    .int()
+    .min(30)
+    .max(3600)
+    .default(300),
 
   // ---- SMTP Infomaniak (optional in session 1, promote when email lands) ----
   SMTP_HOST: z.string().min(1).optional(),
@@ -80,6 +100,30 @@ const envSchema = z.object({
   AUDIO_RETENTION_HOURS: z.coerce.number().int().positive().max(72).default(48),
   TRANSCRIPT_RETENTION_DAYS: z.coerce.number().int().positive().max(30).default(7),
   APPEL_RETENTION_MONTHS: z.coerce.number().int().positive().max(60).default(24),
+}).superRefine((cfg, ctx) => {
+  // At least one Retell secret must be configured. See RETELL_* comment
+  // above for the two-signing-conventions rationale.
+  const hasWebhookSecret =
+    typeof cfg.RETELL_WEBHOOK_SECRET === 'string' &&
+    cfg.RETELL_WEBHOOK_SECRET.length > 0;
+  const hasApiKey =
+    typeof cfg.RETELL_API_KEY === 'string' && cfg.RETELL_API_KEY.length > 0;
+  if (!hasWebhookSecret && !hasApiKey) {
+    ctx.addIssue({
+      code: 'custom',
+      // Point at both fields so the error message from parseEnvOrDie names
+      // both — makes fixing the .env obvious.
+      path: ['RETELL_WEBHOOK_SECRET'],
+      message:
+        'either RETELL_WEBHOOK_SECRET or RETELL_API_KEY must be set (webhook signature verification needs one)',
+    });
+    ctx.addIssue({
+      code: 'custom',
+      path: ['RETELL_API_KEY'],
+      message:
+        'either RETELL_WEBHOOK_SECRET or RETELL_API_KEY must be set (webhook signature verification needs one)',
+    });
+  }
 });
 
 export type Env = z.infer<typeof envSchema>;
