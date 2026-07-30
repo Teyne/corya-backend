@@ -37,6 +37,10 @@ export const version: string = pkg.version;
 // ---------------------------------------------------------------------------
 export const app = express();
 
+// Do not advertise the framework. Removes the `x-powered-by: Express`
+// response header on every route. Cheap defence-in-depth.
+app.disable('x-powered-by');
+
 // CORS: origin comes from env, comma-separated list, no wildcard tolerated.
 const allowedOrigins = env.CORS_ORIGIN.split(',')
   .map((o) => o.trim())
