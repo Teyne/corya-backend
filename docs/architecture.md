@@ -13,7 +13,7 @@ Corya est une plateforme d'accueil téléphonique IA pour cabinets médicaux rom
 | `app.corya.ch` | Back-office admin interne | Next.js 14 | `frontend-admin` |
 | `crm.corya.ch` | CRM prospection interne | Lovable app | Non couvert ici |
 | `status.corya.ch` | Page publique de statut | BetterStack | Non couvert ici |
-| Supabase (Frankfurt) | DB + Auth + Storage | PostgreSQL 15 | `database-compliance` |
+| Supabase (Zurich) | DB + Auth + Storage | PostgreSQL 15 | `database-compliance` |
 
 ## Flux principal : un appel entrant
 

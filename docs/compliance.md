@@ -120,7 +120,7 @@ Corya utilise des sous-traitants pour le traitement. **Un DPA (Data Processing A
 |---|---|---|---|
 | Retell AI | Traitement voice/LLM | US (mais offre EU processing) | Obligatoire |
 | Peoplefone | Téléphonie SIP | Suisse | Obligatoire |
-| Supabase | DB + Storage + Auth | Frankfurt | Obligatoire |
+| Supabase | DB + Storage + Auth | Zurich (CH) | Obligatoire |
 | Infomaniak | Hébergement + email | Suisse | Obligatoire |
 | MessageBird / Twilio | SMS | EU / US | Obligatoire |
 | BetterStack | Monitoring | EU | Obligatoire |

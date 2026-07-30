@@ -72,7 +72,7 @@ Ces éléments sont hors périmètre des agents Claude Code — à faire manuell
 ### Comptes à créer
 - [ ] Retell AI : compte + agent basique
 - [ ] Peoplefone : compte + numéro 032 + SIP trunk vers Retell
-- [ ] Supabase : projet Frankfurt + service key notée
+- [ ] Supabase : projet Zurich (`eu-central-2`) + service key notée
 - [ ] Infomaniak : Jelastic env Node.js + Mail Pro (noreply@corya.ch)
 - [ ] BetterStack : monitors sur api.corya.ch et app.corya.ch
 - [ ] GitHub : repo privé + secrets pour CI/CD

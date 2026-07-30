@@ -34,6 +34,8 @@ Avant chaque tâche, lis systématiquement :
 
 ## Structure du projet backend
 
+Le repo est un monorepo. **Tout le backend vit sous `apps/backend/`** (décision validée par le fondateur, session 1). Les chemins ci-dessous sont donc relatifs à `apps/backend/`.
+
 ```
 src/
 ├── index.ts                    # Point d'entrée Express
