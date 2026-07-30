@@ -10,3 +10,10 @@ process.env.PORT ??= '3000'; // tests use supertest without listen(), value unus
 process.env.APP_BASE_URL ??= 'http://localhost:3000';
 process.env.LOG_LEVEL ??= 'silent';
 process.env.CORS_ORIGIN ??= 'http://localhost:3001';
+
+// -- Session 2 promotions: these are required at boot, dummy values suffice
+// because tests either mock the DB layer or the crypto helpers. NEVER put
+// real credentials here.
+process.env.SUPABASE_URL ??= 'http://localhost:54321';
+process.env.SUPABASE_SERVICE_KEY ??= 'test-service-key-not-real';
+process.env.RETELL_WEBHOOK_SECRET ??= 'test-retell-secret-not-real';
