@@ -254,7 +254,10 @@ ALTER TABLE public.admin_users   ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.logs_actions  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.jobs          ENABLE ROW LEVEL SECURITY;
 
--- 5.1 cabinets : CRUD admin (le DELETE reste possible mais audité via logs_actions).
+-- 5.1 cabinets : SELECT / INSERT / UPDATE pour les admins.
+-- Pas de policy DELETE : la suppression d'un cabinet est donc REFUSÉE côté client
+-- (deny by default). Elle passe obligatoirement par le service_role, et cascade
+-- sur ses appels — d'où le choix de ne pas l'exposer au back-office.
 CREATE POLICY "Admins can read cabinets" ON public.cabinets
   FOR SELECT TO authenticated USING (public.is_admin_user());
 
