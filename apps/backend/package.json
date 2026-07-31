@@ -9,21 +9,26 @@
   },
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsc -p tsconfig.build.json",
+    "worker": "node dist/worker.js",
+    "worker:dev": "tsx watch src/worker.ts",
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-templates.mjs",
     "start": "node dist/index.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint .",
     "type-check": "tsc --noEmit",
-    "diag:retell": "tsx scripts/diagnose-retell-signature.ts"
+    "diag:retell": "tsx scripts/diagnose-retell-signature.ts",
+    "test:email-pipeline": "tsx scripts/test-email-pipeline.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.111.0",
     "cors": "^2.8.5",
     "dotenv": "^17.0.0",
     "express": "^5.0.0",
+    "nodemailer": "^9.0.3",
     "pino": "^10.0.0",
     "pino-http": "^11.0.0",
+    "puppeteer": "^25.4.0",
     "retell-sdk": "^5.53.0",
     "zod": "^4.0.0"
   },
@@ -31,6 +36,7 @@
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.0",
     "@types/node": "^24.0.0",
+    "@types/nodemailer": "^8.0.1",
     "@types/supertest": "^7.0.0",
     "eslint": "^10.0.0",
     "pino-pretty": "^13.0.0",
@@ -39,5 +45,9 @@
     "typescript": "^5.6.0",
     "typescript-eslint": "^8.0.0",
     "vitest": "^3.0.0"
+  },
+  "allowScripts": {
+    "puppeteer@25.4.0": true,
+    "esbuild@0.28.1": true
   }
 }

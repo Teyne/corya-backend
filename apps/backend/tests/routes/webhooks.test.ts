@@ -35,6 +35,7 @@ const cabinetRow = {
   id: '11111111-1111-1111-1111-111111111111',
   numero_corya: '+41215550100',
   email_notification: 'ops@corya.example',
+  email_notification_cc: null,
 };
 
 const insertedAppels = new Map<string, string>(); // retell_call_id -> appelId
@@ -264,25 +265,29 @@ describe('POST /webhooks/retell/call-ended — authenticated but unusable', () =
 // call_analyzed happy path
 // ---------------------------------------------------------------------------
 describe('POST /webhooks/retell/call-ended — call_analyzed', () => {
-  it('accepts a valid signed payload and enqueues 3 jobs', async () => {
+  it('accepts a valid signed payload and enqueues 2 jobs (process_appel + purge_audio_retell)', async () => {
+    // Session 3 change: the historical 3-job split (generate_pdf +
+    // send_email + purge_audio_retell) was collapsed into ONE monolithic
+    // `process_appel` job that runs the pipeline PDF -> upload -> email
+    // with per-step checkpoints in its payload. The audio purge stays a
+    // separate job because it fires at +48 h.
     mockSdkVerify.mockResolvedValue(true);
     const res = await postWebhook(fixtureAnalyzed, placeholderSignature());
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ received: true, event: 'call_analyzed' });
 
     await waitForAsyncProcessing();
-    // Give the microtasks that follow enqueue #1 time to enqueue #2 and #3.
+    // Give the microtasks that follow enqueue #1 time to enqueue #2.
     await vi.waitFor(
       () => {
-        if (enqueuedJobs.length < 3) throw new Error('waiting');
+        if (enqueuedJobs.length < 2) throw new Error('waiting');
       },
       { timeout: 2000, interval: 10 },
     );
 
     expect(enqueuedJobs.map((j) => j.type).sort()).toEqual([
-      'generate_pdf',
+      'process_appel',
       'purge_audio_retell',
-      'send_email',
     ]);
   });
 
@@ -293,7 +298,7 @@ describe('POST /webhooks/retell/call-ended — call_analyzed', () => {
     expect(res1.status).toBe(200);
     await vi.waitFor(
       () => {
-        if (enqueuedJobs.length < 3) throw new Error('waiting');
+        if (enqueuedJobs.length < 2) throw new Error('waiting');
       },
       { timeout: 2000, interval: 10 },
     );
@@ -301,7 +306,7 @@ describe('POST /webhooks/retell/call-ended — call_analyzed', () => {
     const jobsAfterFirst = enqueuedJobs.length;
     const appelsAfterFirst = insertedAppels.size;
     expect(appelsAfterFirst).toBe(1);
-    expect(jobsAfterFirst).toBe(3);
+    expect(jobsAfterFirst).toBe(2);
 
     // Replay: same body, fresh signature.
     const res2 = await postWebhook(fixtureAnalyzed, placeholderSignature());

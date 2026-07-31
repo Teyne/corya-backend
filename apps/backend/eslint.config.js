@@ -7,7 +7,10 @@ import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
   {
-    ignores: ['dist/**', 'node_modules/**', 'coverage/**'],
+    // scripts/copy-templates.mjs is a plain post-build helper (no TS
+    // parsing needed) — excluded so the typed lint stack doesn't complain
+    // about it living outside the TS project graph.
+    ignores: ['dist/**', 'node_modules/**', 'coverage/**', 'scripts/**/*.mjs'],
   },
   ...tseslint.configs.recommendedTypeChecked,
   {

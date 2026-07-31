@@ -136,15 +136,131 @@ export type AppelResultat =
   | 'echec'
   | 'refus';
 
+/**
+ * All job type discriminators accepted by the `jobs.type` CHECK constraint.
+ *
+ * Historical values (`process_call`, `generate_pdf`, `send_email`) are kept
+ * for backwards compatibility with rows possibly still present in the DB from
+ * earlier sessions. `process_appel` is the current canonical value: a single
+ * monolithic job that runs the full post-call pipeline (PDF -> Storage
+ * upload -> email), with per-step checkpoints in its `payload` for
+ * idempotency at retry.
+ *
+ * `purge_audio_retell` remains a distinct job scheduled ~48 h after the call.
+ */
 export type JobType =
   | 'process_call'
   | 'generate_pdf'
   | 'send_email'
-  | 'purge_audio_retell';
+  | 'purge_audio_retell'
+  | 'process_appel';
 
 export interface JobInsertRow {
   type: JobType;
   appel_id: string;
   payload: Record<string, unknown>;
   run_after?: string; // ISO 8601, defaults to NOW() server-side if omitted
+}
+
+/**
+ * A row returned by the `claim_jobs` RPC — mirrors `public.jobs`.
+ *
+ * The RPC already flipped `status` to `'processing'` and INCREMENTED
+ * `attempts`, so this value reflects the post-claim state. The worker uses
+ * `attempts` directly for its backoff computation.
+ */
+export interface Job {
+  id: string;
+  type: JobType;
+  appel_id: string;
+  payload: Record<string, unknown>;
+  status: 'pending' | 'processing' | 'succeeded' | 'failed' | 'dead_letter';
+  attempts: number;
+  max_attempts: number;
+  run_after: string;
+  locked_at: string | null;
+  locked_by: string | null;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * A row from `public.cabinets` — only the columns the worker reads.
+ * `statut` gates whether the pipeline actually runs (paused/terminated
+ * cabinets short-circuit successfully with no PDF and no email).
+ */
+export interface CabinetProcessingRow {
+  id: string;
+  nom: string;
+  email_notification: string;
+  email_notification_cc: string | null;
+  statut: 'actif' | 'pause' | 'resilie';
+}
+
+/**
+ * A row from `public.appels` — only the columns the worker reads (i.e. the
+ * data the PDF and the email need). Purposefully NOT re-exporting the full
+ * shape: the worker must never fetch or hold on to fields it does not need.
+ */
+export interface AppelProcessingRow {
+  id: string;
+  cabinet_id: string;
+  retell_call_id: string;
+  date_appel: string;
+  duree_secondes: number | null;
+  resultat: AppelResultat | null;
+  motif_appel: string | null;
+  patient_nom: string | null;
+  patient_prenom: string | null;
+  patient_telephone: string | null;
+  rdv_date: string | null;
+  rdv_praticien: string | null;
+  transcript: string | null;
+  pdf_url: string | null;
+  email_status: 'pending' | 'sent' | 'failed' | 'bounced';
+}
+
+/**
+ * ---------------------------------------------------------------------------
+ * `process_appel` job payload — persistent checkpoint schema
+ * ---------------------------------------------------------------------------
+ *
+ * Written into `jobs.payload` (JSONB). Every field is OPTIONAL because a
+ * retry may find the row in any intermediate state, including the very first
+ * shape produced by the webhook handler (`{ to, cc, version: 1 }`).
+ *
+ * Idempotence contract, in order:
+ *   1. If `steps.pdf_uploaded_at` is set AND `steps.storage_path` is set,
+ *      SKIP PDF generation and Storage upload.
+ *   2. If `steps.email_sent_at` is set, SKIP the email send. Combined with
+ *      the defence-in-depth read on `appels.email_status === 'sent'`, an
+ *      email is NEVER sent twice for the same appel.
+ *
+ * We deliberately store a MONOTONIC schema version so a future breaking
+ * change is a schema bump rather than a silent shape drift. Missing
+ * `version` is treated as v1 for graceful reads.
+ */
+export interface ProcessAppelPayload {
+  /** Payload schema version. Missing = 1. Bump on breaking changes. */
+  version?: number;
+  /** Primary recipient of the email (cabinet.email_notification). */
+  to?: string;
+  /** Optional CC recipient (cabinet.email_notification_cc). */
+  cc?: string | null;
+  /** Progress checkpoints — see file-level idempotence contract. */
+  steps?: {
+    /** ISO timestamp when the PDF was uploaded to Supabase Storage. */
+    pdf_uploaded_at?: string;
+    /** Storage object path — `{cabinet_id}/{yyyy-mm}/{appel_id}.pdf`. */
+    storage_path?: string;
+    /** ISO timestamp when the email was successfully accepted by SMTP. */
+    email_sent_at?: string;
+  };
+  /**
+   * Index signature to allow this interface to satisfy JSONB Record shapes
+   * expected by `JobInsertRow.payload`. Only the fields above are read by
+   * the pipeline — extras are tolerated (forward-compat).
+   */
+  [key: string]: unknown;
 }

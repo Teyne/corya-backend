@@ -35,15 +35,24 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // Try to load env files in priority order. `override: false` keeps whatever
 // the shell already exported. Missing files are silently ignored.
+//
+// nLPD compliance (session 3.1 audit): in TEST mode we DO NOT load
+// `.env.local`. Real SMTP passwords / Supabase keys would otherwise sit
+// in-process during the test run — harmless when tests mock the DB and
+// SMTP (as ours do), but a stray console.log or a crash dump on CI would
+// exfiltrate them. Tests supply dummy values via `tests/setup.ts` and MUST
+// remain green without any .env.local present.
 const backendRoot = resolve(__dirname, '..', '..'); // apps/backend
 const monorepoRoot = resolve(backendRoot, '..', '..'); // <repo root>
 
-for (const candidate of [
-  resolve(backendRoot, '.env.local'),
-  resolve(monorepoRoot, '.env.local'),
-]) {
-  if (existsSync(candidate)) {
-    dotenv.config({ path: candidate, override: false });
+if (process.env.NODE_ENV !== 'test') {
+  for (const candidate of [
+    resolve(backendRoot, '.env.local'),
+    resolve(monorepoRoot, '.env.local'),
+  ]) {
+    if (existsSync(candidate)) {
+      dotenv.config({ path: candidate, override: false });
+    }
   }
 }
 
@@ -105,6 +114,24 @@ const envSchema = z.object({
   AUDIO_RETENTION_HOURS: z.coerce.number().int().positive().max(72).default(48),
   TRANSCRIPT_RETENTION_DAYS: z.coerce.number().int().positive().max(30).default(7),
   APPEL_RETENTION_MONTHS: z.coerce.number().int().positive().max(60).default(24),
+
+  // ---- Worker (session 3 — post-call pipeline: PDF -> upload -> email) ----
+  // Optional stable identifier for a worker instance. Written to jobs.locked_by
+  // when a job is claimed so a stuck-worker inspection tells you which node was
+  // running it. Auto-generated if not provided.
+  WORKER_ID: z.string().min(1).optional(),
+  // How often the worker polls the DB for new jobs. Kept low because Retell
+  // gives us a ~10s budget end-to-end for the email; a slow poll would push
+  // the SLA on its own. After a non-empty batch the worker re-drains
+  // immediately without waiting for this interval.
+  JOB_POLL_INTERVAL_MS: z.coerce.number().int().min(100).max(60_000).default(2_000),
+  // How many jobs the worker claims in a single RPC call. Bounded by DB row
+  // lock contention: 5 gives us parallelism without holding too many locks.
+  JOB_BATCH_SIZE: z.coerce.number().int().min(1).max(50).default(5),
+  // URL prefix the email links point to for a "view details" call-to-action
+  // in the admin back-office. Falls back to APP_BASE_URL when the back-office
+  // still runs on the same origin as the API (dev).
+  ADMIN_APP_URL: z.string().url().default('http://localhost:3001'),
 });
 
 export type Env = z.infer<typeof envSchema>;

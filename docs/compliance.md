@@ -91,15 +91,34 @@ Aucune configuration d'agent Retell ne peut désactiver cette annonce. C'est un 
 
 | Donnée | Durée maximale | Automatisme |
 |---|---|---|
-| Enregistrement audio | 48h | Purge horaire via pg_cron |
-| Transcript complet | 7 jours | Anonymisation quotidienne (3h du matin) |
+| Enregistrement audio | 48h | Purge horaire via pg_cron (`purge_expired_audio`) |
+| Transcript complet | 7 jours | Anonymisation quotidienne à 03:00 UTC (`anonymize_old_transcripts`) |
 | Nom/prénom patient | 7 jours | Anonymisation quotidienne |
 | Téléphone patient | 7 jours | Anonymisation quotidienne |
 | Transcript anonymisé | 24 mois | Purge mensuelle |
-| Métadonnées appel (durée, résultat) | 24 mois | Purge mensuelle |
-| PDF récap | 24 mois | Purge mensuelle avec l'appel |
+| Métadonnées appel (durée, résultat) | 24 mois | Purge mensuelle (`purge_ancient_appels`) |
+| PDF récap | **30 jours max après création de l'appel** (voir détail ci-dessous) | Purge quotidienne à 03:30 UTC (`purge_old_pdfs`) |
 | Logs applicatifs (sans données perso) | 12 mois | Rotation BetterStack |
 | Logs audit (`logs_actions`) | 24 mois | Purge mensuelle |
+
+### PDF récap — précisions sur la rétention 30 jours
+
+Le PDF récap contient l'intégralité des données patient de l'appel (nom, prénom, téléphone, motif, transcript verbatim). Il est **plus riche** que la ligne `appels` correspondante, dont les champs patient et le `transcript` brut sont anonymisés dès **J+7** par `anonymize_old_transcripts`. Conserver le PDF au-delà perpétuerait, sous forme binaire dans Storage, exactement ce que la purge J+7 efface en base.
+
+Règle appliquée depuis les migrations `20260731100000_job_claim_and_pdf_purge.sql` et `20260731110000_purge_old_pdfs_cover_unsent.sql` :
+
+- **Cas nominal** — email récap envoyé avec succès : le PDF est purgé **30 jours après `pdf_envoye_at`** (motif d'audit `pdf_purged_30d`).
+- **Cas dégradé** — email jamais parti (job `process_appel` en `dead_letter` sur défaillance SMTP prolongée) : le PDF est purgé **30 jours après `appels.created_at`** (motif d'audit distinct `pdf_purged_30d_unsent`, qui permet de détecter en revue les vagues d'échecs SMTP).
+- **Garantie borne dure** : aucun PDF ne survit plus de 30 jours après la création de l'appel, quel que soit le sort de l'email. Cette borne évite qu'un job bloqué en dead_letter n'orphelinise un PDF jusqu'à `purge_ancient_appels` (24 mois).
+- Purge en deux temps via `file_deletions_outbox` : la fonction SQL enfile un ordre de suppression Storage et met `appels.pdf_url` à NULL ; le worker backend consomme l'outbox et supprime le binaire côté bucket, horodatant `deleted_at` comme preuve d'audit.
+
+Statut du PDF vis-à-vis du patient :
+
+- Le PDF n'est **PAS un livrable long terme destiné au patient**. C'est un artefact opérationnel destiné au cabinet (traitement du dossier, prise de RDV, rappel).
+- Le patient qui exerce son droit d'accès (art. 25 nLPD) reçoit ce que Corya détient au moment de la demande. Après J+30 il ne reste plus, côté Corya, que la ligne `appels` avec le `transcript_anonymise` et des métadonnées non identifiantes. Ceci est cohérent avec le principe de minimisation (art. 6 nLPD) et documenté dans la politique de confidentialité.
+- Si le cabinet veut conserver plus longtemps le récap, il télécharge le PDF depuis l'email dans la fenêtre de 30 jours et le stocke dans son propre système (le cabinet, en tant que responsable de traitement, choisit sa propre durée de conservation).
+
+Pour une extension future qui offrirait au patient un espace de consultation persistant, prévoir un flux séparé avec un contenu anonymisé aligné sur ce qui reste en base à J+7.
 
 ### Ce qui ne doit JAMAIS être loggé
 
