@@ -1,15 +1,36 @@
+/**
+ * Tests d'intégration — POST /webhooks/retell/call-ended
+ *
+ * Session 2.2 : la vérification HMAC est déléguée au SDK officiel
+ * `retell-sdk`. Ici on MOCKE le SDK au niveau du module, ce qui nous permet
+ * de :
+ *   - décider test par test si la signature est acceptée ou rejetée
+ *   - vérifier que **un rejet du SDK produit un 401**, jamais un 200
+ *     (le test-clé pour garantir qu'on n'a pas transformé une porte
+ *     fermée en porte ouverte lors de la migration)
+ *   - conserver les tests de discrimination d'événements et la politique
+ *     de codes HTTP (200 pour tout ce qui est authentifié)
+ *
+ * On garde le mock DB in-memory pour prouver que les événements
+ * notification-only et les événements inconnus ne touchent PAS la DB.
+ */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createHmac } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import request from 'supertest';
 
-// --- Mock the DB layer BEFORE importing the app graph -----------------------
-// The webhook handler enqueues jobs via db/queries.ts. We keep in-memory
-// spies here to assert idempotence and to prove that call_started /
-// call_ended events do NOT touch the DB.
+// --- Mocks positionnés AVANT tout import du graphe de l'app ----------------
 
+// 1. Mock du SDK Retell. Par défaut, chaque test devra explicitement dire
+//    ce que le SDK renvoie via `mockSdkVerify.mockResolvedValueOnce(...)`.
+//    Si un test oublie de le faire, l'appel renverra `undefined` (falsy)
+//    et sera traité comme un rejet — ce qui protège contre les faux positifs.
+vi.mock('retell-sdk', () => ({
+  verify: vi.fn(),
+}));
+
+// 2. Mock DB (in-memory) — inchangé par rapport à la version précédente.
 const cabinetRow = {
   id: '11111111-1111-1111-1111-111111111111',
   numero_corya: '+41215550100',
@@ -45,8 +66,11 @@ vi.mock('../../src/db/queries.js', () => {
   };
 });
 
+// Import APRÈS les mocks.
 const { app } = await import('../../src/index.js');
 const queries = await import('../../src/db/queries.js');
+const { verify: sdkVerify } = await import('retell-sdk');
+const mockSdkVerify = vi.mocked(sdkVerify);
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixturesDir = resolve(__dirname, '..', 'fixtures');
@@ -63,22 +87,15 @@ const fixtureEnded = readFileSync(
   'utf8',
 );
 
-const SECRET = process.env.RETELL_WEBHOOK_SECRET ?? 'test-retell-secret-not-real';
-
 /**
- * Build a valid `X-Retell-Signature` header value:
- *   `v=<timestampMs>,d=<hmacSha256Hex(secret, `${ts}.${rawBody}`)>`.
+ * Placeholder signature — la vérification étant mockée, le contenu de
+ * l'en-tête est indifférent tant que le mock répond `true`. On garde un
+ * format ressemblant au vrai pour ne pas déclencher le contrôle de
+ * fraîcheur maison (qui rejetterait avant même d'appeler le SDK si le
+ * timestamp était hors fenêtre).
  */
-function signHeader(
-  bodyRaw: string,
-  opts?: { secret?: string; timestampMs?: number },
-): string {
-  const secret = opts?.secret ?? SECRET;
-  const ts = opts?.timestampMs ?? Date.now();
-  const digest = createHmac('sha256', secret)
-    .update(`${ts}.${bodyRaw}`)
-    .digest('hex');
-  return `v=${ts},d=${digest}`;
+function placeholderSignature(): string {
+  return `v=${Date.now()},d=${'a'.repeat(64)}`;
 }
 
 async function postWebhook(bodyRaw: string, signature?: string) {
@@ -92,8 +109,6 @@ async function postWebhook(bodyRaw: string, signature?: string) {
 }
 
 async function waitForAsyncProcessing(): Promise<void> {
-  // The handler processes asynchronously after responding 200. Poll the
-  // enqueue mock until it has been called for the current call.
   await vi.waitFor(
     () => {
       const called = (queries.enqueueJobIdempotent as unknown as {
@@ -111,61 +126,76 @@ beforeEach(() => {
   vi.mocked(queries.findCabinetByCoryaNumber).mockClear();
   vi.mocked(queries.insertAppelIdempotent).mockClear();
   vi.mocked(queries.enqueueJobIdempotent).mockClear();
+  mockSdkVerify.mockReset();
 });
 
 afterEach(() => {
   vi.clearAllMocks();
 });
 
+// ---------------------------------------------------------------------------
+// Signature layer
+// ---------------------------------------------------------------------------
 describe('POST /webhooks/retell/call-ended — signature layer', () => {
-  it('rejects a request without signature (401)', async () => {
+  it('rejects a request without signature header (401)', async () => {
+    // No signature → verifyRetellSignature delegates to SDK with empty
+    // signature; SDK returns false; route returns 401.
+    mockSdkVerify.mockResolvedValue(false);
     const res = await postWebhook(fixtureAnalyzed);
     expect(res.status).toBe(401);
     expect(vi.mocked(queries.insertAppelIdempotent)).not.toHaveBeenCalled();
   });
 
-  it('rejects a signature in the OLD raw-hex format (401)', async () => {
-    const rawHex = createHmac('sha256', SECRET)
-      .update(fixtureAnalyzed)
-      .digest('hex');
-    const res = await postWebhook(fixtureAnalyzed, rawHex);
+  it('returns 401 (NOT 200) when the SDK rejects the signature', async () => {
+    // MIGRATION-CRITICAL: this is the test that guarantees we did not
+    // turn a closed door into an open one during the SDK migration.
+    // A rejection by the SDK MUST propagate to a 401 — never 200.
+    mockSdkVerify.mockResolvedValue(false);
+    const res = await postWebhook(fixtureAnalyzed, placeholderSignature());
     expect(res.status).toBe(401);
+    expect(res.body).toEqual({ error: 'invalid_signature' });
     expect(vi.mocked(queries.insertAppelIdempotent)).not.toHaveBeenCalled();
+    expect(vi.mocked(queries.enqueueJobIdempotent)).not.toHaveBeenCalled();
   });
 
-  it('rejects a malformed signature header (401)', async () => {
-    const res = await postWebhook(fixtureAnalyzed, 'deadbeef');
+  it('returns 401 (short-circuits SDK) when the timestamp is out of window with a known-format header', async () => {
+    // The freshness guard fires BEFORE the SDK, so mockSdkVerify must NOT
+    // be called. This is defence in depth: even if the SDK accepted a
+    // stale signature, we would reject it ourselves.
+    mockSdkVerify.mockResolvedValue(true);
+    const stale = `v=${Date.now() - 10 * 60 * 1000},d=${'a'.repeat(64)}`;
+    const res = await postWebhook(fixtureAnalyzed, stale);
     expect(res.status).toBe(401);
-    expect(vi.mocked(queries.insertAppelIdempotent)).not.toHaveBeenCalled();
+    expect(mockSdkVerify).not.toHaveBeenCalled();
   });
 
-  it('rejects a signature with a stale timestamp (> 5 min old) (401)', async () => {
-    const staleTs = Date.now() - 10 * 60 * 1000;
-    const res = await postWebhook(
-      fixtureAnalyzed,
-      signHeader(fixtureAnalyzed, { timestampMs: staleTs }),
-    );
+  it('returns 401 for a future-dated timestamp with a known-format header', async () => {
+    mockSdkVerify.mockResolvedValue(true);
+    const future = `v=${Date.now() + 10 * 60 * 1000},d=${'a'.repeat(64)}`;
+    const res = await postWebhook(fixtureAnalyzed, future);
     expect(res.status).toBe(401);
-    expect(vi.mocked(queries.insertAppelIdempotent)).not.toHaveBeenCalled();
+    expect(mockSdkVerify).not.toHaveBeenCalled();
   });
 
-  it('rejects a signature whose timestamp is too far in the future (401)', async () => {
-    const futureTs = Date.now() + 10 * 60 * 1000;
-    const res = await postWebhook(
-      fixtureAnalyzed,
-      signHeader(fixtureAnalyzed, { timestampMs: futureTs }),
-    );
+  it('delegates to the SDK when the header does NOT match our known format', async () => {
+    // If Retell changes their format one day, we must not preemptively
+    // reject. This test proves the freshness guard is conditional.
+    mockSdkVerify.mockResolvedValue(false); // SDK still rejects (unknown to it too)
+    const res = await postWebhook(fixtureAnalyzed, 't=123,s=deadbeef');
     expect(res.status).toBe(401);
-    expect(vi.mocked(queries.insertAppelIdempotent)).not.toHaveBeenCalled();
+    expect(mockSdkVerify).toHaveBeenCalledTimes(1);
   });
 });
 
+// ---------------------------------------------------------------------------
+// Notification-only events
+// ---------------------------------------------------------------------------
 describe('POST /webhooks/retell/call-ended — notification-only events', () => {
   it('accepts a signed call_started and does NOT touch the DB', async () => {
-    const res = await postWebhook(fixtureStarted, signHeader(fixtureStarted));
+    mockSdkVerify.mockResolvedValue(true);
+    const res = await postWebhook(fixtureStarted, placeholderSignature());
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ received: true, event: 'call_started' });
-    // Give any (unwanted) async path a chance to fire.
     await new Promise((r) => setTimeout(r, 50));
     expect(vi.mocked(queries.findCabinetByCoryaNumber)).not.toHaveBeenCalled();
     expect(vi.mocked(queries.insertAppelIdempotent)).not.toHaveBeenCalled();
@@ -173,7 +203,8 @@ describe('POST /webhooks/retell/call-ended — notification-only events', () => 
   });
 
   it('accepts a signed call_ended and does NOT touch the DB', async () => {
-    const res = await postWebhook(fixtureEnded, signHeader(fixtureEnded));
+    mockSdkVerify.mockResolvedValue(true);
+    const res = await postWebhook(fixtureEnded, placeholderSignature());
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ received: true, event: 'call_ended' });
     await new Promise((r) => setTimeout(r, 50));
@@ -183,23 +214,27 @@ describe('POST /webhooks/retell/call-ended — notification-only events', () => 
   });
 
   it('rejects an unsigned call_started (401), same signature policy as call_analyzed', async () => {
+    mockSdkVerify.mockResolvedValue(false);
     const res = await postWebhook(fixtureStarted);
     expect(res.status).toBe(401);
   });
 });
 
+// ---------------------------------------------------------------------------
+// Authenticated but unusable
+// ---------------------------------------------------------------------------
 describe('POST /webhooks/retell/call-ended — authenticated but unusable', () => {
   it('acks 200 for a signed but UNKNOWN event type (e.g. agent_created), zero DB, one warn', async () => {
+    mockSdkVerify.mockResolvedValue(true);
     const body = JSON.stringify({
       event: 'agent_created',
       call: { call_id: 'call_unknown_evt_1' },
       some_extra: true,
     });
-    const res = await postWebhook(body, signHeader(body));
+    const res = await postWebhook(body, placeholderSignature());
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ received: true, event: 'agent_created' });
 
-    // Give any (unwanted) async path a chance to fire.
     await new Promise((r) => setTimeout(r, 50));
     expect(vi.mocked(queries.findCabinetByCoryaNumber)).not.toHaveBeenCalled();
     expect(vi.mocked(queries.insertAppelIdempotent)).not.toHaveBeenCalled();
@@ -207,13 +242,14 @@ describe('POST /webhooks/retell/call-ended — authenticated but unusable', () =
   });
 
   it('acks 200 for a signed call_analyzed with MALFORMED payload, zero DB', async () => {
+    mockSdkVerify.mockResolvedValue(true);
     // event is known ("call_analyzed"), but the strict schema fails on the
     // empty call_id. Retries would not help — must not force Retell to loop.
     const badBody = JSON.stringify({
       event: 'call_analyzed',
       call: { call_id: '' },
     });
-    const res = await postWebhook(badBody, signHeader(badBody));
+    const res = await postWebhook(badBody, placeholderSignature());
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ received: true, event: 'call_analyzed' });
 
@@ -224,10 +260,13 @@ describe('POST /webhooks/retell/call-ended — authenticated but unusable', () =
   });
 });
 
+// ---------------------------------------------------------------------------
+// call_analyzed happy path
+// ---------------------------------------------------------------------------
 describe('POST /webhooks/retell/call-ended — call_analyzed', () => {
-
   it('accepts a valid signed payload and enqueues 3 jobs', async () => {
-    const res = await postWebhook(fixtureAnalyzed, signHeader(fixtureAnalyzed));
+    mockSdkVerify.mockResolvedValue(true);
+    const res = await postWebhook(fixtureAnalyzed, placeholderSignature());
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ received: true, event: 'call_analyzed' });
 
@@ -248,10 +287,9 @@ describe('POST /webhooks/retell/call-ended — call_analyzed', () => {
   });
 
   it('is idempotent: replaying the same webhook creates exactly one appel and one set of jobs', async () => {
-    const sig = signHeader(fixtureAnalyzed);
-
+    mockSdkVerify.mockResolvedValue(true);
     // First delivery.
-    const res1 = await postWebhook(fixtureAnalyzed, sig);
+    const res1 = await postWebhook(fixtureAnalyzed, placeholderSignature());
     expect(res1.status).toBe(200);
     await vi.waitFor(
       () => {
@@ -265,10 +303,8 @@ describe('POST /webhooks/retell/call-ended — call_analyzed', () => {
     expect(appelsAfterFirst).toBe(1);
     expect(jobsAfterFirst).toBe(3);
 
-    // Replay: same body, fresh signature (Retell would recompute one anyway).
-    // The async orchestrator must detect the duplicate row and return early,
-    // without touching the jobs table.
-    const res2 = await postWebhook(fixtureAnalyzed, signHeader(fixtureAnalyzed));
+    // Replay: same body, fresh signature.
+    const res2 = await postWebhook(fixtureAnalyzed, placeholderSignature());
     expect(res2.status).toBe(200);
 
     // Give the async path a chance to run (or short-circuit).
@@ -287,6 +323,7 @@ describe('POST /webhooks/retell/call-ended — call_analyzed', () => {
   });
 
   it('answers 200 (no crash) when to_number does not match any cabinet', async () => {
+    mockSdkVerify.mockResolvedValue(true);
     const rawObj = JSON.parse(fixtureAnalyzed) as {
       call: { to_number: string; call_id: string };
     };
@@ -294,7 +331,7 @@ describe('POST /webhooks/retell/call-ended — call_analyzed', () => {
     rawObj.call.call_id = 'call_unmapped_xyz';
     const raw = JSON.stringify(rawObj);
 
-    const res = await postWebhook(raw, signHeader(raw));
+    const res = await postWebhook(raw, placeholderSignature());
     expect(res.status).toBe(200);
 
     // Wait for the async path to at least call the cabinet lookup.

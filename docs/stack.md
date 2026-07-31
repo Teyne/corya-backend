@@ -29,6 +29,7 @@ Validées explicitement par le fondateur. Elles font désormais partie de la sta
 | `pino-http` | prod | Middleware de request logging |
 | `cors` | prod | CORS restrictif (origin depuis env, jamais `*`) |
 | `dotenv` | prod | Chargement `.env.local` |
+| `retell-sdk` | prod | Vérification de la signature des webhooks. Utilisé parce que Retell ne documente pas publiquement le format exact de sa signature : notre implémentation maison n'était pas validable en conditions réelles. Le secret HMAC est la clé API (`RETELL_API_KEY`), pas un secret de webhook séparé. |
 | `typescript` | dev | Compilation, mode strict |
 | `tsx` | dev | Runner TS en développement (`npm run dev`) |
 | `vitest` | dev | Tests unitaires et intégration |
@@ -37,7 +38,7 @@ Validées explicitement par le fondateur. Elles font désormais partie de la sta
 | `eslint` + `typescript-eslint` | dev | Lint, flat config ESLint 9 |
 | `@types/node`, `@types/express`, `@types/cors`, `@types/supertest` | dev | Typings |
 
-Critères de validation appliqués à chaque ajout : licence MIT ou ISC uniquement, dernière release < 12 mois, aucun advisory `npm audit`. Une dépendance qui ne passe pas ces trois critères n'est pas installée — l'agent s'arrête et remonte au fondateur.
+Critères de validation appliqués à chaque ajout : licence permissive **MIT, Apache 2.0 ou ISC** (voir « Ajouts de dépendances » plus bas, qui fait foi — GPL exclue), dernière release < 12 mois, aucun advisory `npm audit`. Une dépendance qui ne passe pas ces trois critères n'est pas installée — l'agent s'arrête et remonte au fondateur.
 
 ### Règles ESLint verrouillées
 

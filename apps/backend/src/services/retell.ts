@@ -2,45 +2,78 @@
  * Retell webhook signature verification + payload parsing.
  *
  * ---------------------------------------------------------------------------
- * SIGNATURE FORMAT — observed on REAL ngrok traffic on 2026-07-31.
- * Not a supposition: captured from an actual Retell dashboard test webhook.
+ * Session 2.2 — BASCULE VERS LE SDK OFFICIEL `retell-sdk`.
  * ---------------------------------------------------------------------------
  *
- *   Header  : `X-Retell-Signature`
- *   Value   : `v=<timestampMs>,d=<hmacSha256Hex>`
- *   Example : `v=1785450205245,d=4def1fb4105ac45e186acecf1a11cb23e8f3b5bb07d7f85ee6bdf6e5eb5086df`
+ * Historique. Notre implémentation maison du HMAC n'a jamais pu être
+ * validée sur du vrai trafic : les captures ngrok « reconstituées à la
+ * main » depuis les copier-coller d'onglet ne sont pas garanties octet pour
+ * octet, et un seul bit d'écart casse tout HMAC. Le résultat était un 401
+ * systématique en production et 18 combinaisons `{secret, schema, encoding}`
+ * qui rejetaient toutes la capture reconstituée — ce qui ne prouvait rien.
  *
- *   HMAC input  : the ASCII string `${timestampMs}.${rawBody}` — the
- *                 millisecond timestamp, a literal ASCII dot, then the raw
- *                 request bytes exactly as received.
- *   HMAC output : hex-encoded SHA-256 digest, always 64 lowercase chars.
+ * Décision (fondateur, tranchée) : on arrête de réimplémenter un format
+ * que Retell ne documente pas publiquement et on délègue au SDK officiel.
+ * Retell utilise la clé API comme secret HMAC (il n'y a plus de webhook
+ * secret séparé), donc on n'a plus qu'un seul secret dans l'environnement :
+ * `RETELL_API_KEY`.
  *
- * Anti-replay: `timestampMs` is millisecond-precision Unix time and must
- * fall within +/- RETELL_SIGNATURE_MAX_AGE_SECONDS of the server clock —
- * bidirectional, so a clock skew or a forged future timestamp both fail
- * fast. The chosen unit (seconds vs ms) is a classic source of silent
- * bypasses, so the code is deliberately explicit about it at every step.
+ * Doc : https://docs.retellai.com/features/webhook-overview
  *
  * ---------------------------------------------------------------------------
- * Why we DON'T use `retell-sdk` for this:
- *   The webhook is the front door for every piece of medical data we handle.
- *   For the nLPD audits we want the crypto code to live in-repo, be readable
- *   in a single screen, and be exhaustively unit-tested here — not hidden
- *   behind a third-party module we would also need to pin, audit, and watch
- *   for supply-chain incidents. It's ~15 lines of stable crypto. It stays.
+ * API réelle du SDK, inspectée dans node_modules/retell-sdk/lib/webhook_auth.d.ts
  * ---------------------------------------------------------------------------
  *
- * Design notes:
- *   1. `crypto.timingSafeEqual` THROWS on length mismatch — and that throw
- *      itself would leak length information via error timing. We therefore
- *      compare lengths first and, when they differ, still run a dummy
- *      timingSafeEqual against a same-length zero buffer to keep the code
- *      path uniform.
- *   2. We MUST hash the raw body bytes, not the JSON-parsed object re-
- *      serialised. Any whitespace difference would break the signature. The
- *      caller (webhooks route) is responsible for handing us the raw Buffer.
+ *   import { verify } from 'retell-sdk';
+ *
+ *   // Signature :
+ *   //   verify(body: string, apiKey: string, signature: string) => Promise<boolean>
+ *   //
+ *   // - `body` est une CHAÎNE, pas un Buffer. On lui passe rawBody.toString('utf-8')
+ *   //   pour rester octet-fidèle : le Buffer capturé par express.json({ verify })
+ *   //   contient déjà les octets exacts reçus par Node, et toString('utf-8') est
+ *   //   une bijection sur du JSON Retell (UTF-8 pur, pas de bytes invalides).
+ *   // - `apiKey` = env.RETELL_API_KEY.
+ *   // - `signature` = valeur brute de l'en-tête `X-Retell-Signature`.
+ *   // - retourne une Promise<boolean> : false si signature mal formée, si le
+ *   //   digest ne matche pas, ou si le timestamp est hors fenêtre (5 min par
+ *   //   défaut côté SDK).
+ *
+ * Détail utile pour le futur : le SDK calcule HMAC-SHA256 sur `body + timestampMs`
+ * (concaténation, timestamp EN FIN), et non `${timestampMs}.${body}` comme on
+ * l'avait supposé. C'est exactement ce que notre implémentation maison ratait.
+ *
+ * ---------------------------------------------------------------------------
+ * Anti-rejeu — contrôle CONDITIONNEL, défense en profondeur
+ * ---------------------------------------------------------------------------
+ *
+ * On garde un contrôle de fraîcheur maison EN PLUS du SDK, mais avec un
+ * garde-fou strict pour ne pas recréer le bug d'origine : notre ancien code
+ * parsait `v=<ts>,d=<hex>` avant tout traitement et rejetait quand la forme
+ * ne matchait pas. Si Retell change son format un jour (ex. `t=...,s=...`),
+ * on rejetterait tout AVANT même d'appeler le SDK — on aurait migré sans
+ * corriger le bug.
+ *
+ * Comportement exigé, implémenté ici :
+ *   - Si le header suit la forme connue `v=<ts>,d=<hex>` → on parse le
+ *     timestamp, on calcule la dérive et on rejette immédiatement (sans
+ *     appeler le SDK) si on est hors fenêtre. Défense en profondeur.
+ *   - Sinon → on log en DEBUG `signature format unrecognized for freshness
+ *     check, delegating to SDK`, on NE rejette PAS, et on passe la main
+ *     au SDK qui a sa propre vérification de fraîcheur.
+ *
+ * La sécurité réelle repose sur le SDK. Notre contrôle de fraîcheur n'est
+ * qu'un bonus quand on peut l'appliquer.
+ *
+ * ---------------------------------------------------------------------------
+ * Ce qui a été SUPPRIMÉ par cette bascule :
+ *   - `getEffectiveRetellSecret()` (plus qu'un secret possible)
+ *   - `RETELL_WEBHOOK_SECRET` (n'existe plus dans env.ts)
+ *   - Le calcul HMAC maison (`createHmac(...)`) et la logique
+ *     timing-safe : c'est le SDK qui s'en charge en interne.
+ * ---------------------------------------------------------------------------
  */
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { verify as retellSdkVerify } from 'retell-sdk';
 import { z } from 'zod';
 import { env } from '../config/env.js';
 import { logger } from '../config/logger.js';
@@ -55,147 +88,168 @@ import type {
 export const RETELL_SIGNATURE_HEADER = 'x-retell-signature';
 
 /**
- * Strict header parser. The regex is anchored on both ends and enforces:
- *   - literal prefix `v=` followed by one or more digits (timestampMs)
- *   - literal separator `,d=`
- *   - exactly 64 lowercase hex chars (SHA-256 hex digest length)
- * Anything else is rejected. No forgiveness of whitespace, no alternative
- * orderings, no extra components.
+ * Regex de reconnaissance du format Retell CONNU. Volontairement strict :
+ *   - `v=` littéral suivi de chiffres (timestamp ms)
+ *   - `,d=` littéral
+ *   - hex insensible à la casse, longueur variable (le SDK accepte upper et
+ *     lower, longueur exacte 64 en pratique mais on ne l'impose pas ici — la
+ *     vérification stricte de longueur est déléguée au SDK)
+ *
+ * Ce n'est PAS un filtre de sécurité : si la regex ne matche pas, on
+ * délègue au SDK sans rejeter. Elle sert uniquement à savoir si on peut
+ * ou non appliquer notre contrôle de fraîcheur bonus.
  */
-const SIGNATURE_HEADER_RE = /^v=(\d+),d=([a-f0-9]{64})$/;
+const KNOWN_FORMAT_RE = /^v=(\d+),d=[0-9a-f]+$/i;
 
-interface ParsedSignatureHeader {
-  timestampMs: number;
-  digestHex: string;
+interface FreshnessCheckOptions {
+  maxAgeSeconds?: number;
+  nowMs?: number;
 }
 
-function parseSignatureHeader(
+/**
+ * Contrôle de fraîcheur CONDITIONNEL. Trois issues possibles :
+ *   - `{ status: 'in_window' }`  → header reconnu ET fenêtre OK
+ *   - `{ status: 'out_of_window', driftSeconds }` → header reconnu MAIS trop
+ *     vieux/trop futur ; l'appelant DOIT rejeter avant d'appeler le SDK
+ *   - `{ status: 'unrecognized' }` → format inconnu ; l'appelant DOIT
+ *     déléguer au SDK sans rejeter
+ *
+ * Exporté pour être testable indépendamment. Ne dépend que de son argument
+ * (aucun secret, aucun accès env) hors du fallback sur env.RETELL_SIGNATURE_MAX_AGE_SECONDS.
+ */
+export type FreshnessResult =
+  | { status: 'in_window' }
+  | { status: 'out_of_window'; driftSeconds: number; direction: 'past' | 'future' }
+  | { status: 'unrecognized' };
+
+export function checkFreshnessIfKnownFormat(
   headerValue: string | undefined,
-): ParsedSignatureHeader | null {
-  if (!headerValue || headerValue.length === 0) return null;
-  const m = SIGNATURE_HEADER_RE.exec(headerValue.trim());
-  if (!m) return null;
-  const timestampMs = Number(m[1]);
-  // Number() on a ~13-digit string is exactly representable, but guard anyway.
-  if (!Number.isFinite(timestampMs) || timestampMs <= 0) return null;
-  return { timestampMs, digestHex: m[2] };
-}
-
-/**
- * Resolve which secret to use. `RETELL_WEBHOOK_SECRET` takes precedence
- * because it's the modern Retell convention; older accounts sign with the
- * API key, which is why we fall back to `RETELL_API_KEY`.
- *
- * env.ts has already enforced (via a zod refinement) that at least one of
- * the two is present, so this function is guaranteed to return a non-empty
- * string in production. The `throw` here is a belt-and-braces guard for
- * completeness of the type narrowing.
- */
-export function getEffectiveRetellSecret(): {
-  secret: string;
-  source: 'webhook_secret' | 'api_key';
-} {
-  const webhookSecret = env.RETELL_WEBHOOK_SECRET;
-  if (webhookSecret && webhookSecret.length > 0) {
-    return { secret: webhookSecret, source: 'webhook_secret' };
+  options?: FreshnessCheckOptions,
+): FreshnessResult {
+  if (!headerValue || headerValue.length === 0) {
+    // Pas de header : on renvoie « unrecognized » plutôt que « out_of_window ».
+    // Le SDK renverra false parce que la signature ne matche pas, ce qui
+    // produira le 401 attendu. On évite d'avoir deux endroits qui décident
+    // « il n'y a pas de header » avec des sémantiques divergentes.
+    return { status: 'unrecognized' };
   }
-  const apiKey = env.RETELL_API_KEY;
-  if (apiKey && apiKey.length > 0) {
-    return { secret: apiKey, source: 'api_key' };
+  const match = KNOWN_FORMAT_RE.exec(headerValue.trim());
+  if (!match) return { status: 'unrecognized' };
+
+  const timestampMs = Number(match[1]);
+  if (!Number.isFinite(timestampMs) || timestampMs <= 0) {
+    // Regex matche mais Number() dérape (improbable : chaîne de chiffres).
+    // On considère ça comme « unrecognized » pour ne pas rejeter à tort.
+    return { status: 'unrecognized' };
   }
-  // Should never happen — env.ts refuses to boot otherwise.
-  throw new Error(
-    'no_retell_secret_configured (env.ts refinement should have caught this)',
-  );
-}
-
-// Log the chosen source EXACTLY ONCE per process. We used to inline this in
-// the webhook handler, which spammed the logs and made the diagnostic value
-// low. `logRetellSecretSourceOnce()` is invoked from the app bootstrap.
-let secretSourceLogged = false;
-export function logRetellSecretSourceOnce(): void {
-  if (secretSourceLogged) return;
-  secretSourceLogged = true;
-  const { source } = getEffectiveRetellSecret();
-  logger.info(
-    { source },
-    `Retell signature verification using: ${source}`,
-  );
-}
-
-/** Test-only. Resets the once-flag so tests can observe the log path. */
-export function __resetSecretSourceLoggedForTests(): void {
-  secretSourceLogged = false;
-}
-
-/**
- * Verify a Retell webhook signature.
- *
- * Steps, with units spelled out to avoid the ms/s confusion trap:
- *   1. Parse the header into { timestampMs, digestHex }. Reject if malformed.
- *   2. Compute `ageSeconds = abs(nowMs - timestampMs) / 1000`.
- *   3. Reject if `ageSeconds > maxAgeSeconds` — bidirectional (rejects both
- *      stale replays AND timestamps too far in the future).
- *   4. Compute HMAC-SHA256(secret, `${timestampMs}.${rawBody}`) as hex.
- *   5. Compare against `digestHex` with timing-safe equality.
- *
- * On rejection the function returns `false`; the HTTP layer maps that to 401
- * via `RetellSignatureError`. Also logs the drift in seconds when the
- * timestamp check fails — this is what we need to spot an NTP drift on
- * Jelastic in prod.
- */
-export function verifyRetellSignature(
-  rawBody: Buffer,
-  headerSignature: string | undefined,
-  secret: string,
-  options?: { maxAgeSeconds?: number; nowMs?: number },
-): boolean {
-  const parsed = parseSignatureHeader(headerSignature);
-  if (!parsed) return false;
 
   const maxAgeSeconds =
     options?.maxAgeSeconds ?? env.RETELL_SIGNATURE_MAX_AGE_SECONDS;
   const nowMs = options?.nowMs ?? Date.now();
 
-  // Explicit units: header is in ms, we divide by 1000 to compare with the
-  // maxAge configured in SECONDS.
-  const driftSeconds = Math.abs(nowMs - parsed.timestampMs) / 1000;
-  if (driftSeconds > maxAgeSeconds) {
+  // Unités explicites : header en ms, on divise par 1000 pour comparer à
+  // une fenêtre en SECONDES.
+  const driftSeconds = (nowMs - timestampMs) / 1000; // signé
+  if (Math.abs(driftSeconds) > maxAgeSeconds) {
+    return {
+      status: 'out_of_window',
+      driftSeconds: Math.abs(driftSeconds),
+      direction: timestampMs > nowMs ? 'future' : 'past',
+    };
+  }
+  return { status: 'in_window' };
+}
+
+// Log au démarrage, EXACTEMENT une fois par process. Émis depuis le
+// bootstrap (`src/index.ts` -> `logRetellSecretSourceOnce`). Le contenu du
+// message est figé : le brief de la session 2.2 l'exige mot pour mot pour
+// qu'il soit grep-able dans les logs Jelastic.
+let secretSourceLogged = false;
+export function logRetellSecretSourceOnce(): void {
+  if (secretSourceLogged) return;
+  secretSourceLogged = true;
+  // Aucune donnée sensible : on ne logue ni la valeur ni la longueur du
+  // secret, uniquement le NOM de la variable d'environnement utilisée.
+  logger.info('Retell signature verification via SDK, secret = RETELL_API_KEY');
+}
+
+/** Test-only. Reset the once-flag so tests can observe the log path. */
+export function __resetSecretSourceLoggedForTests(): void {
+  secretSourceLogged = false;
+}
+
+/**
+ * Vérifie une signature webhook Retell via le SDK officiel.
+ *
+ * Étapes :
+ *   1. Contrôle de fraîcheur CONDITIONNEL : si le header suit la forme
+ *      connue et que le timestamp est hors fenêtre, on rejette avant
+ *      d'appeler le SDK (défense en profondeur). Si la forme est inconnue,
+ *      on log en debug et on délègue au SDK sans rejeter.
+ *   2. Appel de `retell-sdk#verify(body, apiKey, signature)`. Le SDK :
+ *        - parse le header
+ *        - calcule HMAC-SHA256(apiKey, body + timestampMs)
+ *        - compare timing-safe
+ *        - applique sa propre fenêtre de rejeu (5 min par défaut)
+ *        et retourne un booléen.
+ *   3. On propage ce booléen sans le transformer.
+ *
+ * Sécurité : aucune donnée sensible ne quitte cette fonction — ni le corps
+ * de la requête, ni le secret, ni le contenu de la signature. Les warnings
+ * ne contiennent que des métadonnées non identifiantes (présence du header,
+ * dérive en secondes, direction).
+ *
+ * IMPORTANT — cette fonction est `async` (le SDK l'est). Tous les appelants
+ * sont adaptés en conséquence dans `routes/webhooks.ts`.
+ */
+export async function verifyRetellSignature(
+  rawBody: Buffer,
+  headerSignature: string | undefined,
+  secret: string,
+  options?: FreshnessCheckOptions,
+): Promise<boolean> {
+  // 1. Contrôle de fraîcheur CONDITIONNEL (défense en profondeur).
+  const freshness = checkFreshnessIfKnownFormat(headerSignature, options);
+  if (freshness.status === 'out_of_window') {
     logger.warn(
       {
-        drift_seconds: Math.round(driftSeconds),
-        max_age_seconds: maxAgeSeconds,
-        direction: parsed.timestampMs > nowMs ? 'future' : 'past',
+        drift_seconds: Math.round(freshness.driftSeconds),
+        max_age_seconds:
+          options?.maxAgeSeconds ?? env.RETELL_SIGNATURE_MAX_AGE_SECONDS,
+        direction: freshness.direction,
       },
       'retell_signature_timestamp_out_of_window',
     );
     return false;
   }
-
-  // HMAC over `${timestampMs}.${rawBody}`. We build the signed material by
-  // concatenating the ASCII prefix with the raw body BUFFER — never re-
-  // decoding the body, so binary-safe (Retell only sends UTF-8 JSON today,
-  // but this is one less surprise vector).
-  const prefix = Buffer.from(`${parsed.timestampMs}.`, 'utf8');
-  const signedMaterial = Buffer.concat([prefix, rawBody]);
-  const expectedHex = createHmac('sha256', secret)
-    .update(signedMaterial)
-    .digest('hex');
-
-  const expected = Buffer.from(expectedHex, 'utf8');
-  const provided = Buffer.from(parsed.digestHex, 'utf8');
-
-  // Length mismatch defence: keep the compute cost constant to avoid a
-  // length-based timing leak. In practice both sides are always 64 bytes
-  // (the regex enforces 64 hex chars on `provided`, and sha256 hex is 64
-  // chars on `expected`) — this branch is unreachable but stays as belt.
-  if (expected.length !== provided.length) {
-    const dummy = Buffer.alloc(expected.length);
-    timingSafeEqual(expected, dummy);
-    return false;
+  if (freshness.status === 'unrecognized') {
+    logger.debug('signature format unrecognized for freshness check, delegating to SDK');
   }
 
-  return timingSafeEqual(expected, provided);
+  // 2. Délégation au SDK. Si le header est manquant/vide, le SDK renverra
+  //    false — inutile d'ajouter un guard qui masquerait un comportement
+  //    différent du SDK.
+  //
+  //    Le fondateur a explicitement demandé de passer la CHAÎNE (le SDK
+  //    attend `body: string`, cf. webhook_auth.d.ts). rawBody.toString('utf-8')
+  //    est octet-fidèle pour du JSON Retell (UTF-8 pur).
+  const bodyStr = rawBody.toString('utf-8');
+  const signatureStr = headerSignature ?? '';
+
+  try {
+    return await retellSdkVerify(bodyStr, secret, signatureStr);
+  } catch (err) {
+    // Le SDK peut throw si le runtime n'a pas Web Crypto (impossible sur
+    // Node 20+, mais défense en profondeur). On ne relaye JAMAIS le message
+    // du SDK dans un log — il pourrait, dans une version future, mentionner
+    // le secret ou des fragments du corps. On logue uniquement le NOM de
+    // l'erreur.
+    logger.error(
+      { err_name: err instanceof Error ? err.name : 'unknown' },
+      'retell_sdk_verify_threw',
+    );
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -315,14 +369,17 @@ export function parseRetellEvent(input: unknown): RetellWebhookEvent {
  * Convenience for tests: verify signature then parse. Throws
  * RetellSignatureError BEFORE any parsing so an invalid signature never
  * triggers zod overhead (or any log line containing payload fragments).
+ *
+ * Devient `async` par transitivité avec `verifyRetellSignature`.
  */
-export function verifyAndParse(
+export async function verifyAndParse(
   rawBody: Buffer,
   headerSignature: string | undefined,
   secret: string,
-  options?: { maxAgeSeconds?: number; nowMs?: number },
-): RetellCallAnalyzed {
-  if (!verifyRetellSignature(rawBody, headerSignature, secret, options)) {
+  options?: FreshnessCheckOptions,
+): Promise<RetellCallAnalyzed> {
+  const ok = await verifyRetellSignature(rawBody, headerSignature, secret, options);
+  if (!ok) {
     throw new RetellSignatureError();
   }
   let parsed: unknown;

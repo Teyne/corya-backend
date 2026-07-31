@@ -24,6 +24,7 @@
     "express": "^5.0.0",
     "pino": "^10.0.0",
     "pino-http": "^11.0.0",
+    "retell-sdk": "^5.53.0",
     "zod": "^4.0.0"
   },
   "devDependencies": {

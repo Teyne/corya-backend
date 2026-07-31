@@ -14,11 +14,13 @@
  *       * SUPABASE_URL          -> REQUIRED (queries.ts uses it)
  *       * SUPABASE_SERVICE_KEY  -> REQUIRED (queries.ts uses it)
  *   - session 2.1 (real Retell traffic captured via ngrok):
- *       * RETELL_WEBHOOK_SECRET AND RETELL_API_KEY are BOTH optional in
- *         isolation, but the superRefine at the bottom of the schema
- *         requires AT LEAST ONE of them. The signature verifier picks
- *         whichever is set (webhook secret first, api key as fallback).
  *       * RETELL_SIGNATURE_MAX_AGE_SECONDS added (default 300).
+ *   - session 2.2 (bascule vers le SDK officiel `retell-sdk`):
+ *       * RETELL_WEBHOOK_SECRET SUPPRIMÉ. Retell utilise la clé API comme
+ *         secret HMAC — le SDK officiel et la doc ne connaissent qu'un seul
+ *         secret. On garde uniquement RETELL_API_KEY, désormais REQUIS. La
+ *         superRefine « au moins l'un des deux » disparaît par la même
+ *         occasion.
  *   SMTP + SUPABASE_ANON_KEY + SUPABASE_JWT_SECRET remain optional until
  *   their respective subsystems land.
  * ---------------------------------------------------------------------------
@@ -69,17 +71,20 @@ const envSchema = z.object({
   SUPABASE_JWT_SECRET: z.string().min(1).optional(),
 
   // ---- Retell AI --------------------------------------------------------
-  // Both secrets are individually OPTIONAL in the schema, but the refinement
-  // below (see envSchema.superRefine) requires that AT LEAST ONE of them be
-  // present. Rationale: modern Retell accounts sign webhooks with
-  // RETELL_WEBHOOK_SECRET, legacy accounts (and Retell's own SDK examples)
-  // sign with RETELL_API_KEY. The signature service picks whichever is set,
-  // preferring the webhook secret.
-  RETELL_API_KEY: z.string().min(1).optional(),
-  RETELL_WEBHOOK_SECRET: z.string().min(1).optional(),
+  // La bascule vers `retell-sdk` (session 2.2) a supprimé l'ambiguïté :
+  // Retell n'expose plus qu'un seul secret HMAC, la clé API. Elle est
+  // maintenant REQUISE au boot — sans elle, aucune vérification de
+  // signature n'est possible et il vaut mieux refuser de démarrer plutôt
+  // que d'accepter n'importe quelle requête en silence.
+  RETELL_API_KEY: z.string().min(1),
   // Anti-replay window in SECONDS (bidirectional). 5 min default matches
   // Retell's own guidance and Stripe convention. Bounded to avoid a typo
   // silently disabling replay protection.
+  //
+  // NB : notre contrôle de fraîcheur est CONDITIONNEL — il ne s'applique
+  // que lorsque le header suit la forme documentée `v=<ts>,d=<hex>` (voir
+  // services/retell.ts). Quand la forme change (retell modifie son schéma),
+  // on délègue silencieusement au SDK qui a sa propre fenêtre de rejeu.
   RETELL_SIGNATURE_MAX_AGE_SECONDS: z.coerce
     .number()
     .int()
@@ -100,30 +105,6 @@ const envSchema = z.object({
   AUDIO_RETENTION_HOURS: z.coerce.number().int().positive().max(72).default(48),
   TRANSCRIPT_RETENTION_DAYS: z.coerce.number().int().positive().max(30).default(7),
   APPEL_RETENTION_MONTHS: z.coerce.number().int().positive().max(60).default(24),
-}).superRefine((cfg, ctx) => {
-  // At least one Retell secret must be configured. See RETELL_* comment
-  // above for the two-signing-conventions rationale.
-  const hasWebhookSecret =
-    typeof cfg.RETELL_WEBHOOK_SECRET === 'string' &&
-    cfg.RETELL_WEBHOOK_SECRET.length > 0;
-  const hasApiKey =
-    typeof cfg.RETELL_API_KEY === 'string' && cfg.RETELL_API_KEY.length > 0;
-  if (!hasWebhookSecret && !hasApiKey) {
-    ctx.addIssue({
-      code: 'custom',
-      // Point at both fields so the error message from parseEnvOrDie names
-      // both — makes fixing the .env obvious.
-      path: ['RETELL_WEBHOOK_SECRET'],
-      message:
-        'either RETELL_WEBHOOK_SECRET or RETELL_API_KEY must be set (webhook signature verification needs one)',
-    });
-    ctx.addIssue({
-      code: 'custom',
-      path: ['RETELL_API_KEY'],
-      message:
-        'either RETELL_WEBHOOK_SECRET or RETELL_API_KEY must be set (webhook signature verification needs one)',
-    });
-  }
 });
 
 export type Env = z.infer<typeof envSchema>;

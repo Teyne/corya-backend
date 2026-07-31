@@ -8,9 +8,9 @@
  *   same endpoint. Only `call_analyzed` triggers business logic.
  *
  * Contract — HTTP status policy:
- *   - **401 uniquement si non authentifié** (signature invalide/absente).
- *     C'est le SEUL cas où on refuse : la requête n'est pas prouvée venir
- *     de Retell, on ne doit surtout pas l'acquitter.
+ *   - **401 uniquement si non authentifié** (signature invalide/absente,
+ *     ou rejet du SDK Retell). C'est le SEUL cas où on refuse : la requête
+ *     n'est pas prouvée venir de Retell, on ne doit surtout pas l'acquitter.
  *   - **400 uniquement si le body est vide/absent** — une requête sans
  *     corps ne vient manifestement pas de Retell.
  *   - **Tout le reste est acquitté 200**, pour ne pas déclencher les retries
@@ -34,18 +34,26 @@
  *   son `.httpStatus` — c'est le route handler qui décide du code de retour,
  *   pas la classe d'erreur.
  *
- * Raw body:
- *   Signature is HMAC-SHA256 of `${timestampMs}.${rawBody}`. The signature
- *   check MUST run on the bytes as received, so this route relies on the
- *   raw-body capture wired in `src/index.ts` (express.json `verify`
- *   callback stashing the Buffer on `req.rawBody`).
+ * Signature — session 2.2, bascule vers `retell-sdk` :
+ *   La vérification n'est plus faite en interne. On appelle le SDK officiel
+ *   via `verifyRetellSignature` qui délègue à `retell-sdk#verify`. Le secret
+ *   utilisé est UNIQUEMENT `env.RETELL_API_KEY` (le concept de webhook
+ *   secret séparé a disparu). L'accès au raw body vient toujours du
+ *   callback `express.json({ verify })` câblé dans `src/index.ts`.
+ *
+ * Async :
+ *   La vérification étant maintenant asynchrone (SDK Retell renvoie une
+ *   Promise), le handler l'est aussi. Toute exception non catchée est
+ *   remontée à Express — le error middleware standard renvoie 500. Pour
+ *   nous, c'est mieux qu'un ack silencieux d'une requête cassée : Retell
+ *   verra une erreur et la rejouera, ce qui nous laisse une seconde chance.
  */
 import { Router, type Request, type Response } from 'express';
+import { env } from '../config/env.js';
 import { logger } from '../config/logger.js';
 import { processCallAnalyzed } from '../services/appel.js';
 import {
   RETELL_SIGNATURE_HEADER,
-  getEffectiveRetellSecret,
   parseRetellEvent,
   verifyRetellSignature,
 } from '../services/retell.js';
@@ -63,7 +71,7 @@ export const webhooksRouter: Router = Router();
 
 webhooksRouter.post(
   '/retell/call-ended',
-  (req: RawBodyRequest, res: Response): void => {
+  async (req: RawBodyRequest, res: Response): Promise<void> => {
     const rawBody = req.rawBody;
     const headerSig = req.header(RETELL_SIGNATURE_HEADER);
 
@@ -72,23 +80,15 @@ webhooksRouter.post(
       return;
     }
 
-    // 1. Resolve the signing secret (webhook_secret first, api_key fallback).
-    //    env.ts refuses to boot if neither is set, so this always succeeds.
-    let secret: string;
-    try {
-      secret = getEffectiveRetellSecret().secret;
-    } catch (e) {
-      logger.error(
-        { err: e instanceof Error ? e.message : String(e) },
-        'retell_secret_missing_at_runtime',
-      );
-      res.status(500).json({ error: 'server_misconfigured' });
-      return;
-    }
-
-    // 2. Signature — timing-safe, no early return path leaks bytes. Applies
-    //    to all three event types.
-    if (!verifyRetellSignature(rawBody, headerSig, secret)) {
+    // 1. Signature — via SDK Retell officiel. Le secret est RETELL_API_KEY
+    //    (env.ts refuse le boot s'il est absent, donc pas de guard runtime).
+    //    Applique aux trois types d'événement.
+    const signatureOk = await verifyRetellSignature(
+      rawBody,
+      headerSig,
+      env.RETELL_API_KEY,
+    );
+    if (!signatureOk) {
       // No correlation id yet — we refuse to parse the body of an unsigned
       // request. Just log the header presence, nothing more.
       logger.warn(
@@ -100,7 +100,7 @@ webhooksRouter.post(
       return;
     }
 
-    // 3. Payload validation.
+    // 2. Payload validation.
     //
     // Two failure modes to distinguish, because they lead to different logs:
     //   a) authenticated call with an event TYPE we don't handle (e.g. a
@@ -173,7 +173,7 @@ webhooksRouter.post(
       throw e;
     }
 
-    // 4. Route by event type.
+    // 3. Route by event type.
     if (event.event === 'call_started' || event.event === 'call_ended') {
       // Notification-only events: log with correlation id, ack 200, no DB.
       logger.info(
