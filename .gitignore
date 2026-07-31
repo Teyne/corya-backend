@@ -54,3 +54,6 @@ credentials*.json
 
 # PDF de test
 tests/output/*.pdf
+
+apps/backend/body.raw
+apps/backend/temp.txt
