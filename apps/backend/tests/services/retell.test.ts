@@ -1,161 +1,207 @@
-import { describe, expect, it } from 'vitest';
-import { createHmac } from 'node:crypto';
-import {
+/**
+ * Tests unitaires — services/retell.ts
+ *
+ * Session 2.2 : la vérification HMAC est déléguée au SDK officiel
+ * `retell-sdk`. On MOCKE le SDK au lieu de tester notre calcul maison
+ * (qui n'existe plus). Les anciens tests qui recomputaient un HMAC
+ * `${ts}.${body}` ont été supprimés — ils validaient une hypothèse
+ * jamais confirmée sur le format Retell, sans valeur pour la couverture
+ * actuelle.
+ *
+ * Ce qu'on teste ici :
+ *   1. Le contrôle de fraîcheur CONDITIONNEL (`checkFreshnessIfKnownFormat`) :
+ *      dérives, fenêtre, forme reconnue vs forme inconnue (le point le plus
+ *      délicat de la migration, celui qui pourrait recréer le bug d'origine
+ *      s'il rejetait à tort).
+ *   2. Le contrat de `verifyRetellSignature` :
+ *        - rejette AVANT d'appeler le SDK si header connu et hors fenêtre
+ *        - délègue au SDK sinon (forme reconnue ET fenêtre OK, OU forme
+ *          inconnue) et propage son verdict boolean
+ *        - passe bien la CHAÎNE (rawBody.toString('utf-8')), l'apiKey et
+ *          le header brut au SDK
+ *        - renvoie false sans propager si le SDK throw (défense en profondeur)
+ *   3. `parseRetellPayload` / `parseRetellEvent` : inchangé, toujours notre
+ *      responsabilité — on garde les tests existants.
+ *   4. `verifyAndParse` : async désormais, mock du SDK côté OK/KO.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+// -- Mock du SDK Retell AVANT tout import du code sous test. ---------------
+// `retell-sdk` expose une fonction async `verify(body, apiKey, signature)`
+// (cf. node_modules/retell-sdk/lib/webhook_auth.d.ts). On la remplace par un
+// spy qu'on contrôle test par test.
+vi.mock('retell-sdk', () => {
+  return {
+    verify: vi.fn(),
+  };
+});
+
+// Import APRÈS le mock (ordre important pour ESM + vitest).
+const { verify: sdkVerify } = await import('retell-sdk');
+const {
+  checkFreshnessIfKnownFormat,
   parseRetellEvent,
   parseRetellPayload,
   verifyAndParse,
   verifyRetellSignature,
-} from '../../src/services/retell.js';
-import {
-  RetellSignatureError,
-  WebhookValidationError,
-} from '../../src/utils/errors.js';
+} = await import('../../src/services/retell.js');
+const { RetellSignatureError, WebhookValidationError } = await import(
+  '../../src/utils/errors.js'
+);
 
-const SECRET = 'test-secret-abcdef';
+const SECRET = 'test-api-key-abcdef';
 
-/**
- * Build a valid `X-Retell-Signature` header value for the given raw body,
- * matching the real Retell format observed on ngrok:
- *   `v=<timestampMs>,d=<hmac(secret, `${ts}.${rawBody}`)>`.
- */
-function buildHeader(
-  body: Buffer,
-  opts?: { secret?: string; timestampMs?: number },
-): string {
-  const secret = opts?.secret ?? SECRET;
-  const ts = opts?.timestampMs ?? Date.now();
-  const material = Buffer.concat([Buffer.from(`${ts}.`, 'utf8'), body]);
-  const digest = createHmac('sha256', secret).update(material).digest('hex');
-  return `v=${ts},d=${digest}`;
-}
+const mockSdkVerify = vi.mocked(sdkVerify);
 
-describe('verifyRetellSignature', () => {
-  const body = Buffer.from(JSON.stringify({ event: 'call_analyzed' }), 'utf8');
+beforeEach(() => {
+  mockSdkVerify.mockReset();
+});
 
-  it('accepts a valid signature in the v=ts,d=hex format', () => {
-    expect(verifyRetellSignature(body, buildHeader(body), SECRET)).toBe(true);
-  });
+afterEach(() => {
+  vi.clearAllMocks();
+});
 
-  it('rejects a signature whose HMAC digest is wrong but well-formed', () => {
+// ---------------------------------------------------------------------------
+// 1. Contrôle de fraîcheur conditionnel
+// ---------------------------------------------------------------------------
+describe('checkFreshnessIfKnownFormat', () => {
+  it('returns in_window for a known-format header within the max age', () => {
     const now = Date.now();
-    const material = Buffer.concat([Buffer.from(`${now}.`, 'utf8'), body]);
-    const good = createHmac('sha256', SECRET).update(material).digest('hex');
-    // Flip one hex char in the digest, keeping the 64-char length.
-    const bad = good.replace(/^./, (c) => (c === '0' ? '1' : '0'));
-    expect(
-      verifyRetellSignature(body, `v=${now},d=${bad}`, SECRET),
-    ).toBe(false);
+    const header = `v=${now - 60_000},d=${'a'.repeat(64)}`; // 1 min ago
+    const res = checkFreshnessIfKnownFormat(header, { maxAgeSeconds: 300, nowMs: now });
+    expect(res).toEqual({ status: 'in_window' });
   });
 
-  it('rejects a signature computed with a different secret', () => {
-    expect(
-      verifyRetellSignature(
-        body,
-        buildHeader(body, { secret: 'other-secret' }),
-        SECRET,
-      ),
-    ).toBe(false);
-  });
-
-  it('rejects a signature whose timestamp is too far in the PAST (replay)', () => {
-    const oldTs = Date.now() - 10 * 60 * 1000; // 10 minutes ago
-    const header = buildHeader(body, { timestampMs: oldTs });
-    expect(
-      verifyRetellSignature(body, header, SECRET, { maxAgeSeconds: 300 }),
-    ).toBe(false);
-  });
-
-  it('rejects a signature whose timestamp is too far in the FUTURE', () => {
-    const futureTs = Date.now() + 10 * 60 * 1000; // 10 minutes ahead
-    const header = buildHeader(body, { timestampMs: futureTs });
-    expect(
-      verifyRetellSignature(body, header, SECRET, { maxAgeSeconds: 300 }),
-    ).toBe(false);
-  });
-
-  it('accepts a signature within the freshness window at both ends', () => {
+  it('returns out_of_window with direction=past when timestamp too old', () => {
     const now = Date.now();
-    // 4 minutes ago — within 5-minute window
-    const nearPast = now - 4 * 60 * 1000;
-    // 4 minutes ahead — clock skew tolerated within window
-    const nearFuture = now + 4 * 60 * 1000;
+    const header = `v=${now - 10 * 60_000},d=${'a'.repeat(64)}`;
+    const res = checkFreshnessIfKnownFormat(header, { maxAgeSeconds: 300, nowMs: now });
+    expect(res.status).toBe('out_of_window');
+    if (res.status !== 'out_of_window') throw new Error('narrowing');
+    expect(res.direction).toBe('past');
+    expect(res.driftSeconds).toBeGreaterThan(300);
+  });
+
+  it('returns out_of_window with direction=future when timestamp too far ahead', () => {
+    const now = Date.now();
+    const header = `v=${now + 10 * 60_000},d=${'a'.repeat(64)}`;
+    const res = checkFreshnessIfKnownFormat(header, { maxAgeSeconds: 300, nowMs: now });
+    expect(res.status).toBe('out_of_window');
+    if (res.status !== 'out_of_window') throw new Error('narrowing');
+    expect(res.direction).toBe('future');
+  });
+
+  it('returns unrecognized when the header is absent', () => {
+    expect(checkFreshnessIfKnownFormat(undefined)).toEqual({ status: 'unrecognized' });
+    expect(checkFreshnessIfKnownFormat('')).toEqual({ status: 'unrecognized' });
+  });
+
+  it('returns unrecognized when the header does not match v=<ts>,d=<hex>', () => {
+    // Hypothetical future Retell format we do not want to reject preemptively.
     expect(
-      verifyRetellSignature(
-        body,
-        buildHeader(body, { timestampMs: nearPast }),
-        SECRET,
-        { maxAgeSeconds: 300, nowMs: now },
-      ),
-    ).toBe(true);
+      checkFreshnessIfKnownFormat('t=1785450205245,s=deadbeef'),
+    ).toEqual({ status: 'unrecognized' });
     expect(
-      verifyRetellSignature(
-        body,
-        buildHeader(body, { timestampMs: nearFuture }),
-        SECRET,
-        { maxAgeSeconds: 300, nowMs: now },
-      ),
-    ).toBe(true);
-  });
-
-  it('rejects a header missing the v= prefix', () => {
-    const now = Date.now();
-    const digest = createHmac('sha256', SECRET)
-      .update(Buffer.concat([Buffer.from(`${now}.`, 'utf8'), body]))
-      .digest('hex');
-    expect(verifyRetellSignature(body, `d=${digest}`, SECRET)).toBe(false);
-  });
-
-  it('rejects a header missing the d= component', () => {
-    const now = Date.now();
-    expect(verifyRetellSignature(body, `v=${now}`, SECRET)).toBe(false);
-  });
-
-  it('rejects a header without the comma separator', () => {
-    const now = Date.now();
-    const digest = createHmac('sha256', SECRET)
-      .update(Buffer.concat([Buffer.from(`${now}.`, 'utf8'), body]))
-      .digest('hex');
-    // Space instead of comma.
-    expect(verifyRetellSignature(body, `v=${now} d=${digest}`, SECRET)).toBe(
-      false,
-    );
-  });
-
-  it('rejects a header whose digest hex has the wrong length', () => {
-    const now = Date.now();
-    // 32 hex chars instead of 64.
+      checkFreshnessIfKnownFormat('sha256=abcdef'),
+    ).toEqual({ status: 'unrecognized' });
     expect(
-      verifyRetellSignature(body, `v=${now},d=${'a'.repeat(32)}`, SECRET),
-    ).toBe(false);
+      checkFreshnessIfKnownFormat('v=notanumber,d=abcd'),
+    ).toEqual({ status: 'unrecognized' });
   });
 
-  it('rejects a header whose digest contains non-hex chars', () => {
+  it('accepts both lowercase and uppercase hex in the known-format regex', () => {
     const now = Date.now();
+    const lower = `v=${now},d=${'a'.repeat(64)}`;
+    const upper = `v=${now},d=${'A'.repeat(64)}`;
     expect(
-      verifyRetellSignature(body, `v=${now},d=${'z'.repeat(64)}`, SECRET),
-    ).toBe(false);
-  });
-
-  it('rejects a raw HMAC hex (old format — no v=/d= wrapper)', () => {
-    const material = Buffer.concat([
-      Buffer.from(`${Date.now()}.`, 'utf8'),
-      body,
-    ]);
-    const rawHex = createHmac('sha256', SECRET)
-      .update(material)
-      .digest('hex');
-    expect(verifyRetellSignature(body, rawHex, SECRET)).toBe(false);
-  });
-
-  it('rejects an empty signature header', () => {
-    expect(verifyRetellSignature(body, '', SECRET)).toBe(false);
-  });
-
-  it('rejects when the header is undefined', () => {
-    expect(verifyRetellSignature(body, undefined, SECRET)).toBe(false);
+      checkFreshnessIfKnownFormat(lower, { nowMs: now, maxAgeSeconds: 300 }).status,
+    ).toBe('in_window');
+    expect(
+      checkFreshnessIfKnownFormat(upper, { nowMs: now, maxAgeSeconds: 300 }).status,
+    ).toBe('in_window');
   });
 });
 
+// ---------------------------------------------------------------------------
+// 2. verifyRetellSignature — délégation au SDK, avec garde-fou fraîcheur
+// ---------------------------------------------------------------------------
+describe('verifyRetellSignature', () => {
+  const rawBody = Buffer.from('{"event":"call_analyzed"}', 'utf8');
+
+  it('passes body-as-string, apiKey and header to the SDK when format is known + fresh', async () => {
+    mockSdkVerify.mockResolvedValueOnce(true);
+    const now = Date.now();
+    const header = `v=${now},d=${'a'.repeat(64)}`;
+
+    const ok = await verifyRetellSignature(rawBody, header, SECRET, { nowMs: now });
+    expect(ok).toBe(true);
+    expect(mockSdkVerify).toHaveBeenCalledTimes(1);
+
+    // The founder was explicit: pass rawBody.toString('utf-8'), not the Buffer.
+    const [passedBody, passedSecret, passedSig] = mockSdkVerify.mock.calls[0];
+    expect(typeof passedBody).toBe('string');
+    expect(passedBody).toBe(rawBody.toString('utf-8'));
+    expect(passedSecret).toBe(SECRET);
+    expect(passedSig).toBe(header);
+  });
+
+  it('rejects WITHOUT calling the SDK when known format + timestamp out of window', async () => {
+    const now = Date.now();
+    const staleHeader = `v=${now - 10 * 60_000},d=${'a'.repeat(64)}`;
+    const ok = await verifyRetellSignature(rawBody, staleHeader, SECRET, {
+      maxAgeSeconds: 300,
+      nowMs: now,
+    });
+    expect(ok).toBe(false);
+    expect(mockSdkVerify).not.toHaveBeenCalled(); // defence-in-depth short-circuit
+  });
+
+  it('delegates to the SDK (does NOT reject on freshness) for UNKNOWN-format headers', async () => {
+    // This is the migration-critical case: our old code rejected everything
+    // that didn't match `v=<ts>,d=<hex>`. That was the whole bug. Now we
+    // must delegate silently.
+    mockSdkVerify.mockResolvedValueOnce(true);
+    const ok = await verifyRetellSignature(
+      rawBody,
+      't=1785450205245,s=deadbeef', // hypothetical future Retell format
+      SECRET,
+    );
+    expect(ok).toBe(true);
+    expect(mockSdkVerify).toHaveBeenCalledTimes(1);
+  });
+
+  it('delegates to the SDK when the header is missing entirely (SDK will return false)', async () => {
+    mockSdkVerify.mockResolvedValueOnce(false);
+    const ok = await verifyRetellSignature(rawBody, undefined, SECRET);
+    expect(ok).toBe(false);
+    // The SDK was called with an empty signature string, as documented.
+    expect(mockSdkVerify).toHaveBeenCalledWith(
+      rawBody.toString('utf-8'),
+      SECRET,
+      '',
+    );
+  });
+
+  it('returns the SDK boolean verdict unchanged (false when SDK says false)', async () => {
+    mockSdkVerify.mockResolvedValueOnce(false);
+    const now = Date.now();
+    const header = `v=${now},d=${'a'.repeat(64)}`;
+    const ok = await verifyRetellSignature(rawBody, header, SECRET, { nowMs: now });
+    expect(ok).toBe(false);
+  });
+
+  it('returns false (does not throw) when the SDK throws', async () => {
+    mockSdkVerify.mockRejectedValueOnce(new Error('subtle crypto unavailable'));
+    const now = Date.now();
+    const header = `v=${now},d=${'a'.repeat(64)}`;
+    const ok = await verifyRetellSignature(rawBody, header, SECRET, { nowMs: now });
+    expect(ok).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3. parseRetellPayload / parseRetellEvent — inchangé
+// ---------------------------------------------------------------------------
 describe('parseRetellPayload (call_analyzed strict)', () => {
   const validCall = {
     event: 'call_analyzed',
@@ -240,6 +286,9 @@ describe('parseRetellEvent (discriminated union)', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// 4. verifyAndParse — désormais async
+// ---------------------------------------------------------------------------
 describe('verifyAndParse', () => {
   const payloadObj = {
     event: 'call_analyzed',
@@ -253,26 +302,30 @@ describe('verifyAndParse', () => {
   };
   const raw = Buffer.from(JSON.stringify(payloadObj), 'utf8');
 
-  it('parses when signature is valid', () => {
-    const out = verifyAndParse(raw, buildHeader(raw), SECRET);
+  it('parses when the SDK accepts the signature', async () => {
+    mockSdkVerify.mockResolvedValueOnce(true);
+    const out = await verifyAndParse(raw, 'sig-does-not-matter', SECRET);
     expect(out.call.call_id).toBe('c');
   });
 
-  it('throws RetellSignatureError on bad signature', () => {
-    expect(() => verifyAndParse(raw, 'nope', SECRET)).toThrow(
+  it('throws RetellSignatureError when the SDK rejects the signature', async () => {
+    mockSdkVerify.mockResolvedValueOnce(false);
+    await expect(verifyAndParse(raw, 'bad', SECRET)).rejects.toThrow(
       RetellSignatureError,
     );
   });
 
-  it('throws RetellSignatureError when signature is missing', () => {
-    expect(() => verifyAndParse(raw, undefined, SECRET)).toThrow(
+  it('throws RetellSignatureError when signature is missing (SDK returns false on empty)', async () => {
+    mockSdkVerify.mockResolvedValueOnce(false);
+    await expect(verifyAndParse(raw, undefined, SECRET)).rejects.toThrow(
       RetellSignatureError,
     );
   });
 
-  it('throws WebhookValidationError when body is not JSON', () => {
+  it('throws WebhookValidationError when body is not JSON (SDK accepted signature)', async () => {
+    mockSdkVerify.mockResolvedValueOnce(true);
     const junk = Buffer.from('not-json', 'utf8');
-    expect(() => verifyAndParse(junk, buildHeader(junk), SECRET)).toThrow(
+    await expect(verifyAndParse(junk, 'sig', SECRET)).rejects.toThrow(
       WebhookValidationError,
     );
   });

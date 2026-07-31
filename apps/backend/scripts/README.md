@@ -1,39 +1,57 @@
 # Backend scripts
 
 Local-only maintenance and diagnostic tools. Not shipped in the production
-image. Nothing here touches the DB or the network.
+image. Nothing here touches the DB. The only network call authorised is
+the ngrok inspector at `127.0.0.1:4040`, and it is gated behind the
+`--capture-from-ngrok` flag on the diagnostic script.
 
 ## `diagnose-retell-signature.ts`
 
 Given a captured Retell webhook (`X-Retell-Signature` header + raw body),
-tries every plausible combination of `{secret, signed-material scheme,
-digest encoding}` and tells you which one, if any, matches the digest in
-the header.
+does two things:
 
-Use it whenever the webhook returns `401` and you can't reproduce Retell's
-signature.
+1. Tries every plausible combination of `{signed-material scheme, digest
+   encoding}` with `RETELL_API_KEY` as the HMAC secret and reports which
+   ones, if any, reproduce the digest in the header.
+2. Calls the **official `retell-sdk#verify`** on the exact same capture
+   and prints its verdict on a dedicated `sdk` row of the table.
 
-### Capturing the header and body via ngrok
+**The SDK verdict is the ground truth.** The manual grid remains for
+comparison — if the SDK accepts something no manual scheme reproduces,
+it means Retell is signing with a scheme we have not enumerated (and
+the SDK is silently keeping up). Use the diagnostic to spot those
+drifts, not to make production decisions.
 
-1. Start the backend and ngrok as usual (`npm run dev`, then
-   `ngrok http 3000`).
-2. Trigger a webhook (Retell dashboard test call, or a real call).
-3. Open the ngrok inspector at <http://127.0.0.1:4040>.
-4. In the left column, click the `POST /webhooks/retell/call-ended`
-   request.
-5. In the right panel, open the **Request** tab.
-6. Under **Headers**, copy the value of `X-Retell-Signature` (starts with
-   `v=`).
-7. Under **Raw** (not "Body", not "JSON"), the **Raw** sub-tab shows the
-   exact bytes ngrok received. Use "Save" (or select-all + copy) to
-   preserve those bytes untouched. If you copy from the pretty-printed
-   **JSON** view instead, you will silently re-encode whitespace and the
-   HMAC will no longer match — that's the whole reason `--body-file`
-   exists.
+### RECOMMENDED — `--capture-from-ngrok`
 
-### Four invocation modes
+This is now the default recommendation. It eliminates the "manually
+reconstructed capture is off by one bit" trap that spawned the whole
+SDK migration.
 
-**1. Positional JSON capture** — quickest for chat/ticket paste-ability:
+```bash
+# 1. Start the backend and ngrok.
+npm run dev            # in one terminal, from apps/backend
+ngrok http 3000        # in another terminal
+
+# 2. Trigger a webhook (Retell dashboard test call, or a real call).
+
+# 3. Run the diagnostic. It fetches the last request seen by ngrok
+#    at http://127.0.0.1:4040/api/requests/http, decodes the raw
+#    base64 body, and analyses those EXACT bytes.
+npm run diag:retell -- --capture-from-ngrok
+```
+
+Defensive on failure modes: if ngrok is not running, or the API shape
+changed, or no request has been captured yet, the script tells you
+exactly what to do — never a stack trace.
+
+### Fallback — manual capture
+
+If you cannot use ngrok (working from a support ticket someone else
+pasted, or you want to compare the current state to an old capture),
+the older modes still work:
+
+**1. Positional JSON capture:**
 
 ```bash
 # capture.json = { "header": "v=1785...,d=4def...", "body": "{\"event\":\"call_analyzed\",...}" }
@@ -48,71 +66,84 @@ npm run diag:retell -- \
   --body '{"event":"call_analyzed","call":{"call_id":"..."}}'
 ```
 
-**3. `--body-file` — RECOMMENDED when the result is ambiguous:**
+**3. `--body-file` — highest fidelity of the manual modes:**
 
 ```bash
-# Save the raw body from ngrok's "Raw" tab into body.raw
+# From ngrok's Raw tab, save the body bytes to body.raw
 npm run diag:retell -- \
   --header "v=1785450205245,d=4def1fb4..." \
   --body-file body.raw
 ```
 
 The body is read as raw bytes — no JSON round-trip, no whitespace
-rewriting, no line-ending translation. If your first attempt with mode 1
-or 2 says "no match" but you're confident the secret is correct, retry
-with `--body-file`. A single extra space or a `\r\n` -> `\n` conversion
-is enough to break HMAC-SHA256.
+rewriting, no line-ending translation. Still less trustworthy than
+`--capture-from-ngrok` (nothing beats the actual API), but a lot
+better than copy/pasting text.
 
-**4. Stdin** — pipe a JSON capture:
+**4. Stdin — pipe a JSON capture:**
 
 ```bash
 cat capture.json | npm run diag:retell
 ```
 
+### Capturing the header and body via ngrok (manual, for the fallback modes)
+
+If you need to build a JSON capture by hand:
+
+1. Start the backend and ngrok as usual (`npm run dev`, then
+   `ngrok http 3000`).
+2. Trigger a webhook.
+3. Open the ngrok inspector at <http://127.0.0.1:4040>.
+4. In the left column, click the `POST /webhooks/retell/call-ended`
+   request.
+5. In the right panel, open the **Request** tab.
+6. Under **Headers**, copy the value of `X-Retell-Signature` (starts with
+   `v=`).
+7. Under **Raw** (not "Body", not "JSON"), the **Raw** sub-tab shows the
+   exact bytes ngrok received. Use "Save" (or select-all + copy) to
+   preserve those bytes untouched. If you copy from the pretty-printed
+   **JSON** view instead, you will silently re-encode whitespace and the
+   HMAC will no longer match — that is exactly why `--capture-from-ngrok`
+   is now the recommended flow.
+
 ### Interpreting the output
 
-- **Exactly one row matches, with `secret=webhook_secret, scheme=ts.body,
-  encoding=hex-lower`** — this is the production configuration.
-  Everything is fine cryptographically; if you were still getting 401,
-  investigate the timestamp freshness block (clock skew on ngrok/backend
-  host) or the header parsing.
+- **SDK verdict = OK**: verification passes. If your webhook is still
+  returning 401 in production, the issue is elsewhere: check the
+  `Retell signature verification via SDK, secret = RETELL_API_KEY` log
+  line at boot, confirm the same `RETELL_API_KEY` is loaded in Jelastic,
+  and look at the freshness block below the table (clock skew).
 
-- **A row matches with `secret=api_key`** — the Retell agent is signing
-  with the API key, not the webhook secret. Either set
-  `RETELL_WEBHOOK_SECRET` to the value currently in `RETELL_API_KEY`, or
-  rotate the webhook secret in the Retell dashboard and copy it into
-  `.env.local`. The prod code already prefers `webhook_secret` and falls
-  back to `api_key`, so if only `api_key` is set, verification will
-  already work — but you should not be surprised by which one you're
-  actually using.
+- **SDK verdict = rejected, and no manual row matches**: the secret in
+  your `.env.local` almost certainly does not match the one configured
+  in the Retell dashboard. Rotate the key and retry. If it still fails
+  with a byte-exact capture, contact Retell support.
 
-- **A row matches with `scheme=body` (no timestamp prefix)** — an older
-  Retell signing convention. Speak to Retell support and confirm which
-  scheme is active on your workspace; do NOT change our production code
-  to match without written confirmation.
+- **SDK verdict = rejected, but some manual row matches**: rare. Usually
+  a timestamp / replay window disagreement — the SDK's own 5-minute
+  window may have rejected the capture even though the HMAC is correct.
+  Check the freshness block.
 
-- **A row matches with `encoding=base64`** — same as above, unusual for
-  Retell. Confirm with support before adapting the code.
+- **SDK verdict = OK, but no manual row matches**: Retell is signing
+  with a scheme we have not enumerated in the manual grid. That is fine
+  — the SDK is the source of truth. If you care about updating the
+  grid to reflect current Retell behaviour, add a scheme to `SCHEMES`
+  in the script.
 
-- **Zero matches, timestamp in window** — the secret in your `.env.local`
-  does not match the one configured in the Retell dashboard. Rotate and
-  recopy. If it still fails, retry with `--body-file` in case the body
-  was reformatted between capture and diagnosis.
-
-- **Zero matches, timestamp OUT of window** — clock skew. Even if the
-  HMAC were correct, the production code would reject the webhook. Fix
-  the host clock (NTP) or increase `RETELL_SIGNATURE_MAX_AGE_SECONDS`
-  temporarily for the diagnostic.
-
-- **Multiple matches** — this is astronomically improbable for
-  HMAC-SHA256. It means the script is buggy or two secrets are
-  identical. Investigate the script, do NOT declare the webhook fixed.
+- **Zero matches, timestamp OUT of window**: clock skew. Fix the host
+  clock (NTP) or increase `RETELL_SIGNATURE_MAX_AGE_SECONDS`
+  temporarily for the diagnostic. Note that the SDK enforces its own
+  5-minute window internally, so a very stale capture will always be
+  rejected regardless of our config.
 
 ### Safety notes
 
 - The script NEVER prints the value of any secret. It only shows the
   variable name and length. Its output is meant to be pasted into chat
   or a support ticket.
-- No DB access. No outbound HTTP. No file writes outside stdout/stderr.
-- Exits with code 0 if at least one combination matches, 1 otherwise —
-  suitable for a smoke check in CI later on.
+- No DB access. No outbound HTTP except the localhost ngrok inspector
+  when `--capture-from-ngrok` is passed. No file writes outside
+  stdout/stderr.
+- Exits with code 0 if the SDK verdict is OK (or, when the SDK could
+  not be invoked, if at least one manual combination matches); 1
+  otherwise — suitable for a smoke check in CI later on.

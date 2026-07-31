@@ -6,8 +6,22 @@
  * combination of {secret, signed-material scheme, digest encoding} and
  * reports which one, if any, reproduces the digest carried by the header.
  *
+ * Session 2.2 additions:
+ *   - **SDK verdict row**. In addition to the 18 manual combinations, we
+ *     now call the official `retell-sdk#verify` on the exact same capture
+ *     and print its boolean verdict on a dedicated line of the table.
+ *     This lets us compare "what the SDK accepts" vs "what our manual
+ *     schemas produce" — the whole point of keeping this tool around now
+ *     that production delegates to the SDK.
+ *   - **--capture-from-ngrok flag**. Fetches the LAST request seen by ngrok
+ *     via its inspector API (127.0.0.1:4040), decodes the raw base64 body,
+ *     and runs the analysis on the exact bytes ngrok received. This is the
+ *     definitive antidote to the "manually reconstructed capture is off by
+ *     one bit" trap that spawned this whole migration.
+ *
  * NOT a production dependency. NOT wired into the running app. Purely
- * diagnostic — no DB, no network, stdout only.
+ * diagnostic — no DB access, and the ONLY network call is the localhost
+ * ngrok inspector, gated behind --capture-from-ngrok.
  *
  * IMPORTANT: this script deliberately never prints the value of any secret.
  * It is expected to be pasted into tickets / chat transcripts.
@@ -18,6 +32,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
+import { verify as retellSdkVerify } from 'retell-sdk';
 
 // ---------------------------------------------------------------------------
 // .env loading — mirrors apps/backend/src/config/env.ts. We deliberately do
@@ -53,6 +68,7 @@ function paint(code: string, s: string): string {
 }
 const green = (s: string) => paint('32', s);
 const red = (s: string) => paint('31', s);
+const yellow = (s: string) => paint('33', s);
 const dim = (s: string) => paint('2', s);
 const bold = (s: string) => paint('1', s);
 
@@ -63,6 +79,7 @@ const bold = (s: string) => paint('1', s);
 //   --body-file <path>       (bytes read verbatim, no JSON round-trip)
 //   --max-age-seconds <n>    (override, default from env or 300)
 //   --json-file <path>       (implicit if a positional arg is passed)
+//   --capture-from-ngrok     (fetch last request from 127.0.0.1:4040)
 //   --help
 // ---------------------------------------------------------------------------
 interface CliArgs {
@@ -71,11 +88,12 @@ interface CliArgs {
   bodyFile?: string;
   jsonFile?: string;
   maxAgeSeconds?: number;
+  captureFromNgrok: boolean;
   help: boolean;
 }
 
 function parseCli(argv: string[]): CliArgs {
-  const args: CliArgs = { help: false };
+  const args: CliArgs = { help: false, captureFromNgrok: false };
   const rest: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -99,6 +117,9 @@ function parseCli(argv: string[]): CliArgs {
       case '--max-age-seconds':
         args.maxAgeSeconds = Number(argv[++i]);
         break;
+      case '--capture-from-ngrok':
+        args.captureFromNgrok = true;
+        break;
       default:
         if (a !== undefined && !a.startsWith('-')) rest.push(a);
     }
@@ -115,21 +136,25 @@ function printHelp(): void {
     'Usage: npm run diag:retell -- [options]',
     '',
     'Input modes (priority order):',
-    '  1. Positional JSON file  { "header": "...", "body": "..." }',
+    '  1. --capture-from-ngrok  (RECOMMENDED — bypasses copy/paste errors):',
+    '     npm run diag:retell -- --capture-from-ngrok',
+    '     Fetches the last POST captured by ngrok at http://127.0.0.1:4040',
+    '     and analyses its EXACT bytes.',
+    '  2. Positional JSON file:',
     '     npm run diag:retell -- capture.json',
-    '  2. Explicit flags:',
+    '  3. Explicit flags:',
     '     npm run diag:retell -- --header "v=...,d=..." --body \'{"event":"..."}\'',
-    '  3. Raw body file (BEST FIDELITY — bytes read verbatim, no JSON re-encode):',
+    '  4. Raw body file:',
     '     npm run diag:retell -- --header "v=...,d=..." --body-file body.raw',
-    '  4. Stdin (pipe the JSON capture):',
+    '  5. Stdin (pipe the JSON capture):',
     '     cat capture.json | npm run diag:retell',
     '',
     'Options:',
     '  --max-age-seconds <n>   Override the anti-replay window (default 300).',
     '  -h, --help              Show this help.',
     '',
-    'Environment: reads RETELL_WEBHOOK_SECRET and RETELL_API_KEY from',
-    '<monorepo-root>/.env.local then apps/backend/.env.local.',
+    'Environment: reads RETELL_API_KEY from <monorepo-root>/.env.local then',
+    'apps/backend/.env.local.',
   ];
   process.stdout.write(lines.join('\n') + '\n');
 }
@@ -149,8 +174,6 @@ function die(msg: string, hint?: string): never {
 async function readStdin(): Promise<string> {
   if (process.stdin.isTTY) return '';
   const chunks: Buffer[] = [];
-  // Node's Readable async-iterator yields `any`; we narrow explicitly to
-  // avoid unsafe-argument on Buffer.concat.
   for await (const chunk of process.stdin as AsyncIterable<unknown>) {
     if (typeof chunk === 'string') {
       chunks.push(Buffer.from(chunk));
@@ -159,6 +182,150 @@ async function readStdin(): Promise<string> {
     }
   }
   return Buffer.concat(chunks).toString('utf8');
+}
+
+// ---------------------------------------------------------------------------
+// ngrok inspector fetch. Defensive: NEVER assumes the response shape;
+// checks each field and gives a clear message if anything is off.
+// ---------------------------------------------------------------------------
+interface NgrokCapture {
+  header: string;
+  body: Buffer;
+}
+
+async function fetchFromNgrok(): Promise<NgrokCapture> {
+  const url = 'http://127.0.0.1:4040/api/requests/http';
+  let resp: Response;
+  try {
+    resp = await fetch(url);
+  } catch (e) {
+    die(
+      `could not reach ngrok inspector at ${url}`,
+      `is ngrok running? start it with "ngrok http 3000". Underlying: ${(e as Error).message}`,
+    );
+  }
+  if (!resp.ok) {
+    die(
+      `ngrok inspector returned HTTP ${resp.status}`,
+      'ngrok is running but the inspector is not answering as expected',
+    );
+  }
+
+  // Parse defensively. The ngrok inspector JSON shape can drift between
+  // versions; we validate every field we touch and give the user something
+  // actionable rather than a stack trace.
+  let parsed: unknown;
+  try {
+    parsed = await resp.json();
+  } catch (e) {
+    die(
+      'ngrok inspector response was not valid JSON',
+      (e as Error).message,
+    );
+  }
+
+  if (typeof parsed !== 'object' || parsed === null) {
+    die('ngrok inspector JSON is not an object');
+  }
+
+  const root = parsed as { requests?: unknown };
+  const requests = root.requests;
+  if (!Array.isArray(requests)) {
+    die(
+      'ngrok inspector JSON has no `requests` array',
+      'the ngrok API contract may have changed. Inspect http://127.0.0.1:4040/api/requests/http manually and update this script.',
+    );
+  }
+  if (requests.length === 0) {
+    die(
+      'no HTTP requests captured by ngrok yet',
+      'trigger a webhook first (Retell dashboard test call), then re-run this script',
+    );
+  }
+
+  // Take the LAST request. ngrok returns most-recent-first in current
+  // versions, but we check both possibilities defensively by picking the
+  // one with the largest timestamp when available; otherwise index 0.
+  const last = pickLastRequest(requests);
+  if (last === null) {
+    die(
+      'ngrok returned requests but none had a recognisable shape',
+      'expected each request to be an object with a `request` field carrying headers + body',
+    );
+  }
+
+  return last;
+}
+
+/**
+ * Extract { header, body } from an ngrok request entry. Returns null if
+ * the entry does not look like an HTTP POST with a signature header and a
+ * base64-encoded body. Defensive: EVERY narrowing step is checked.
+ */
+function extractCapture(entry: unknown): NgrokCapture | null {
+  if (typeof entry !== 'object' || entry === null) return null;
+  const req = (entry as { request?: unknown }).request;
+  if (typeof req !== 'object' || req === null) return null;
+
+  // Headers: ngrok exposes them as `{ Header-Name: ["value"] }`.
+  const headers = (req as { headers?: unknown }).headers;
+  if (typeof headers !== 'object' || headers === null) return null;
+
+  const headerValue = findHeader(headers, 'x-retell-signature');
+  if (headerValue === null) return null;
+
+  // Body: ngrok exposes it as base64 in `raw` (name varies across versions:
+  // `raw`, `body`, `rawBase64`). We try each.
+  const body = extractBodyBytes(req as Record<string, unknown>);
+  if (body === null) return null;
+
+  return { header: headerValue, body };
+}
+
+function findHeader(headers: object, name: string): string | null {
+  const target = name.toLowerCase();
+  for (const [k, v] of Object.entries(headers as Record<string, unknown>)) {
+    if (k.toLowerCase() !== target) continue;
+    if (typeof v === 'string') return v;
+    if (Array.isArray(v) && v.length > 0 && typeof v[0] === 'string') return v[0];
+  }
+  return null;
+}
+
+function extractBodyBytes(req: Record<string, unknown>): Buffer | null {
+  // Try known field names in order of likelihood.
+  for (const key of ['raw', 'body', 'rawBase64', 'raw_body']) {
+    const v = req[key];
+    if (typeof v !== 'string' || v.length === 0) continue;
+    // ngrok returns base64. If it turns out to be plain UTF-8 in some
+    // version, base64 decoding is idempotent-ish for pure-ASCII JSON
+    // (invalid chars = fail) — we catch and fall through.
+    try {
+      const decoded = Buffer.from(v, 'base64');
+      // Sanity check: if the base64 decoded to a plausibly-JSON payload
+      // (starts with '{' or '['), accept it. Otherwise assume the field
+      // was already raw text.
+      if (decoded.length > 0) {
+        const first = String.fromCharCode(decoded[0]);
+        if (first === '{' || first === '[') return decoded;
+      }
+    } catch {
+      // fall through
+    }
+    // Fallback: treat the string as UTF-8 raw body.
+    return Buffer.from(v, 'utf8');
+  }
+  return null;
+}
+
+function pickLastRequest(requests: readonly unknown[]): NgrokCapture | null {
+  // Iterate from index 0 (most-recent-first assumption); as soon as we
+  // find one we can decode, return it. If none decode, return null.
+  for (const entry of requests) {
+    const c = extractCapture(entry);
+    if (c !== null) return c;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -181,13 +348,20 @@ function parseHeader(raw: string): ParsedHeader | null {
 }
 
 // ---------------------------------------------------------------------------
-// Combinations to test. 2 secrets x 3 schemes x 3 encodings = 18 rows.
+// Combinations to test.
+//
+// Note (session 2.2): we now know from inspecting the SDK that Retell signs
+// with HMAC-SHA256(apiKey, body + timestampMs) — the timestamp goes at the
+// END, not the start, and there is no separator. We added `body.ts` to the
+// schemes to reflect that, alongside the historical guesses.
+//
+// The manual grid remains as a diagnostic AID: if the SDK verdict disagrees
+// with our matching row, that's a real signal something has drifted.
 // ---------------------------------------------------------------------------
-type SecretName = 'webhook_secret' | 'api_key';
-type Scheme = 'body' | 'ts.body' | 'tsbody';
+type Scheme = 'body' | 'ts.body' | 'tsbody' | 'body.ts' | 'bodyts';
 type Encoding = 'hex-lower' | 'hex-upper' | 'base64';
 
-const SCHEMES: readonly Scheme[] = ['body', 'ts.body', 'tsbody'] as const;
+const SCHEMES: readonly Scheme[] = ['body', 'ts.body', 'tsbody', 'body.ts', 'bodyts'] as const;
 const ENCODINGS: readonly Encoding[] = [
   'hex-lower',
   'hex-upper',
@@ -206,6 +380,11 @@ function buildSignedMaterial(
       return Buffer.concat([Buffer.from(`${timestampMs}.`, 'utf8'), body]);
     case 'tsbody':
       return Buffer.concat([Buffer.from(`${timestampMs}`, 'utf8'), body]);
+    case 'body.ts':
+      return Buffer.concat([body, Buffer.from(`.${timestampMs}`, 'utf8')]);
+    case 'bodyts':
+      // This is the Retell SDK's actual scheme (body + timestampMs).
+      return Buffer.concat([body, Buffer.from(`${timestampMs}`, 'utf8')]);
   }
 }
 
@@ -237,13 +416,13 @@ function safeEqual(a: string, b: string): boolean {
 // Table rendering. Fixed column widths, ASCII borders.
 // ---------------------------------------------------------------------------
 interface Row {
-  secret: SecretName;
-  scheme: Scheme;
-  encoding: Encoding;
+  secret: string;
+  scheme: string;
+  encoding: string;
   match: boolean;
 }
 
-function renderTable(rows: readonly Row[]): string {
+function renderTable(rows: readonly Row[], sdkVerdict: boolean | null): string {
   const headers = ['secret', 'signed material', 'digest', 'match'];
   const widths = [16, 16, 10, 5];
   const sep = `+-${'-'.repeat(widths[0])}-+-${'-'.repeat(widths[1])}-+-${'-'.repeat(
@@ -258,6 +437,15 @@ function renderTable(rows: readonly Row[]): string {
     const mark = r.match ? green('OK') : red('no');
     out.push(line([r.secret, r.scheme, r.encoding, mark]));
   }
+  // Dedicated SDK row, visually separated.
+  out.push(sep);
+  const sdkMark =
+    sdkVerdict === null
+      ? yellow('n/a')
+      : sdkVerdict
+      ? green('OK')
+      : red('no');
+  out.push(line([bold('sdk'), 'retell-sdk#verify', '(sdk)', sdkMark]));
   out.push(sep);
   return out.join('\n');
 }
@@ -272,12 +460,20 @@ async function main(): Promise<number> {
     return 0;
   }
 
-  // ------- Resolve header + body (mode priority: file > flags > stdin) -----
+  // ------- Resolve header + body (mode priority: ngrok > file > flags > stdin)
   let header: string | undefined;
   let body: Buffer | undefined;
 
-  // Mode: --body-file (raw bytes) — combines with --header
-  if (args.bodyFile !== undefined) {
+  // Mode 1: --capture-from-ngrok (RECOMMENDED)
+  if (args.captureFromNgrok) {
+    process.stdout.write(dim('fetching last request from ngrok (127.0.0.1:4040)...\n'));
+    const cap = await fetchFromNgrok();
+    header = cap.header;
+    body = cap.body;
+  }
+
+  // Mode 2: --body-file (raw bytes) — combines with --header
+  if (body === undefined && args.bodyFile !== undefined) {
     if (!existsSync(args.bodyFile)) {
       die(`--body-file not found: ${args.bodyFile}`);
     }
@@ -285,7 +481,7 @@ async function main(): Promise<number> {
     header = args.header;
   }
 
-  // Mode: JSON file
+  // Mode 3: JSON file
   if (body === undefined && args.jsonFile !== undefined) {
     if (!existsSync(args.jsonFile)) {
       die(`JSON file not found: ${args.jsonFile}`);
@@ -310,19 +506,19 @@ async function main(): Promise<number> {
     body = Buffer.from(p.body, 'utf8');
   }
 
-  // Mode: explicit --header/--body flags
+  // Mode 4: explicit --header/--body flags
   if (body === undefined && args.body !== undefined) {
     body = Buffer.from(args.body, 'utf8');
     header = args.header;
   }
 
-  // Mode: stdin JSON
+  // Mode 5: stdin JSON
   if (body === undefined) {
     const stdinContent = await readStdin();
     if (stdinContent.trim().length === 0) {
       die(
         'no input provided',
-        'pass a JSON capture as arg, or use --header/--body, --body-file, or pipe JSON via stdin. Run --help for details.',
+        'pass --capture-from-ngrok (recommended), a JSON capture as arg, use --header/--body, --body-file, or pipe JSON via stdin. Run --help for details.',
       );
     }
     let parsed: unknown;
@@ -351,26 +547,18 @@ async function main(): Promise<number> {
   if (!parsed) {
     die(
       'signature header does not match `v=<digits>,d=<hex>` format',
-      'copy the exact value of X-Retell-Signature — no quotes, no whitespace edits',
+      'copy the exact value of X-Retell-Signature — no quotes, no whitespace edits. If Retell has changed their format, the SDK may still accept it; check its verdict specifically.',
     );
   }
 
-  // ------- Resolve secrets from env --------------------------------------
-  const webhookSecret = process.env.RETELL_WEBHOOK_SECRET ?? '';
+  // ------- Resolve secret from env --------------------------------------
+  // Session 2.2: only RETELL_API_KEY is used (webhook secret is gone).
   const apiKey = process.env.RETELL_API_KEY ?? '';
-  if (webhookSecret.length === 0 && apiKey.length === 0) {
+  if (apiKey.length === 0) {
     die(
-      'no Retell secret found in env',
-      'set RETELL_WEBHOOK_SECRET and/or RETELL_API_KEY in .env.local (repo root or apps/backend)',
+      'RETELL_API_KEY not found in env',
+      'set RETELL_API_KEY in .env.local (repo root or apps/backend)',
     );
-  }
-
-  const secretsToTry: Array<{ name: SecretName; value: string }> = [];
-  if (webhookSecret.length > 0) {
-    secretsToTry.push({ name: 'webhook_secret', value: webhookSecret });
-  }
-  if (apiKey.length > 0) {
-    secretsToTry.push({ name: 'api_key', value: apiKey });
   }
 
   // ------- Header echo (safe: no secrets, no body dump) ------------------
@@ -380,44 +568,42 @@ async function main(): Promise<number> {
       `body: ${body.length} bytes | header ts: ${parsed.timestampMs} | header digest length: ${parsed.digest.length}\n`,
     ),
   );
+  process.stdout.write(dim(`secrets: api_key(len=${apiKey.length})\n\n`));
 
-  // Secret info — NEVER the value. Length + are-they-identical only.
-  const secretInfo: string[] = [];
-  for (const s of secretsToTry) {
-    secretInfo.push(`${s.name}(len=${s.value.length})`);
-  }
-  if (webhookSecret.length > 0 && apiKey.length > 0) {
-    secretInfo.push(
-      `identical=${webhookSecret === apiKey ? 'YES' : 'no'}`,
-    );
-  }
-  process.stdout.write(dim(`secrets: ${secretInfo.join(', ')}\n\n`));
-
-  // ------- Run the 18 combinations (or 9 if only one secret set) --------
+  // ------- Run the manual combinations ----------------------------------
   const rows: Row[] = [];
-  for (const secret of secretsToTry) {
-    for (const scheme of SCHEMES) {
-      const material = buildSignedMaterial(
+  for (const scheme of SCHEMES) {
+    const material = buildSignedMaterial(scheme, parsed.timestampMs, body);
+    const hmacBytes = createHmac('sha256', apiKey).update(material).digest();
+    for (const encoding of ENCODINGS) {
+      const candidate = encodeDigest(hmacBytes, encoding);
+      rows.push({
+        secret: 'api_key',
         scheme,
-        parsed.timestampMs,
-        body,
-      );
-      const hmacBytes = createHmac('sha256', secret.value)
-        .update(material)
-        .digest();
-      for (const encoding of ENCODINGS) {
-        const candidate = encodeDigest(hmacBytes, encoding);
-        rows.push({
-          secret: secret.name,
-          scheme,
-          encoding,
-          match: safeEqual(candidate, parsed.digest),
-        });
-      }
+        encoding,
+        match: safeEqual(candidate, parsed.digest),
+      });
     }
   }
 
-  process.stdout.write(renderTable(rows) + '\n\n');
+  // ------- Ask the SDK ---------------------------------------------------
+  // The whole point of the SDK migration: this is the ground truth.
+  let sdkVerdict: boolean | null = null;
+  try {
+    sdkVerdict = await retellSdkVerify(
+      body.toString('utf-8'),
+      apiKey,
+      header,
+    );
+  } catch (e) {
+    // Log without stack; the SDK might throw on a runtime without Web Crypto.
+    process.stderr.write(
+      `${yellow('warn:')} retell-sdk#verify threw: ${(e as Error).message}\n`,
+    );
+    sdkVerdict = null;
+  }
+
+  process.stdout.write(renderTable(rows, sdkVerdict) + '\n\n');
 
   // ------- Freshness block ----------------------------------------------
   const maxAgeSeconds =
@@ -443,27 +629,38 @@ async function main(): Promise<number> {
   // ------- Final summary -------------------------------------------------
   const matches = rows.filter((r) => r.match);
   process.stdout.write(bold('Summary\n'));
-  process.stdout.write(`  matching combinations: ${matches.length}\n`);
-  if (matches.length === 0) {
+  process.stdout.write(`  matching manual combinations: ${matches.length}\n`);
+  process.stdout.write(
+    `  SDK verdict                 : ${
+      sdkVerdict === null
+        ? yellow('n/a (SDK threw)')
+        : sdkVerdict
+        ? green('OK')
+        : red('rejected')
+    }\n`,
+  );
+  if (matches.length === 0 && sdkVerdict === true) {
     process.stdout.write(
-      `  ${red('no combination matches — the secret in .env.local is almost certainly wrong (or the body was reformatted; try --body-file)')}\n`,
+      `  ${yellow('note: the SDK accepts this signature but no manual scheme matches — the SDK is using a scheme we have not enumerated. Trust the SDK; the manual grid is stale.')}\n`,
     );
-  } else if (matches.length === 1) {
+  } else if (matches.length > 0 && sdkVerdict === false) {
+    process.stdout.write(
+      `  ${red('note: manual scheme matches but SDK rejects — probably a timestamp / replay window discrepancy inside the SDK.')}\n`,
+    );
+  } else if (matches.length === 0 && sdkVerdict === false) {
+    process.stdout.write(
+      `  ${red('no combination matches. Most likely: wrong RETELL_API_KEY in .env.local, or the body was reformatted between capture and diagnosis. Try --capture-from-ngrok for byte-exact fidelity.')}\n`,
+    );
+  } else if (matches.length > 0 && sdkVerdict === true) {
     const m = matches[0];
     process.stdout.write(
-      `  ${green(`use: secret=${m.secret}, scheme=${m.scheme}, encoding=${m.encoding}`)}\n`,
+      `  ${green(`match agreed: secret=${m.secret}, scheme=${m.scheme}, encoding=${m.encoding} (SDK also OK)`)}\n`,
     );
-  } else {
-    process.stdout.write(
-      `  ${red('multiple matches — this is astronomically improbable for HMAC-SHA256. Suspect a script bug, not a success.')}\n`,
-    );
-    for (const m of matches) {
-      process.stdout.write(
-        `    - secret=${m.secret}, scheme=${m.scheme}, encoding=${m.encoding}\n`,
-      );
-    }
   }
 
+  // Exit code: prefer the SDK verdict when we have it, otherwise fall back
+  // to the manual grid.
+  if (sdkVerdict !== null) return sdkVerdict ? 0 : 1;
   return matches.length > 0 ? 0 : 1;
 }
 

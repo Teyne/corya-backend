@@ -12,8 +12,10 @@ process.env.LOG_LEVEL ??= 'silent';
 process.env.CORS_ORIGIN ??= 'http://localhost:3001';
 
 // -- Session 2 promotions: these are required at boot, dummy values suffice
-// because tests either mock the DB layer or the crypto helpers. NEVER put
+// because tests either mock the DB layer or the SDK verifier. NEVER put
 // real credentials here.
 process.env.SUPABASE_URL ??= 'http://localhost:54321';
 process.env.SUPABASE_SERVICE_KEY ??= 'test-service-key-not-real';
-process.env.RETELL_WEBHOOK_SECRET ??= 'test-retell-secret-not-real';
+// Session 2.2 : bascule vers `retell-sdk`. Un seul secret désormais,
+// obligatoire au boot (schema env.ts). RETELL_WEBHOOK_SECRET a disparu.
+process.env.RETELL_API_KEY ??= 'test-retell-api-key-not-real';
