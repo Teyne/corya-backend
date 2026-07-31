@@ -10,7 +10,10 @@
  *   2. Extract structured fields (patient, motif, rdv) from
  *      `call_analysis.custom_analysis_data` — best-effort, all optional
  *   3. Insert `appels` row (idempotent on retell_call_id)
- *   4. Enqueue jobs: generate_pdf, send_email, purge_audio_retell@+48h
+ *   4. Enqueue jobs:
+ *        - `process_appel` (monolithic PDF -> upload -> email pipeline;
+ *          idempotent via per-step checkpoints stored in jobs.payload)
+ *        - `purge_audio_retell` scheduled at date_appel + 48 h
  *
  * PII handling:
  *   - `patient_telephone` (raw) goes into DB (purged at J+7 by DB cron)
@@ -29,6 +32,7 @@ import {
 import type {
   AppelInsertRow,
   AppelResultat,
+  ProcessAppelPayload,
   RetellCallAnalyzed,
   WebhookProcessResult,
 } from '../types/index.js';
@@ -157,23 +161,29 @@ export async function processCallAnalyzed(
   }
 
   // 4. Enqueue post-processing jobs -------------------------------------
-  // Order: PDF first (email needs it), then email, then audio purge.
-  // Each call is independently idempotent thanks to the unique partial
-  // index on (type, appel_id) WHERE status IN ('pending','processing').
+  // Session 3 change: the historical `generate_pdf` + `send_email` split
+  // was collapsed into ONE monolithic `process_appel` job. The worker
+  // (src/workers/job-worker.ts) walks the pipeline PDF -> upload -> email
+  // atomically from the caller's perspective, using per-step checkpoints
+  // written into jobs.payload to stay idempotent across retries.
+  //
+  // Both enqueues are independently idempotent thanks to the unique
+  // partial index on (type, appel_id) WHERE status IN ('pending',
+  // 'processing').
 
+  const processAppelPayload: ProcessAppelPayload = {
+    version: 1,
+    to: cabinet.email_notification,
+    cc: cabinet.email_notification_cc,
+    steps: {},
+  };
   await enqueueJobIdempotent({
-    type: 'generate_pdf',
+    type: 'process_appel',
     appel_id: appelId,
-    payload: {},
+    payload: processAppelPayload,
   });
 
-  await enqueueJobIdempotent({
-    type: 'send_email',
-    appel_id: appelId,
-    payload: { to: cabinet.email_notification },
-  });
-
-  // Retell audio purge at date_appel + AUDIO_RETENTION_HOURS.
+  // Retell audio purge at date_appel + AUDIO_RETENTION_HOURS (unchanged).
   await enqueueJobIdempotent({
     type: 'purge_audio_retell',
     appel_id: appelId,

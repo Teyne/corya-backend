@@ -193,12 +193,21 @@ webhooksRouter.post(
 
     // Fire-and-forget: we own retries via the jobs table. Any thrown error
     // is caught here and logged; Retell must NEVER see it.
+    //
+    // nLPD guardrail (session 3.1, database-compliance audit): we log ONLY
+    // the error CLASS NAME, never `err.message`. Downstream DB helpers
+    // (`insertAppelIdempotent` in particular) can propagate a Postgres
+    // error whose `.message` includes the offending column VALUE (e.g.
+    // `DETAIL: Key (patient_telephone)=(+417...)`) — that would defeat the
+    // recursive log sanitizer, which only redacts by KEY name. The
+    // detailed message is still captured by the worker in `jobs.last_error`
+    // through a separately-scrubbed path (see workers/job-worker.ts).
     const payload = event;
     void processCallAnalyzed(payload).catch((err: unknown) => {
       logger.error(
         {
           retell_call_id: payload.call.call_id,
-          err: err instanceof Error ? { name: err.name, message: err.message } : String(err),
+          err_name: err instanceof Error ? err.name : 'unknown',
         },
         'webhook_async_processing_failed',
       );
