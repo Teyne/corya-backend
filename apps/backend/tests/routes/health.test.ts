@@ -6,6 +6,7 @@ interface HealthBody {
   status: string;
   version: string;
   timestamp: string;
+  uptime_seconds: number;
 }
 
 async function getHealth(): Promise<{ status: number; body: HealthBody }> {
@@ -34,5 +35,12 @@ describe('GET /health', () => {
     const parsed = new Date(ts);
     expect(Number.isNaN(parsed.getTime())).toBe(false);
     expect(parsed.toISOString()).toBe(ts);
+  });
+
+  it('returns an integer uptime_seconds >= 0 (session 4 vague 4)', async () => {
+    const { body } = await getHealth();
+    expect(typeof body.uptime_seconds).toBe('number');
+    expect(Number.isInteger(body.uptime_seconds)).toBe(true);
+    expect(body.uptime_seconds).toBeGreaterThanOrEqual(0);
   });
 });

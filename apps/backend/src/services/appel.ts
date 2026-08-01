@@ -88,14 +88,21 @@ function computeAudioExpiresAt(dateAppelIso: string): string {
 
 export async function processCallAnalyzed(
   payload: RetellCallAnalyzed,
+  correlationId: string | null = null,
 ): Promise<WebhookProcessResult> {
   const call = payload.call;
-  const correlationId = call.call_id;
+  const retellCallId = call.call_id;
+  // Session 4 vague 3: the correlation id comes from the HTTP request
+  // via middleware/correlation.ts. `retell_call_id` remains a distinct
+  // log field — it is NOT a correlation id (multiple Retell events
+  // arrive for the same call), but it is the strongest business
+  // identifier we have.
+  const logCtx = { retell_call_id: retellCallId, correlation_id: correlationId };
 
   // 1. Cabinet lookup ----------------------------------------------------
   if (!call.to_number) {
     logger.warn(
-      { retell_call_id: correlationId },
+      logCtx,
       'webhook_missing_to_number — cannot route to cabinet',
     );
     return { kind: 'cabinet_not_found', toNumber: '' };
@@ -105,7 +112,7 @@ export async function processCallAnalyzed(
   if (!cabinet) {
     // to_number is a Corya-owned line, safe to log (not a patient number).
     logger.warn(
-      { retell_call_id: correlationId, to_number: call.to_number },
+      { ...logCtx, to_number: call.to_number },
       'webhook_no_cabinet_for_to_number',
     );
     return { kind: 'cabinet_not_found', toNumber: call.to_number };
@@ -154,10 +161,10 @@ export async function processCallAnalyzed(
 
   if (duplicate) {
     logger.info(
-      { retell_call_id: correlationId, appel_id: appelId },
+      { ...logCtx, appel_id: appelId },
       'webhook_replay_ignored',
     );
-    return { kind: 'duplicate', retellCallId: correlationId };
+    return { kind: 'duplicate', retellCallId: retellCallId };
   }
 
   // 4. Enqueue post-processing jobs -------------------------------------
@@ -177,10 +184,20 @@ export async function processCallAnalyzed(
     cc: cabinet.email_notification_cc,
     steps: {},
   };
+  // Session 4 vague 3 : le correlation_id posé ici est l'ID de REQUÊTE
+  // HTTP (généré par middleware/correlation.ts). C'est ce qui permet de
+  // suivre une même requête webhook du log HTTP jusqu'aux logs du worker.
+  // retell_call_id reste un champ de log distinct — utile mais pas un
+  // correlation id (plusieurs événements Retell arrivent pour un même
+  // appel, ils partagent le retell_call_id mais pas le correlation id).
+  //
+  // Réconcilie l'écart n°1 de la vague 2 : on n'utilise plus retell_call_id
+  // comme correlation id (choix par défaut faute de middleware à l'époque).
   await enqueueJobIdempotent({
     type: 'process_appel',
     appel_id: appelId,
     payload: processAppelPayload,
+    correlation_id: correlationId,
   });
 
   // Retell audio purge at date_appel + AUDIO_RETENTION_HOURS (unchanged).
@@ -189,14 +206,11 @@ export async function processCallAnalyzed(
     appel_id: appelId,
     payload: { retell_call_id: call.call_id },
     run_after: computeAudioExpiresAt(dateAppelIso),
+    correlation_id: correlationId,
   });
 
   logger.info(
-    {
-      retell_call_id: correlationId,
-      appel_id: appelId,
-      cabinet_id: cabinet.id,
-    },
+    { ...logCtx, appel_id: appelId, cabinet_id: cabinet.id },
     'webhook_processed',
   );
 

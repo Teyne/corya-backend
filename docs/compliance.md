@@ -110,7 +110,35 @@ Règle appliquée depuis les migrations `20260731100000_job_claim_and_pdf_purge.
 - **Cas nominal** — email récap envoyé avec succès : le PDF est purgé **30 jours après `pdf_envoye_at`** (motif d'audit `pdf_purged_30d`).
 - **Cas dégradé** — email jamais parti (job `process_appel` en `dead_letter` sur défaillance SMTP prolongée) : le PDF est purgé **30 jours après `appels.created_at`** (motif d'audit distinct `pdf_purged_30d_unsent`, qui permet de détecter en revue les vagues d'échecs SMTP).
 - **Garantie borne dure** : aucun PDF ne survit plus de 30 jours après la création de l'appel, quel que soit le sort de l'email. Cette borne évite qu'un job bloqué en dead_letter n'orphelinise un PDF jusqu'à `purge_ancient_appels` (24 mois).
-- Purge en deux temps via `file_deletions_outbox` : la fonction SQL enfile un ordre de suppression Storage et met `appels.pdf_url` à NULL ; le worker backend consomme l'outbox et supprime le binaire côté bucket, horodatant `deleted_at` comme preuve d'audit.
+- Purge en deux temps via `file_deletions_outbox` : la fonction SQL enfile un ordre de suppression Storage et met `appels.pdf_url` à NULL ; le worker backend est censé consommer l'outbox et supprimer le binaire côté bucket, en horodatant `deleted_at` comme preuve d'audit.
+
+> ### ⚠️ Écart connu — le consommateur de `file_deletions_outbox` n'existe pas
+>
+> Constaté en Session 4 (01.08.2026). Aucun fichier de `apps/backend/src/`
+> ne lit `file_deletions_outbox`. Conséquences factuelles, à ne pas
+> présenter autrement à un cabinet ou à un auditeur :
+>
+> - **PDF** : la garantie « aucun PDF ne survit plus de 30 jours » est vraie
+>   de la migration SQL, **fausse du système**. À J+30 le PDF est
+>   déréférencé (`pdf_url = NULL`, donc plus atteignable depuis le
+>   back-office ni par une URL signée) et l'ordre de suppression est enfilé,
+>   mais **le binaire reste dans le bucket Supabase**.
+> - **Audio Retell** : le job `purge_audio_retell`, enfilé à chaque appel
+>   pour T+48 h, n'a pas de handler. L'audio **n'est pas supprimé chez
+>   Retell** par Corya. La rétention effective est celle configurée dans le
+>   dashboard Retell, qui doit donc être vérifiée et documentée par le
+>   fondateur tant que cet écart subsiste.
+>
+> Pour éviter une alerte email par appel, ce job est routé directement en
+> `dead_letter` avec `last_error = 'not_implemented:purge_audio_retell'` et
+> **sans alerte** (`KNOWN_UNIMPLEMENTED_JOB_TYPES` dans
+> `src/workers/job-worker.ts`). Le silence est délibéré et borné à ce type
+> précis : tout autre type de job non géré déclenche toujours une alerte.
+> Ces lignes `dead_letter` sont la trace de l'écart et devront être
+> requeuées manuellement le jour où le handler existe.
+>
+> **Résolution prévue** : Session 5, priorité 1 — consommateur d'outbox +
+> appel de l'API de suppression d'enregistrement Retell.
 
 Statut du PDF vis-à-vis du patient :
 
@@ -187,6 +215,67 @@ En cas de violation de sécurité :
 - Documentation de toute violation dans un registre interne
 
 Procédure à documenter dès la mise en production.
+
+## Alerting opérationnel (Session 4)
+
+Le backend émet des **alertes email** dès qu'un incident risque de retarder ou
+perdre un récapitulatif d'appel. Le silence prolongé d'un composant critique
+sans alerte est un risque de compliance en soi (patient dont le récapitulatif
+n'arrive pas au cabinet, sans que personne ne s'en rende compte).
+
+### Types d'alertes
+
+| Type              | Déclencheur                                                      | Émis par                          |
+| ----------------- | ---------------------------------------------------------------- | --------------------------------- |
+| `job_dead_letter` | Job en `dead_letter` après `max_attempts` ou échec permanent    | Worker (immédiat) + poller API    |
+| `pdf_orphelin`    | `dead_letter` avec PDF uploadé mais email jamais envoyé          | Worker (immédiat) + poller API    |
+| `worker_stale`    | Heartbeat worker > 60 s (`last_seen_at`) ou > 180 s (`last_poll_at`) | Poller API (5 min + boot)     |
+| `jobs_backlog`    | > `JOBS_BACKLOG_ALERT_THRESHOLD` jobs `pending` de plus de 5 min | Poller API                        |
+| `cron_stale`      | Un cron pg_cron hors de sa fenêtre de tolérance                  | Poller API                        |
+
+### Contrat de non-fuite
+
+- **Aucune donnée patient** (nom, prénom, téléphone, motif, transcript) ne
+  transite par un email d'alerte. Le contenu est limité à des identifiants
+  techniques (`job_id`, `retell_call_id`, `cabinet_id`, `correlation_id`,
+  compteurs, `jobname` pour les crons).
+- Le corps est **texte brut** — pas d'HTML, pas d'images.
+- Le poller `dead_letter` marque `dead_letter_alerted_at` UNIQUEMENT après
+  un envoi SMTP confirmé, garantissant qu'aucune alerte n'est perdue sur
+  panne SMTP.
+- Déduplication mémoire : 1 alerte max par type par fenêtre
+  `ALERT_DEDUP_WINDOW_MS` (15 min par défaut). Un worker qui boucle sur
+  une erreur ne peut pas générer 1800 emails/heure.
+- `ALERT_ENABLED=false` produit un **WARN explicite au boot** de l'API
+  ET du worker — impossible de croire que les alertes tournent alors
+  qu'elles sont coupées.
+
+### Fuseau horaire des crons pg_cron
+
+**pg_cron sur Supabase tourne en UTC**, pas en heure locale suisse. Toutes
+les planifications des migrations sont exprimées en UTC :
+
+- `purge-expired-audio` : `0 * * * *` = toutes les heures UTC
+- `anonymize-old-transcripts` : `0 3 * * *` = 03:00 UTC (04:00 CET / 05:00 CEST)
+- `purge-old-pdfs` : `30 3 * * *` = 03:30 UTC (04:30 CET / 05:30 CEST)
+- `purge-ancient-appels` : `0 4 1 * *` = 04:00 UTC le 1er du mois
+
+Le décalage 1-2 h avec l'heure suisse est **intentionnel** : les purges
+tournent la nuit heure locale, quand aucun cabinet n'est actif. Ne pas
+"corriger" ces horaires en heure locale ; toute modification passe par
+`database-compliance`.
+
+Le check `crons` dans `/health/deep` et le poller d'alerte `cron_stale`
+partagent une table de tolérances typée (`CRON_TOLERANCES_SECONDS` dans
+`apps/backend/src/services/cron-check.ts`). Toute nouvelle purge ajoutée
+côté SQL doit être ajoutée dans cette table sinon le check la remonte en
+`unknown_cron_in_db`.
+
+### Registre des traitements
+
+Voir `docs/registre-traitements.md` (tenu à jour par `database-compliance`)
+pour la liste exhaustive des flux de données personnelles, leurs bases
+légales, durées de rétention et destinataires.
 
 ## Article 321 CP : secret médical
 

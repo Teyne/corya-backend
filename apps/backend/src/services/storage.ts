@@ -20,7 +20,9 @@
  *     this on the first live webhook would kill the SLA silently.
  */
 import { getServiceClient } from '../config/supabase.js';
+import { env } from '../config/env.js';
 import { logger } from '../config/logger.js';
+import { withTimeout } from '../utils/timeout.js';
 
 /** Bucket name — mirrors the migration. Constant on purpose. */
 export const PDF_BUCKET = 'pdf-recaps';
@@ -62,7 +64,11 @@ export function buildPdfObjectPath(
  */
 export async function ensureBucketAccessible(): Promise<void> {
   const supabase = getServiceClient();
-  const { data, error } = await supabase.storage.listBuckets();
+  const { data, error } = await withTimeout(
+    supabase.storage.listBuckets(),
+    env.TIMEOUT_STORAGE_MS,
+    'storage:listBuckets',
+  );
   if (error) {
     throw new Error(
       `storage_list_buckets_failed: ${error.message} — check SUPABASE_SERVICE_KEY has Storage access`,
@@ -90,10 +96,19 @@ export async function uploadPdf(
   pdfBytes: Buffer | Uint8Array,
 ): Promise<{ objectPath: string }> {
   const supabase = getServiceClient();
-  const { error } = await supabase.storage.from(PDF_BUCKET).upload(objectPath, pdfBytes, {
-    contentType: 'application/pdf',
-    upsert: true,
-  });
+  // Session 4 vague 3: bound the upload. supabase-js's storage client
+  // does not expose an AbortController on `.upload()` — the timeout
+  // rejection frees our worker slot but the underlying request may
+  // still complete in the background. Acceptable: upsert:true means a
+  // late completion is either a no-op or overwrites with identical bytes.
+  const { error } = await withTimeout(
+    supabase.storage.from(PDF_BUCKET).upload(objectPath, pdfBytes, {
+      contentType: 'application/pdf',
+      upsert: true,
+    }),
+    env.TIMEOUT_STORAGE_MS,
+    'storage:upload',
+  );
   if (error) {
     throw new Error(`storage_upload_failed: ${error.message}`);
   }
@@ -111,9 +126,11 @@ export async function createSignedPdfUrl(
 ): Promise<string> {
   const clamped = Math.min(Math.max(1, Math.floor(ttlSeconds)), MAX_SIGNED_URL_TTL_SECONDS);
   const supabase = getServiceClient();
-  const { data, error } = await supabase.storage
-    .from(PDF_BUCKET)
-    .createSignedUrl(objectPath, clamped);
+  const { data, error } = await withTimeout(
+    supabase.storage.from(PDF_BUCKET).createSignedUrl(objectPath, clamped),
+    env.TIMEOUT_STORAGE_MS,
+    'storage:createSignedUrl',
+  );
   if (error || !data) {
     throw new Error(`storage_sign_url_failed: ${error?.message ?? 'no_data'}`);
   }

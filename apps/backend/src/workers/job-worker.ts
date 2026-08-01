@@ -33,21 +33,37 @@
  * ---------------------------------------------------------------------------
  * Unknown job type routing
  * ---------------------------------------------------------------------------
- * The worker knows how to run `process_appel`. Any other type ends up in
- * `dead_letter` via `fail_job` with a clear error message — we don't crash
- * the worker just because someone enqueued a type we haven't wired yet.
+ * The worker knows how to run `process_appel`. Two other cases are handled
+ * distinctly:
+ *   - Types in `KNOWN_UNIMPLEMENTED_JOB_TYPES` (e.g. `purge_audio_retell`)
+ *     are enfilés on purpose but have no handler yet. They go STRAIGHT to
+ *     `dead_letter` (via `fail_job_permanent`) with NO alert — otherwise
+ *     every cabinet actif would spam the operator's inbox 48 h after each
+ *     call. These rows are meant to be requeued manually the day the
+ *     handler ships.
+ *   - Anything else is a TRUE unknown (bad enqueue, migration regression):
+ *     `fail_job` + backoff + `maybeAlertDeadLetter`. Loud on purpose.
  */
 import { hostname } from 'node:os';
 import { env } from '../config/env.js';
 import { logger } from '../config/logger.js';
-import { claimJobs, completeJob, failJob } from '../db/queries.js';
-import type { Job } from '../types/index.js';
+import {
+  claimJobs,
+  completeJob,
+  failJob,
+  forceDeadLetter,
+  workerHeartbeatAlive,
+  workerHeartbeatPoll,
+} from '../db/queries.js';
+import type { Job, JobType } from '../types/index.js';
 import {
   EmailPipelineError,
   PdfPipelineError,
   processAppelJob,
 } from '../services/appel-processor.js';
+import { PermanentEmailError } from '../services/email.js';
 import { computeBackoffSeconds } from '../utils/backoff.js';
+import { sendAlert } from '../services/alert.js';
 
 /**
  * Error classes whose `.message` is constant-by-construction and therefore
@@ -62,6 +78,44 @@ import { computeBackoffSeconds } from '../utils/backoff.js';
 const PII_SAFE_ERROR_NAMES: ReadonlySet<string> = new Set([
   PdfPipelineError.name,
   EmailPipelineError.name,
+  PermanentEmailError.name,
+]);
+
+/**
+ * ---------------------------------------------------------------------------
+ * Job types the DB CHECK constraint accepts and the webhook actively
+ * enqueues, but for which THIS worker has no handler yet.
+ * ---------------------------------------------------------------------------
+ *
+ * (a) Why is such a job enqueued at all ?
+ *     `purge_audio_retell` is enfilé pour chaque appel (voir
+ *     `services/appel.ts` — enqueue immédiat + `run_after = date_appel +
+ *     AUDIO_RETENTION_HOURS`). Le webhook n'a pas à savoir si le worker
+ *     sait encore le traiter : la charge symbolique reste posée, ce qui
+ *     garantit qu'aucun appel ne passera à travers la maille le jour où
+ *     le handler existera. Retirer l'enfilement serait une régression
+ *     compliance.
+ *
+ * (b) Où la suppression réelle finira par vivre.
+ *     La suppression du média chez Retell passera par le consommateur de
+ *     `file_deletions_outbox` (planifié Session 5). Ce n'est PAS ce
+ *     handler-ci qui appellera l'API Retell : ce set n'existe QUE pour
+ *     dire au worker « ce job est attendu, n'alerte pas ».
+ *
+ * (c) TODO — dès que le handler `purge_audio_retell` est implémenté,
+ *     RETIRER le type de ce set (sinon les vrais échecs de purge seraient
+ *     silencieusement enterrés en dead_letter sans alerte). Idem pour
+ *     tout futur type ajouté ici en transit.
+ *
+ * Conséquence opérationnelle assumée : chaque appel produit, 48 h plus
+ * tard, un job qui atterrit immédiatement en `dead_letter` (aucune
+ * consommation de `max_attempts`, aucun email d'alerte). Ces lignes
+ * devront être requeueées manuellement (script one-shot) quand le
+ * handler arrivera. Trace `dead_letter` = « à requeuer », pas « à
+ * investiguer ».
+ */
+export const KNOWN_UNIMPLEMENTED_JOB_TYPES: ReadonlySet<JobType> = new Set<JobType>([
+  'purge_audio_retell',
 ]);
 
 /**
@@ -92,6 +146,24 @@ export interface JobWorkerOptions {
    * to run a single pass instead of an infinite loop. Never true in prod.
    */
   runOnce?: boolean;
+  /**
+   * Advisory: how long a `processing` row must be locked before claim_jobs
+   * treats it as a zombie. Defaults to `env.JOB_STALE_AFTER_SECONDS`.
+   * Exposed for tests only.
+   */
+  staleAfterSeconds?: number;
+  /**
+   * Advisory: alive-tick period in ms. Defaults to
+   * `env.WORKER_HEARTBEAT_INTERVAL_MS`. Tests pass a short value to keep
+   * the suite fast.
+   */
+  heartbeatIntervalMs?: number;
+  /**
+   * Advisory: version string reported to worker_heartbeats.version. Read
+   * from package.json by the process entry point. Optional here so tests
+   * can omit it.
+   */
+  version?: string | null;
 }
 
 /**
@@ -127,9 +199,30 @@ async function interruptibleSleep(
  * Never throws. Any error from `processAppelJob` is turned into a
  * `fail_job` with a redacted message. This is the outermost defence: if it
  * threw, an unhandled rejection would kill the worker process.
+ *
+ * Session 4: when a failure exhausts `max_attempts` we ALSO fire an
+ * immediate alert (`job_dead_letter`, and `pdf_orphelin` when the PDF
+ * upload checkpoint exists but the email did not go out). We rely on the
+ * `attempts >= max_attempts` predicate on the job we already hold — which
+ * matches the exact contract of the `fail_job` RPC (see migration
+ * 20260731100000). The API-side poller catches dead_letter rows produced
+ * by SQL (bascule by `requeue_stuck_jobs`) that never went through this
+ * path.
  */
 async function handleOne(job: Job): Promise<void> {
-  const corr = { job_id: job.id, job_type: job.type, attempt: job.attempts };
+  // Distinguish a zombie reclaim from a fresh claim in the logs. attempts > 1
+  // is not a perfect proof (a genuine retry after fail_job also lands here
+  // with attempts > 1), but combined with `locked_at` timing and the
+  // preceding `job_claim_batch` log line it is enough for support to spot a
+  // reclaim event.
+  const corr = {
+    job_id: job.id,
+    job_type: job.type,
+    attempt: job.attempts,
+    max_attempts: job.max_attempts,
+    correlation_id: job.correlation_id,
+    reclaimed: job.attempts > 1,
+  };
   try {
     if (job.type === 'process_appel') {
       await processAppelJob(job);
@@ -138,15 +231,42 @@ async function handleOne(job: Job): Promise<void> {
       return;
     }
 
-    // Unknown type — we don't crash. We fail the job with a clear message
-    // and let the RPC decide whether that becomes a retry (pointless, but
-    // harmless) or a dead_letter (which is what we want after enough tries).
+    // KNOWN but not yet implemented (see KNOWN_UNIMPLEMENTED_JOB_TYPES).
+    // These are enfilés on purpose (compliance reservation) and MUST NOT
+    // trigger any alert — a cabinet actif = one such job per call, 48 h
+    // later. Route them straight to `dead_letter` via `fail_job_permanent`
+    // to avoid burning `max_attempts` * backoff on a no-op. `last_error`
+    // is a CONSTANT string built from the type — never concatenated with
+    // an external message, so no PII can leak here.
+    if (KNOWN_UNIMPLEMENTED_JOB_TYPES.has(job.type)) {
+      logger.warn(corr, 'job_type_known_but_unimplemented');
+      try {
+        await forceDeadLetter(job.id, `not_implemented:${job.type}`);
+      } catch (forceErr: unknown) {
+        // On DB failure, log and return — do NOT fall through to the
+        // "unknown type" branch, which would trigger an alert. The
+        // requeue_stuck_jobs SQL net will eventually reclaim + we'll
+        // land back here on the next attempt.
+        logger.error(
+          {
+            ...corr,
+            err_name: forceErr instanceof Error ? forceErr.name : 'unknown',
+          },
+          'force_dead_letter_failed',
+        );
+      }
+      return;
+    }
+
+    // Truly UNKNOWN type — a signal (bad enqueue, migration regression).
+    // Keep the noisy behaviour: fail with backoff, alert on dead_letter.
     logger.warn(corr, 'job_type_not_handled_by_this_worker');
     await failJob(
       job.id,
       `unhandled_job_type:${job.type}`,
       computeBackoffSeconds(job.attempts),
     );
+    await maybeAlertDeadLetter(job, `unhandled_job_type:${job.type}`);
     return;
   } catch (err: unknown) {
     // nLPD compliance (session 3.1 audit):
@@ -155,14 +275,48 @@ async function handleOne(job: Job): Promise<void> {
     //     Nodemailer) can carry a fragment of patient data in its message.
     //   - We persist only a REDACTED failure marker in `jobs.last_error`
     //     via `redactedFailureMessage`. Whitelisted classes
-    //     (PdfPipelineError / EmailPipelineError) have constant messages
-    //     by construction and are safe to keep verbatim.
+    //     (PdfPipelineError / EmailPipelineError / PermanentEmailError)
+    //     have constant messages by construction and are safe to keep
+    //     verbatim.
     const errName = err instanceof Error ? err.name : 'unknown';
+    const redacted = redactedFailureMessage(err);
+
+    // Session 4 vague 3: PERMANENT SMTP failure short-circuits the retry
+    // budget. Force dead_letter directly (see queries.forceDeadLetter) —
+    // do NOT go through fail_job, which would only bump attempts and
+    // waste the whole SMTP_TIMEOUT * (max_attempts - attempts) budget.
+    if (err instanceof PermanentEmailError) {
+      logger.error(
+        { ...corr, err_name: errName, smtp_code: err.smtpCode },
+        'job_permanent_failure_forcing_dead_letter',
+      );
+      try {
+        await forceDeadLetter(job.id, redacted);
+      } catch (forceErr: unknown) {
+        logger.error(
+          {
+            ...corr,
+            err_name: forceErr instanceof Error ? forceErr.name : 'unknown',
+          },
+          'force_dead_letter_failed',
+        );
+      }
+      // The job is now (semantically) in dead_letter. Fire the alerts
+      // unconditionally — the standard `attempts >= max_attempts` gate
+      // in maybeAlertDeadLetter would not trigger here (attempts may be
+      // 1). Build a synthetic post-transition Job for the alert helper.
+      await alertDeadLetterUnconditional(
+        { ...job, attempts: job.max_attempts, status: 'dead_letter' },
+        redacted,
+      );
+      return;
+    }
+
     logger.warn({ ...corr, err_name: errName }, 'job_failed_will_retry_or_dead_letter');
     try {
       await failJob(
         job.id,
-        redactedFailureMessage(err),
+        redacted,
         computeBackoffSeconds(job.attempts),
       );
     } catch (failErr: unknown) {
@@ -176,8 +330,102 @@ async function handleOne(job: Job): Promise<void> {
         },
         'fail_job_rpc_failed',
       );
+      // Also fire the alert if this was the terminal attempt — otherwise
+      // the fail_job outage would double-hide the dead_letter transition.
     }
+    await maybeAlertDeadLetter(job, redacted);
   }
+}
+
+/**
+ * Alert path used by the force-dead-letter branch. Mirrors
+ * maybeAlertDeadLetter but skips the attempts >= max_attempts gate
+ * because we KNOW we just short-circuited it.
+ */
+async function alertDeadLetterUnconditional(job: Job, lastError: string): Promise<void> {
+  const steps = readPayloadSteps(job.payload);
+  const isOrphelin =
+    typeof steps.storage_path === 'string' &&
+    steps.storage_path.length > 0 &&
+    !steps.email_sent_at;
+  const context = {
+    job_id: job.id,
+    appel_id: job.appel_id,
+    job_type: job.type,
+    attempts: job.attempts,
+    max_attempts: job.max_attempts,
+    correlation_id: job.correlation_id,
+    last_error: lastError,
+    is_orphelin: isOrphelin,
+    source: 'worker_immediate_permanent',
+  };
+  if (isOrphelin) await sendAlert('pdf_orphelin', context);
+  await sendAlert('job_dead_letter', context);
+}
+
+/**
+ * Fire immediate alerts when the JUST-FAILED job hit dead_letter status.
+ *
+ * We rely on the local `attempts >= max_attempts` predicate: it mirrors
+ * fail_job's decision exactly. If fail_job's DB call itself failed above,
+ * pg_cron's requeue-stuck-jobs will eventually flip it to dead_letter via
+ * SQL — and the API poller will alert then. Either way the incident does
+ * not slip through.
+ *
+ * `pdf_orphelin` is layered on top: when the PDF was uploaded (checkpoint
+ * `storage_path` set) but the email was never sent (`email_sent_at`
+ * missing), we have a compliance-flavoured incident (patient PII in
+ * Storage without recipient notification). Fired FIRST so the operator's
+ * inbox surfaces it distinctly from a generic dead_letter.
+ *
+ * All context passed to sendAlert is TECHNICAL: job id, type, attempts,
+ * correlation id, redacted error marker. Never patient data.
+ */
+async function maybeAlertDeadLetter(job: Job, lastError: string): Promise<void> {
+  if (job.attempts < job.max_attempts) return;
+
+  const steps = readPayloadSteps(job.payload);
+  const isOrphelin =
+    typeof steps.storage_path === 'string' &&
+    steps.storage_path.length > 0 &&
+    !steps.email_sent_at;
+
+  const context = {
+    job_id: job.id,
+    appel_id: job.appel_id,
+    job_type: job.type,
+    attempts: job.attempts,
+    max_attempts: job.max_attempts,
+    correlation_id: job.correlation_id,
+    last_error: lastError,
+    is_orphelin: isOrphelin,
+    source: 'worker_immediate',
+  };
+
+  if (isOrphelin) {
+    await sendAlert('pdf_orphelin', context);
+  }
+  await sendAlert('job_dead_letter', context);
+}
+
+/** Tolerant reader for the `payload.steps` checkpoint shape. */
+interface StepsView {
+  pdf_uploaded_at?: string;
+  storage_path?: string;
+  email_sent_at?: string;
+}
+function readPayloadSteps(payload: unknown): StepsView {
+  if (!payload || typeof payload !== 'object') return {};
+  const s = (payload as Record<string, unknown>).steps;
+  if (!s || typeof s !== 'object') return {};
+  const bag = s as Record<string, unknown>;
+  const opt = (v: unknown): string | undefined =>
+    typeof v === 'string' && v.length > 0 ? v : undefined;
+  return {
+    pdf_uploaded_at: opt(bag.pdf_uploaded_at),
+    storage_path: opt(bag.storage_path),
+    email_sent_at: opt(bag.email_sent_at),
+  };
 }
 
 /**
@@ -194,30 +442,95 @@ export function runJobWorker(options?: JobWorkerOptions): RunningWorker {
   const pollIntervalMs = options?.pollIntervalMs ?? env.JOB_POLL_INTERVAL_MS;
   const batchSize = options?.batchSize ?? env.JOB_BATCH_SIZE;
   const runOnce = options?.runOnce ?? false;
+  const staleAfterSeconds =
+    options?.staleAfterSeconds ?? env.JOB_STALE_AFTER_SECONDS;
+  const heartbeatIntervalMs =
+    options?.heartbeatIntervalMs ?? env.WORKER_HEARTBEAT_INTERVAL_MS;
+  const version = options?.version ?? null;
 
   let stopping = false;
   const isStopping = (): boolean => stopping;
 
+  // ------------------------------------------------------------------------
+  // Alive-heartbeat — INDEPENDENT of the polling loop.
+  // ------------------------------------------------------------------------
+  //
+  // This setInterval writes `last_seen_at` even when the polling loop is
+  // stuck inside a long-running job (Puppeteer render, SMTP handshake).
+  // Without it, a job that pends 5 min would look like a dead process.
+  //
+  // We do NOT `.unref()` the timer: the worker's own graceful shutdown
+  // handler MUST call stop() to clear it — leaving it unref'd would let
+  // the process exit while a heartbeat is in flight, producing a truncated
+  // write.
+  //
+  // First tick fires immediately (synchronously scheduled) so the row
+  // exists in worker_heartbeats even before the polling loop's first pass.
+  let heartbeatTimer: NodeJS.Timeout | null = null;
+  const fireAliveTick = (): void => {
+    if (stopping) return;
+    workerHeartbeatAlive(workerId, version).catch((err: unknown) => {
+      // Never let a heartbeat failure kill the worker. Downgrade to warn:
+      // the poller in the API will detect the resulting gap.
+      logger.warn(
+        { err_name: err instanceof Error ? err.name : 'unknown' },
+        'worker_heartbeat_alive_failed',
+      );
+    });
+  };
+  // Immediate first tick.
+  fireAliveTick();
+  heartbeatTimer = setInterval(fireAliveTick, heartbeatIntervalMs);
+
   const stoppedPromise = (async (): Promise<void> => {
     logger.info(
-      { worker_id: workerId, poll_ms: pollIntervalMs, batch: batchSize },
+      {
+        worker_id: workerId,
+        poll_ms: pollIntervalMs,
+        batch: batchSize,
+        stale_after_seconds: staleAfterSeconds,
+        heartbeat_interval_ms: heartbeatIntervalMs,
+        version,
+      },
       'job_worker_started',
     );
     while (!stopping) {
       let batch: Job[] = [];
       try {
-        batch = await claimJobs(workerId, batchSize);
+        batch = await claimJobs(workerId, batchSize, staleAfterSeconds);
       } catch (err: unknown) {
         // A DB blip should not kill the worker. Log and back off a bit.
         logger.error(
           { err_name: err instanceof Error ? err.name : 'unknown' },
           'job_claim_failed',
         );
+        // Still record the poll tick so we can distinguish "DB down" (poll
+        // ticks continue) from "loop stuck" (poll ticks stop).
+        pollTick(workerId, 0);
         await interruptibleSleep(Math.max(1_000, pollIntervalMs), isStopping);
         continue;
       }
 
+      // Observability: log the batch outcome. When claim_jobs returned
+      // ANY reclaimed row (attempts > 1), surface it — that is our signal
+      // that the zombie-reclaim path activated.
+      if (batch.length > 0) {
+        const reclaimedCount = batch.filter((j) => j.attempts > 1).length;
+        logger.info(
+          {
+            worker_id: workerId,
+            batch_size: batch.length,
+            reclaimed_count: reclaimedCount,
+          },
+          'job_claim_batch',
+        );
+      }
+
       if (batch.length === 0) {
+        // Non-regression: `claim_jobs` returns a real empty array (not a
+        // one-row bag of NULLs). Locked behind a test in
+        // tests/workers/job-worker.test.ts.
+        pollTick(workerId, 0);
         if (runOnce) break;
         await interruptibleSleep(pollIntervalMs, isStopping);
         continue;
@@ -226,16 +539,48 @@ export function runJobWorker(options?: JobWorkerOptions): RunningWorker {
       // Run the batch in parallel. Each handleOne is fault-isolated.
       await Promise.all(batch.map((job) => handleOne(job)));
 
+      // Poll-tick AFTER the batch: counts the jobs we just processed.
+      pollTick(workerId, batch.length);
+
       // Non-empty batch: re-drain IMMEDIATELY (do not wait pollInterval).
       // Critical for the sub-10-s email SLA on the webhook path.
       if (runOnce) break;
+    }
+    // Clear the alive-heartbeat timer no matter how the loop exited
+    // (stop() flip, runOnce break, or a thrown error above we did not
+    // catch). Leaving a live setInterval past the polling loop would
+    // hold the event loop open in prod and pile handles up in tests.
+    if (heartbeatTimer !== null) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
     }
     logger.info('job_worker_stopped');
   })();
 
   const stop = (): void => {
     stopping = true;
+    // Best-effort immediate cleanup when the caller stops us explicitly.
+    // The end-of-loop cleanup above is the authoritative one — this is
+    // just to shorten the window in which the timer might fire once more
+    // after stop() is called.
+    if (heartbeatTimer !== null) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
   };
 
   return { stop, stopped: stoppedPromise };
+}
+
+/**
+ * Fire-and-forget poll-tick. Kept in a helper so both the batch path and
+ * the DB-blip fallback path share exactly the same error handling.
+ */
+function pollTick(workerId: string, jobsProcessedDelta: number): void {
+  workerHeartbeatPoll(workerId, jobsProcessedDelta).catch((err: unknown) => {
+    logger.warn(
+      { err_name: err instanceof Error ? err.name : 'unknown' },
+      'worker_heartbeat_poll_failed',
+    );
+  });
 }

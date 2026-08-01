@@ -327,6 +327,36 @@ describe('POST /webhooks/retell/call-ended — call_analyzed', () => {
     expect(enqueuedJobs.length).toBe(jobsAfterFirst); // no new jobs
   });
 
+  it('propagates the request X-Correlation-Id into jobs.correlation_id (session 4 vague 3)', async () => {
+    mockSdkVerify.mockResolvedValue(true);
+    const CORRELATION = 'cid-e2e-webhook-001';
+    const req = request(app)
+      .post('/webhooks/retell/call-ended')
+      .set('Content-Type', 'application/json')
+      .set('X-Correlation-Id', CORRELATION)
+      .set('x-retell-signature', placeholderSignature());
+    const res = await req.send(fixtureAnalyzed);
+    expect(res.status).toBe(200);
+    // Response echoes the correlation id (correlationMiddleware wiring).
+    expect(res.header['x-correlation-id']).toBe(CORRELATION);
+
+    // Wait for the async processing to enqueue at least the process_appel job.
+    await vi.waitFor(
+      () => {
+        if (enqueuedJobs.length < 2) throw new Error('waiting');
+      },
+      { timeout: 2000, interval: 10 },
+    );
+
+    // Inspect the actual enqueue calls — the row must carry the CID.
+    const enqueueCalls = vi.mocked(queries.enqueueJobIdempotent).mock.calls;
+    // Every enqueued job for this webhook must carry the incoming CID.
+    for (const call of enqueueCalls) {
+      const row = call[0] as { correlation_id?: string | null };
+      expect(row.correlation_id).toBe(CORRELATION);
+    }
+  });
+
   it('answers 200 (no crash) when to_number does not match any cabinet', async () => {
     mockSdkVerify.mockResolvedValue(true);
     const rawObj = JSON.parse(fixtureAnalyzed) as {

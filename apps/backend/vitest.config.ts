@@ -9,6 +9,10 @@ export default defineConfig({
     environment: 'node',
     globals: false,
     include: ['tests/**/*.test.ts'],
+    // e2e suite has its own vitest config (vitest.e2e.config.ts) and a
+    // dedicated `npm run test:e2e` script. Exclude it here so `npm test`
+    // does not double-run it.
+    exclude: ['tests/e2e/**', 'node_modules/**', 'dist/**'],
     setupFiles: ['tests/setup.ts'],
     testTimeout: 10_000,
   },

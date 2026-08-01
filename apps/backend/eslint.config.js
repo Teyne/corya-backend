@@ -34,7 +34,7 @@ export default tseslint.config(
   },
   {
     // Config/build files sit outside the TS project graph.
-    files: ['vitest.config.ts', 'eslint.config.js'],
+    files: ['vitest.config.ts', 'vitest.e2e.config.ts', 'eslint.config.js'],
     ...tseslint.configs.disableTypeChecked,
     languageOptions: {
       parserOptions: {

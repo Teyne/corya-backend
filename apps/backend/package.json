@@ -15,6 +15,7 @@
     "start": "node dist/index.js",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "lint": "eslint .",
     "type-check": "tsc --noEmit",
     "diag:retell": "tsx scripts/diagnose-retell-signature.ts",

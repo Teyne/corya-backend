@@ -25,6 +25,6 @@
     },
     "types": ["node"]
   },
-  "include": ["src/**/*", "tests/**/*", "scripts/**/*", "vitest.config.ts", "eslint.config.js"],
+  "include": ["src/**/*", "tests/**/*", "scripts/**/*", "vitest.config.ts", "vitest.e2e.config.ts", "eslint.config.js"],
   "exclude": ["node_modules", "dist"]
 }
