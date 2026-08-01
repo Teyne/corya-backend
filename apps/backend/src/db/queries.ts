@@ -9,6 +9,7 @@
  * throw only on truly unexpected DB errors, never on empty result sets.
  */
 import { getServiceClient } from '../config/supabase.js';
+import { env } from '../config/env.js';
 import type {
   AppelInsertRow,
   AppelProcessingRow,
@@ -17,6 +18,38 @@ import type {
   JobInsertRow,
   ProcessAppelPayload,
 } from '../types/index.js';
+import { withTimeout } from '../utils/timeout.js';
+
+/**
+ * Small helper — every Supabase call in this file goes through here.
+ *
+ * Two responsibilities:
+ *   1. Enforce a bounded execution time on the network round-trip (the
+ *      historical "hung Supabase request pins a worker slot" incident).
+ *   2. Pass an AbortController down to supabase-js. supabase-js's query
+ *      builder exposes `.abortSignal(signal)`; when the deadline fires,
+ *      withTimeout calls `abort()`, and the underlying `fetch` call
+ *      terminates — freeing the server-side connection instead of
+ *      leaking it.
+ *
+ * The Storage helpers use a similar pattern but without abortSignal (the
+ * Storage client does not expose it) — see comment in services/storage.ts.
+ *
+ * `label` MUST be a constant string — it lands in TimeoutError.message,
+ * in the logger, and (through the fail_job path) in `jobs.last_error`.
+ */
+export function withDbTimeout<T>(
+  build: (signal: AbortSignal) => PromiseLike<T>,
+  label: string,
+): Promise<T> {
+  const controller = new AbortController();
+  return withTimeout(
+    build(controller.signal),
+    env.TIMEOUT_DB_MS,
+    label,
+    { signal: controller },
+  );
+}
 
 export interface CabinetRow {
   id: string;
@@ -38,12 +71,17 @@ export async function findCabinetByCoryaNumber(
   toNumber: string,
 ): Promise<CabinetRow | null> {
   const supabase = getServiceClient();
-  const { data, error } = await supabase
-    .from('cabinets')
-    .select('id, numero_corya, email_notification, email_notification_cc')
-    .eq('numero_corya', toNumber)
-    .eq('statut', 'actif')
-    .maybeSingle<CabinetRow>();
+  const { data, error } = await withDbTimeout(
+    (signal) =>
+      supabase
+        .from('cabinets')
+        .select('id, numero_corya, email_notification, email_notification_cc')
+        .eq('numero_corya', toNumber)
+        .eq('statut', 'actif')
+        .abortSignal(signal)
+        .maybeSingle<CabinetRow>(),
+    'db:findCabinetByCoryaNumber',
+  );
 
   if (error) {
     throw new Error(`db_find_cabinet_failed: ${error.message}`);
@@ -71,11 +109,16 @@ export async function insertAppelIdempotent(
   // single call. We simulate it in two steps: try the insert, if unique-
   // violation then look up the existing row. That keeps our behaviour
   // idempotent without needing a stored proc.
-  const { data, error } = await supabase
-    .from('appels')
-    .insert(row)
-    .select('id')
-    .single<{ id: string }>();
+  const { data, error } = await withDbTimeout(
+    (signal) =>
+      supabase
+        .from('appels')
+        .insert(row)
+        .select('id')
+        .abortSignal(signal)
+        .single<{ id: string }>(),
+    'db:insertAppelIdempotent',
+  );
 
   if (!error && data) {
     return { appelId: data.id, duplicate: false };
@@ -83,11 +126,16 @@ export async function insertAppelIdempotent(
 
   // Postgres unique_violation. Supabase surfaces it as code '23505'.
   if (error && error.code === '23505') {
-    const { data: existing, error: lookupErr } = await supabase
-      .from('appels')
-      .select('id')
-      .eq('retell_call_id', row.retell_call_id)
-      .single<{ id: string }>();
+    const { data: existing, error: lookupErr } = await withDbTimeout(
+      (signal) =>
+        supabase
+          .from('appels')
+          .select('id')
+          .eq('retell_call_id', row.retell_call_id)
+          .abortSignal(signal)
+          .single<{ id: string }>(),
+      'db:insertAppelIdempotent:lookup',
+    );
     if (lookupErr || !existing) {
       throw new Error(
         `db_insert_appel_conflict_but_lookup_failed: ${lookupErr?.message ?? 'no_row'}`,
@@ -109,7 +157,10 @@ export async function insertAppelIdempotent(
  */
 export async function enqueueJobIdempotent(row: JobInsertRow): Promise<boolean> {
   const supabase = getServiceClient();
-  const { error } = await supabase.from('jobs').insert(row);
+  const { error } = await withDbTimeout(
+    (signal) => supabase.from('jobs').insert(row).abortSignal(signal),
+    'db:enqueueJobIdempotent',
+  );
 
   if (!error) return true;
   if (error.code === '23505') {
@@ -130,29 +181,43 @@ export async function enqueueJobIdempotent(row: JobInsertRow): Promise<boolean> 
 // localised change.
 
 /**
- * Reserve up to `batchSize` due jobs for this worker. The RPC atomically
- * flips their status to 'processing', stamps `locked_by = workerId`, and
- * INCREMENTS `attempts` — so the returned `attempts` value already reflects
- * the current try (use it as-is for backoff decisions).
+ * Reserve up to `batchSize` due jobs for this worker.
+ *
+ * Session 4 update: the RPC now ALSO reclaims zombies (rows stuck in
+ * `processing` for longer than `staleAfterSeconds`). See migration
+ * 20260801000000. A reclaimed row is returned as any other claim — the
+ * caller sees `attempts > 1` and can log it as a zombie for observability,
+ * but no code path branches on that: the pipeline is idempotent by
+ * checkpoint (see `services/appel-processor.ts`).
  *
  * Concurrent workers see disjoint rows thanks to the RPC's internal
- * SELECT ... FOR UPDATE SKIP LOCKED.
+ * `SELECT ... FOR UPDATE SKIP LOCKED`. The RPC also enforces
+ * `attempts < max_attempts`, so an exhausted job is never re-served.
  *
- * Returns [] when no jobs are ready. Never throws on empty result.
+ * Returns [] when no jobs are ready. Never throws on empty result — proven
+ * by a non-regression test in tests/workers/job-worker.test.ts.
  */
 export async function claimJobs(
   workerId: string,
   batchSize: number,
+  staleAfterSeconds: number,
 ): Promise<Job[]> {
   const supabase = getServiceClient();
   // Supabase-js types RPC results as `any` (no generated types file). We
   // cast the RESULT object to a narrow shape before destructuring so
   // downstream code stays typed. Anything the RPC contract violates
   // (e.g. non-array data) is silently coerced to an empty array.
-  const rpcResult = (await supabase.rpc('claim_jobs', {
-    p_worker_id: workerId,
-    p_batch_size: batchSize,
-  })) as { data: unknown; error: { message: string } | null };
+  const rpcResult = (await withDbTimeout(
+    (signal) =>
+      supabase
+        .rpc('claim_jobs', {
+          p_worker_id: workerId,
+          p_batch_size: batchSize,
+          p_stale_after_seconds: staleAfterSeconds,
+        })
+        .abortSignal(signal),
+    'db:claimJobs',
+  )) as { data: unknown; error: { message: string } | null };
   if (rpcResult.error) {
     throw new Error(`db_claim_jobs_failed: ${rpcResult.error.message}`);
   }
@@ -166,7 +231,10 @@ export async function claimJobs(
  */
 export async function completeJob(jobId: string): Promise<void> {
   const supabase = getServiceClient();
-  const { error } = await supabase.rpc('complete_job', { p_job_id: jobId });
+  const { error } = await withDbTimeout(
+    (signal) => supabase.rpc('complete_job', { p_job_id: jobId }).abortSignal(signal),
+    'db:completeJob',
+  );
   if (error) {
     throw new Error(`db_complete_job_failed: ${error.message}`);
   }
@@ -187,13 +255,82 @@ export async function failJob(
   backoffSeconds: number,
 ): Promise<void> {
   const supabase = getServiceClient();
-  const { error } = await supabase.rpc('fail_job', {
-    p_job_id: jobId,
-    p_error: errorMessage,
-    p_backoff_seconds: backoffSeconds,
-  });
+  const { error } = await withDbTimeout(
+    (signal) =>
+      supabase
+        .rpc('fail_job', {
+          p_job_id: jobId,
+          p_error: errorMessage,
+          p_backoff_seconds: backoffSeconds,
+        })
+        .abortSignal(signal),
+    'db:failJob',
+  );
   if (error) {
     throw new Error(`db_fail_job_failed: ${error.message}`);
+  }
+}
+
+/**
+ * Force a job into `dead_letter` immediately, bypassing the attempts-based
+ * decision of `fail_job`.
+ *
+ * ---------------------------------------------------------------------------
+ * Why this bypass exists
+ * ---------------------------------------------------------------------------
+ * The RPC `fail_job` only flips to `dead_letter` once `attempts >=
+ * max_attempts`. That is correct for TRANSIENT errors — a temporary SMTP
+ * hiccup deserves the full retry budget.
+ *
+ * PERMANENT errors (SMTP 550/551/553/554: mailbox unknown, blocked,
+ * syntax error) are different: retrying 5 times against a bad recipient
+ * wastes 5 * SMTP_TIMEOUT of wall-clock, spams the relay, and delays the
+ * dead_letter alert by hours. The correct behaviour is "fail terminally,
+ * NOW".
+ *
+ * ---------------------------------------------------------------------------
+ * Session 4 vague 5 — recâblage sur la RPC `fail_job_permanent`
+ * ---------------------------------------------------------------------------
+ * Vague 3 implémentait cette bascule via un UPDATE direct côté client,
+ * guardé par `WHERE status='processing'`. database-compliance a depuis
+ * livré la RPC dédiée `public.fail_job_permanent(p_job_id UUID, p_error TEXT)`.
+ *
+ * Contrat garanti par la migration :
+ *   - Passage en `dead_letter`, libération de `locked_at`/`locked_by`,
+ *     `last_error` tronqué à 500 chars côté SQL.
+ *   - IGNORE délibérément `attempts` — c'est tout l'intérêt.
+ *   - `WHERE id = p_job_id AND status = 'processing'` : no-op assumée si
+ *     le job a déjà transité (par requeue_stuck_jobs ou fail_job).
+ *
+ * Bénéfices vs. UPDATE direct :
+ *   - Toutes les transitions d'état redescendent côté SQL — un audit
+ *     via `information_schema` / triggers reste centralisé.
+ *   - Le service_role peut à terme se voir retirer les droits UPDATE
+ *     directs sur `public.jobs` sans casser ce chemin.
+ *
+ * `errorMessage` MUST be redacted (constant string or class name marker),
+ * same contract as `fail_job`.
+ */
+export async function forceDeadLetter(
+  jobId: string,
+  errorMessage: string,
+): Promise<void> {
+  const supabase = getServiceClient();
+  // Truncate côté client — défense en profondeur, la RPC tronque aussi
+  // mais on borne d'abord le payload réseau.
+  const truncated = errorMessage.slice(0, 500);
+  const { error } = await withDbTimeout(
+    (signal) =>
+      supabase
+        .rpc('fail_job_permanent', {
+          p_job_id: jobId,
+          p_error: truncated,
+        })
+        .abortSignal(signal),
+    'db:forceDeadLetter',
+  );
+  if (error) {
+    throw new Error(`db_force_dead_letter_failed: ${error.message}`);
   }
 }
 
@@ -210,10 +347,10 @@ export async function updateJobPayload(
   payload: ProcessAppelPayload,
 ): Promise<void> {
   const supabase = getServiceClient();
-  const { error } = await supabase
-    .from('jobs')
-    .update({ payload })
-    .eq('id', jobId);
+  const { error } = await withDbTimeout(
+    (signal) => supabase.from('jobs').update({ payload }).eq('id', jobId).abortSignal(signal),
+    'db:updateJobPayload',
+  );
   if (error) {
     throw new Error(`db_update_job_payload_failed: ${error.message}`);
   }
@@ -229,13 +366,18 @@ export async function getAppelForProcessing(
   appelId: string,
 ): Promise<AppelProcessingRow | null> {
   const supabase = getServiceClient();
-  const { data, error } = await supabase
-    .from('appels')
-    .select(
-      'id, cabinet_id, retell_call_id, date_appel, duree_secondes, resultat, motif_appel, patient_nom, patient_prenom, patient_telephone, rdv_date, rdv_praticien, transcript, pdf_url, email_status',
-    )
-    .eq('id', appelId)
-    .maybeSingle<AppelProcessingRow>();
+  const { data, error } = await withDbTimeout(
+    (signal) =>
+      supabase
+        .from('appels')
+        .select(
+          'id, cabinet_id, retell_call_id, date_appel, duree_secondes, resultat, motif_appel, patient_nom, patient_prenom, patient_telephone, rdv_date, rdv_praticien, transcript, pdf_url, email_status',
+        )
+        .eq('id', appelId)
+        .abortSignal(signal)
+        .maybeSingle<AppelProcessingRow>(),
+    'db:getAppelForProcessing',
+  );
   if (error) {
     throw new Error(`db_get_appel_failed: ${error.message}`);
   }
@@ -254,11 +396,16 @@ export async function getCabinetForProcessing(
   cabinetId: string,
 ): Promise<CabinetProcessingRow | null> {
   const supabase = getServiceClient();
-  const { data, error } = await supabase
-    .from('cabinets')
-    .select('id, nom, email_notification, email_notification_cc, statut')
-    .eq('id', cabinetId)
-    .maybeSingle<CabinetProcessingRow>();
+  const { data, error } = await withDbTimeout(
+    (signal) =>
+      supabase
+        .from('cabinets')
+        .select('id, nom, email_notification, email_notification_cc, statut')
+        .eq('id', cabinetId)
+        .abortSignal(signal)
+        .maybeSingle<CabinetProcessingRow>(),
+    'db:getCabinetForProcessing',
+  );
   if (error) {
     throw new Error(`db_get_cabinet_failed: ${error.message}`);
   }
@@ -276,10 +423,15 @@ export async function setAppelPdfPath(
   objectPath: string,
 ): Promise<void> {
   const supabase = getServiceClient();
-  const { error } = await supabase
-    .from('appels')
-    .update({ pdf_url: objectPath })
-    .eq('id', appelId);
+  const { error } = await withDbTimeout(
+    (signal) =>
+      supabase
+        .from('appels')
+        .update({ pdf_url: objectPath })
+        .eq('id', appelId)
+        .abortSignal(signal),
+    'db:setAppelPdfPath',
+  );
   if (error) {
     throw new Error(`db_set_pdf_path_failed: ${error.message}`);
   }
@@ -292,13 +444,18 @@ export async function setAppelPdfPath(
  */
 export async function markAppelEmailSent(appelId: string): Promise<void> {
   const supabase = getServiceClient();
-  const { error } = await supabase
-    .from('appels')
-    .update({
-      email_status: 'sent',
-      pdf_envoye_at: new Date().toISOString(),
-    })
-    .eq('id', appelId);
+  const { error } = await withDbTimeout(
+    (signal) =>
+      supabase
+        .from('appels')
+        .update({
+          email_status: 'sent',
+          pdf_envoye_at: new Date().toISOString(),
+        })
+        .eq('id', appelId)
+        .abortSignal(signal),
+    'db:markAppelEmailSent',
+  );
   if (error) {
     throw new Error(`db_mark_email_sent_failed: ${error.message}`);
   }
@@ -310,11 +467,302 @@ export async function markAppelEmailSent(appelId: string): Promise<void> {
  */
 export async function markAppelEmailFailed(appelId: string): Promise<void> {
   const supabase = getServiceClient();
-  const { error } = await supabase
-    .from('appels')
-    .update({ email_status: 'failed' })
-    .eq('id', appelId);
+  const { error } = await withDbTimeout(
+    (signal) =>
+      supabase
+        .from('appels')
+        .update({ email_status: 'failed' })
+        .eq('id', appelId)
+        .abortSignal(signal),
+    'db:markAppelEmailFailed',
+  );
   if (error) {
     throw new Error(`db_mark_email_failed_failed: ${error.message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Session 4 — worker heartbeats & alerting queries
+// ---------------------------------------------------------------------------
+//
+// Two heartbeat RPCs (`worker_heartbeat_alive` / `worker_heartbeat_poll`)
+// with DECOUPLED tempos:
+//   - alive : written every WORKER_HEARTBEAT_INTERVAL_MS by a setInterval
+//     INDEPENDENT of the polling loop → answers "process is alive"
+//   - poll  : written on every polling-loop tick → answers "loop advances"
+// See migration 20260801000001 for the SQL contract.
+
+/**
+ * Alive-tick. Small write, called every 10 s. `version` is only sent on the
+ * first tick after boot (RPC coalesces to keep the previously-known value
+ * when NULL is passed) — the caller is free to pass it every time; the
+ * network cost is negligible.
+ */
+export async function workerHeartbeatAlive(
+  workerId: string,
+  version: string | null,
+): Promise<void> {
+  const supabase = getServiceClient();
+  const { error } = await withDbTimeout(
+    (signal) =>
+      supabase
+        .rpc('worker_heartbeat_alive', {
+          p_worker_id: workerId,
+          p_version: version,
+        })
+        .abortSignal(signal),
+    'db:workerHeartbeatAlive',
+  );
+  if (error) {
+    throw new Error(`db_worker_heartbeat_alive_failed: ${error.message}`);
+  }
+}
+
+/**
+ * Poll-tick. Called after each `claim_jobs` return (batch empty or drained).
+ * `jobsProcessedDelta` is the number of jobs the current tick processed —
+ * incremented atomically into the monotonic counter server-side.
+ */
+export async function workerHeartbeatPoll(
+  workerId: string,
+  jobsProcessedDelta: number,
+): Promise<void> {
+  const supabase = getServiceClient();
+  const { error } = await withDbTimeout(
+    (signal) =>
+      supabase
+        .rpc('worker_heartbeat_poll', {
+          p_worker_id: workerId,
+          p_jobs_processed_delta: jobsProcessedDelta,
+        })
+        .abortSignal(signal),
+    'db:workerHeartbeatPoll',
+  );
+  if (error) {
+    throw new Error(`db_worker_heartbeat_poll_failed: ${error.message}`);
+  }
+}
+
+/**
+ * Row shape returned by `worker_heartbeats`. Only the columns we actually
+ * read in the API poller — we do NOT expose `version` etc. to the log
+ * pipeline unless a diagnostic surfaces the need.
+ */
+export interface WorkerHeartbeatRow {
+  worker_id: string;
+  last_seen_at: string;
+  last_poll_at: string | null;
+}
+
+/**
+ * Return the workers whose heartbeats look unhealthy — either the process
+ * has not ticked in `seenThresholdSec` (dead process) or the polling loop
+ * has not advanced in `pollThresholdSec` (blocked loop). Rows are filtered
+ * SERVER-SIDE so the poller does not pull the whole table.
+ *
+ * We only consider workers with a NON-NULL `last_poll_at` for the poll
+ * check — a fresh worker that has just written its first alive-tick but
+ * hasn't polled yet is not stale.
+ */
+export async function getStaleWorkerHeartbeats(
+  seenThresholdSec: number,
+  pollThresholdSec: number,
+): Promise<WorkerHeartbeatRow[]> {
+  const supabase = getServiceClient();
+  const nowMs = Date.now();
+  const seenCutoff = new Date(nowMs - seenThresholdSec * 1_000).toISOString();
+  const pollCutoff = new Date(nowMs - pollThresholdSec * 1_000).toISOString();
+
+  // supabase-js's .or() runs the two comparators in a single SQL OR. The
+  // NULL guard on last_poll_at is expressed via the composite predicate:
+  // "last_poll_at is not null AND last_poll_at < pollCutoff".
+  const { data, error } = await withDbTimeout(
+    (signal) =>
+      supabase
+        .from('worker_heartbeats')
+        .select('worker_id, last_seen_at, last_poll_at')
+        .or(
+          `last_seen_at.lt.${seenCutoff},and(last_poll_at.not.is.null,last_poll_at.lt.${pollCutoff})`,
+        )
+        .abortSignal(signal),
+    'db:getStaleWorkerHeartbeats',
+  );
+
+  if (error) {
+    throw new Error(`db_get_stale_workers_failed: ${error.message}`);
+  }
+  // Supabase-js infers columns from the select string, so `data` already
+  // types as WorkerHeartbeatRow[] | null — no cast needed.
+  return data ?? [];
+}
+
+/**
+ * Count `pending` jobs whose `run_after` is older than `olderThanSeconds`.
+ * Used by the backlog alerting poller.
+ *
+ * We use `run_after`, not `created_at`: a job with a future `run_after`
+ * (e.g. `purge_audio_retell` at +48 h) is NOT a backlog symptom — it's just
+ * scheduled ahead. The intent is "should be running now, isn't".
+ */
+export async function countPendingJobsOlderThan(
+  olderThanSeconds: number,
+): Promise<number> {
+  const supabase = getServiceClient();
+  const cutoff = new Date(Date.now() - olderThanSeconds * 1_000).toISOString();
+  const { count, error } = await withDbTimeout(
+    (signal) =>
+      supabase
+        .from('jobs')
+        .select('id', { count: 'exact', head: true })
+        .eq('status', 'pending')
+        .lt('run_after', cutoff)
+        .abortSignal(signal),
+    'db:countPendingJobsOlderThan',
+  );
+  if (error) {
+    throw new Error(`db_count_backlog_failed: ${error.message}`);
+  }
+  return count ?? 0;
+}
+
+/**
+ * Fetch dead-letter jobs that have NOT yet been alerted. Chronological
+ * order so the oldest incident bubbles up first. `limit` is a hard cap to
+ * bound a single poller pass; the next pass will drain the rest.
+ */
+export async function getDeadLetterJobsToAlert(limit: number): Promise<Job[]> {
+  const supabase = getServiceClient();
+  const { data, error } = await withDbTimeout(
+    (signal) =>
+      supabase
+        .from('jobs')
+        .select('*')
+        .eq('status', 'dead_letter')
+        .is('dead_letter_alerted_at', null)
+        .order('created_at', { ascending: true })
+        .limit(limit)
+        .abortSignal(signal),
+    'db:getDeadLetterJobsToAlert',
+  );
+  if (error) {
+    throw new Error(`db_get_dead_letter_jobs_failed: ${error.message}`);
+  }
+  return (data ?? []) as Job[];
+}
+
+/**
+ * Stamp `dead_letter_alerted_at = NOW()` for a specific job. Contract
+ * (see migration 20260801000000): this write happens EXCLUSIVELY here and
+ * ONLY after a confirmed SMTP send. If SMTP is in outage, the caller does
+ * NOT invoke this — the next poller pass will re-attempt.
+ */
+// ---------------------------------------------------------------------------
+// Session 4 vague 4 — health / readiness probe queries
+// ---------------------------------------------------------------------------
+
+/**
+ * Cheapest DB round-trip available. Used by /health/deep to prove that
+ * the connection pool is alive and the credentials still work. Success
+ * criterion is simply "no error thrown / no supabase error object".
+ *
+ * We select `id` LIMIT 1 on `cabinets` (a stable table with an index on
+ * the primary key). `SELECT 1` is not expressible through supabase-js
+ * without a raw RPC; this is the closest equivalent with the same cost.
+ *
+ * Timeout is passed by the caller (health handler uses 2 s per brief).
+ */
+export async function pingDb(timeoutMs: number): Promise<void> {
+  const supabase = getServiceClient();
+  const controller = new AbortController();
+  const { error } = await withTimeout(
+    supabase
+      .from('cabinets')
+      .select('id', { head: true, count: 'exact' })
+      .limit(1)
+      .abortSignal(controller.signal),
+    timeoutMs,
+    'db:ping',
+    { signal: controller },
+  );
+  if (error) {
+    throw new Error(`db_ping_failed: ${error.message}`);
+  }
+}
+
+/**
+ * Latest heartbeat across ALL workers — used by /health/deep to answer
+ * "is at least one worker still alive?". We do NOT expose the full row
+ * (worker_id embeds hostname/pid, potentially useful topology info) —
+ * just the freshest `last_seen_at` and how old it is.
+ */
+export async function getMostRecentHeartbeat(): Promise<{ last_seen_at: string } | null> {
+  const supabase = getServiceClient();
+  const { data, error } = await withDbTimeout(
+    (signal) =>
+      supabase
+        .from('worker_heartbeats')
+        .select('last_seen_at')
+        .order('last_seen_at', { ascending: false })
+        .limit(1)
+        .abortSignal(signal)
+        .maybeSingle<{ last_seen_at: string }>(),
+    'db:getMostRecentHeartbeat',
+  );
+  if (error) {
+    throw new Error(`db_get_most_recent_heartbeat_failed: ${error.message}`);
+  }
+  return data ?? null;
+}
+
+/**
+ * Row shape returned by public.get_cron_health() (migration
+ * 20260801000003). We only project the fields the health check consumes;
+ * the RPC returns more (24 h stats, last_status) that we leave for a
+ * future admin dashboard.
+ */
+export interface CronHealthRow {
+  jobname: string;
+  schedule: string;
+  last_run_at: string | null;
+  last_success_at: string | null;
+  last_status: string | null;
+  seconds_since_last_run: number | null;
+  seconds_since_last_success: number | null;
+  total_runs_last_24h: number;
+  failed_runs_last_24h: number;
+}
+
+/**
+ * Read the health snapshot of every ACTIVE pg_cron job in the current
+ * database. The RPC is SECURITY DEFINER and bounded to the current DB
+ * (see migration). Any missing/unhealthy row is interpreted by the
+ * caller (services/cron-check.ts).
+ */
+export async function getCronHealth(): Promise<CronHealthRow[]> {
+  const supabase = getServiceClient();
+  const rpcResult = (await withDbTimeout(
+    (signal) => supabase.rpc('get_cron_health').abortSignal(signal),
+    'db:getCronHealth',
+  )) as { data: unknown; error: { message: string } | null };
+  if (rpcResult.error) {
+    throw new Error(`db_get_cron_health_failed: ${rpcResult.error.message}`);
+  }
+  const rows = Array.isArray(rpcResult.data) ? (rpcResult.data as unknown[]) : [];
+  return rows as CronHealthRow[];
+}
+
+export async function markDeadLetterAlerted(jobId: string): Promise<void> {
+  const supabase = getServiceClient();
+  const { error } = await withDbTimeout(
+    (signal) =>
+      supabase
+        .from('jobs')
+        .update({ dead_letter_alerted_at: new Date().toISOString() })
+        .eq('id', jobId)
+        .abortSignal(signal),
+    'db:markDeadLetterAlerted',
+  );
+  if (error) {
+    throw new Error(`db_mark_dead_letter_alerted_failed: ${error.message}`);
   }
 }

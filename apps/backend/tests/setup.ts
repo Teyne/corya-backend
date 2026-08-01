@@ -48,3 +48,38 @@ process.env.WORKER_ID ??= 'test-worker';
 process.env.JOB_POLL_INTERVAL_MS ??= '100';
 process.env.JOB_BATCH_SIZE ??= '5';
 process.env.ADMIN_APP_URL ??= 'http://localhost:3001';
+
+// Session 4 — resilience + alerting. Same rationale as the SMTP block:
+// zod validates these at boot, so test-safe defaults must be present.
+// ALERT_EMAIL is set here to a DUMMY address so the alerting tests can
+// reach the send path — the superRefine only requires it in production
+// but tests need a value because env is frozen at boot (per-test
+// process.env mutations don't reach env).
+process.env.JOB_STALE_AFTER_SECONDS ??= '300';
+process.env.WORKER_HEARTBEAT_INTERVAL_MS ??= '10000';
+process.env.WORKER_STALE_THRESHOLD_SECONDS ??= '60';
+process.env.JOBS_BACKLOG_ALERT_THRESHOLD ??= '20';
+process.env.ALERT_EMAIL ??= 'ops@test.local';
+process.env.ALERT_DEDUP_WINDOW_MS ??= '900000';
+process.env.ALERT_ENABLED ??= 'true';
+
+// Session 4 vague 3 — timeouts + SMTP retry policy. Short values keep
+// the test suite fast; per-test overrides are done inline where needed.
+process.env.TIMEOUT_DB_MS ??= '5000';
+process.env.TIMEOUT_STORAGE_MS ??= '30000';
+process.env.TIMEOUT_PDF_MS ??= '15000';
+process.env.TIMEOUT_SMTP_MS ??= '30000';
+process.env.TIMEOUT_RETELL_MS ??= '10000';
+process.env.SMTP_RETRY_ATTEMPTS ??= '3';
+// Zero-delay retries so the retry test doesn't sleep in real time.
+process.env.SMTP_RETRY_DELAYS_MS ??= '0,0,0';
+
+// Session 4 vague 4 — health endpoints + rate limiting.
+// HEALTH_DEEP_TOKEN is set here so /health/deep integration tests can
+// pass a valid value. The superRefine only enforces presence in
+// production. Length min 16 chars.
+process.env.HEALTH_DEEP_TOKEN ??= 'test-health-deep-token-16chars';
+process.env.HEALTH_DEEP_CACHE_MS ??= '60000';
+process.env.RATE_LIMIT_WEBHOOK_MAX ??= '300';
+process.env.RATE_LIMIT_WEBHOOK_WINDOW_MS ??= '60000';
+process.env.TRUST_PROXY_HOPS ??= '1';

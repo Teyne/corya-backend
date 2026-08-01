@@ -202,11 +202,18 @@ webhooksRouter.post(
     // recursive log sanitizer, which only redacts by KEY name. The
     // detailed message is still captured by the worker in `jobs.last_error`
     // through a separately-scrubbed path (see workers/job-worker.ts).
+    //
+    // Session 4 vague 3: pass the HTTP correlation id (from middleware/
+    // correlation.ts) so it flows into jobs.correlation_id and every
+    // downstream log. Fallback to null when for some reason the middleware
+    // did not run — retell_call_id stays available as a distinct log field.
     const payload = event;
-    void processCallAnalyzed(payload).catch((err: unknown) => {
+    const correlationId = req.correlationId ?? null;
+    void processCallAnalyzed(payload, correlationId).catch((err: unknown) => {
       logger.error(
         {
           retell_call_id: payload.call.call_id,
+          correlation_id: correlationId,
           err_name: err instanceof Error ? err.name : 'unknown',
         },
         'webhook_async_processing_failed',

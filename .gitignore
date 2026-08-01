@@ -41,6 +41,7 @@ coverage/
 # Claude Code
 .claude/settings.local.json
 .claude/context/
+.claude/worktrees/
 
 # Supabase
 supabase/.branches

@@ -50,7 +50,7 @@ import type {
   ProcessAppelPayload,
 } from '../types/index.js';
 import { renderAppelPdf } from './pdf.js';
-import { sendRecapEmail } from './email.js';
+import { PermanentEmailError, sendRecapEmail } from './email.js';
 import {
   buildPdfObjectPath,
   createSignedPdfUrl,
@@ -132,10 +132,13 @@ function mergePayload(
  * `fail_job` with backoff.
  */
 export async function processAppelJob(job: Job): Promise<void> {
+  // Session 4 vague 3: propagate the job's correlation_id (posted by the
+  // webhook at enqueue) into every log line emitted while processing.
   const correlation = {
     job_id: job.id,
     appel_id: job.appel_id,
     attempt: job.attempts,
+    correlation_id: job.correlation_id,
   };
 
   // 1. Load rows -----------------------------------------------------------
@@ -267,10 +270,22 @@ export async function processAppelJob(job: Job): Promise<void> {
       pdfBytes,
     });
   } catch (err: unknown) {
-    // Transient SMTP failures land here. The worker's backoff kicks in.
-    // We do NOT log the SMTP response body — it may include the recipient
-    // address which is a cabinet address (fine) but Nodemailer can also
-    // stuff the message subject in there in some verbose modes.
+    // Session 4 vague 3: distinguish PERMANENT from TRANSIENT.
+    //   - PERMANENT: sendRecapEmail already exhausted zero retries
+    //     (bad recipient, blocked sender) and threw PermanentEmailError.
+    //     Propagate it verbatim — the worker recognises the class and
+    //     forces dead_letter without spending outer job attempts.
+    //   - TRANSIENT: services/email.ts already ran its internal retry
+    //     policy (SMTP_RETRY_ATTEMPTS). We land here only after ALL
+    //     internal retries failed. Wrap it in EmailPipelineError so the
+    //     outer worker retry (backoff) kicks in.
+    if (err instanceof PermanentEmailError) {
+      logger.error(
+        { ...corrWithCall, err_name: err.name, smtp_code: err.smtpCode },
+        'email_send_permanent_failure',
+      );
+      throw err;
+    }
     logger.warn(
       { ...corrWithCall, err_name: err instanceof Error ? err.name : 'unknown' },
       'email_send_failed_will_retry',

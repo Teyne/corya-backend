@@ -39,6 +39,7 @@ import type {
   AppelProcessingRow,
   CabinetProcessingRow,
 } from '../types/index.js';
+import { isTimeoutError, withTimeout } from '../utils/timeout.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TEMPLATE_PATH = resolve(__dirname, '..', 'templates', 'email-recap.html');
@@ -108,6 +109,16 @@ export function assertSmtpConfigured(): SmtpConfig {
  * Return the shared SMTP transporter, lazy-building it. `pool: true` reuses
  * connections across sends so a small burst of jobs doesn't reopen the
  * TCP+TLS handshake each time.
+ *
+ * Session 4 vague 3 : timeouts are pushed to the Nodemailer layer directly
+ * (`connectionTimeout`, `greetingTimeout`, `socketTimeout`) IN ADDITION to
+ * the outer `withTimeout` wrap in `sendRecapEmailWithRetry`. Two layers on
+ * purpose:
+ *   - Nodemailer's socket-level timeout reclaims the underlying TCP
+ *     handle inside the client. Without it, an unresponsive relay would
+ *     leak a socket even after our outer promise timed out.
+ *   - The outer `withTimeout` is our contract — it always rejects with
+ *     `TimeoutError` (classified transient by the retry classifier).
  */
 function getTransporter(): Transporter {
   if (transporter !== null) return transporter;
@@ -128,6 +139,12 @@ function getTransporter(): Transporter {
     // to a hard requirement: no STARTTLS = the send fails, no cleartext
     // fallback. Harmless when `secure: true` (Nodemailer no-ops it).
     requireTLS: true,
+    // Session 4 vague 3 — client-side timeouts. TIMEOUT_SMTP_MS is the
+    // ceiling for the full transaction; individual phases (connect,
+    // greeting, socket) share the same budget rather than adding up.
+    connectionTimeout: env.TIMEOUT_SMTP_MS,
+    greetingTimeout: env.TIMEOUT_SMTP_MS,
+    socketTimeout: env.TIMEOUT_SMTP_MS,
   });
   return transporter;
 }
@@ -138,6 +155,24 @@ function getTransporter(): Transporter {
  */
 export function __setTransporterForTests(t: Transporter | null): void {
   transporter = t;
+}
+
+/**
+ * Returns the current transporter if one is cached, or builds it via
+ * `getTransporter()` — but ONLY when SMTP is configured. Used by the
+ * /health/deep `?full=1` branch so a probe never crashes an unconfigured
+ * dev process. Returns null when SMTP env vars are missing.
+ *
+ * Distinct from `getTransporter()` (which throws on missing config) so
+ * the health handler can degrade gracefully instead of exploding.
+ */
+export function getSharedTransporterForHealth(): Transporter | null {
+  if (transporter !== null) return transporter;
+  try {
+    return getTransporter();
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -299,12 +334,133 @@ export function renderEmailBodies(
   return { html, text, subject };
 }
 
+// ---------------------------------------------------------------------------
+// Session 4 vague 3 — SMTP error classification + internal retry policy
+// ---------------------------------------------------------------------------
+//
+// Two failure classes, one policy each:
+//   - TRANSIENT (name: 'PermanentEmailError' NOT set):
+//       Network hiccups, temporary SMTP throttles, TLS renegotiation
+//       storms. Worth retrying inside the same job. The classifier lists
+//       Node error codes (ETIMEDOUT, ECONNREFUSED, ECONNRESET, EAI_AGAIN,
+//       ESOCKET) AND SMTP 4xx response codes 421/450/451/452.
+//   - PERMANENT (thrown as PermanentEmailError):
+//       Bad recipient, mailbox full, blocked sender, syntax error.
+//       Retrying spends 5 outer job attempts on something structurally
+//       broken. The caller (appel-processor / worker) treats
+//       PermanentEmailError as "force dead_letter now, do NOT retry".
+//       SMTP codes: 550, 551, 553, 554.
+//
+// Timeouts (TimeoutError from utils/timeout.ts) are classified TRANSIENT
+// — a slow relay may accept the next attempt.
+//
+// The classifier is DEFENSIVE by default: any error we cannot classify
+// (unknown shape, weird 5xx we didn't list) is treated as transient.
+// Better to burn a retry than to prematurely dead-letter something that
+// might have recovered. The founder's cost/risk calculus was explicit.
+
 /**
- * Send the recap email. Throws on transient SMTP failure — the caller
- * (appel-processor) treats a throw as a retryable step.
+ * Thrown by `sendRecapEmail` when the SMTP layer returned a PERMANENT
+ * error code. The worker's fault handler recognises the class name and
+ * forces `dead_letter` directly via `forceDeadLetter` (see queries.ts) —
+ * it does NOT go through `fail_job`, which would only bump attempts.
  *
- * `to` and `cc` come from the cabinet row (cabinet-owned addresses), never
- * from patient data.
+ * Message is a constant string ('permanent_smtp_failure') so it is safe
+ * to persist in `jobs.last_error` — no PII leak.
+ */
+export class PermanentEmailError extends Error {
+  /** SMTP response code that triggered the classification, if any. */
+  public readonly smtpCode: number | null;
+  constructor(smtpCode: number | null) {
+    super('permanent_smtp_failure');
+    this.name = 'PermanentEmailError';
+    this.smtpCode = smtpCode;
+  }
+}
+
+/** SMTP response codes classified as PERMANENT (no retry). */
+const PERMANENT_SMTP_CODES: ReadonlySet<number> = new Set([550, 551, 553, 554]);
+
+/** SMTP response codes classified as TRANSIENT (retryable). */
+const TRANSIENT_SMTP_CODES: ReadonlySet<number> = new Set([421, 450, 451, 452]);
+
+/** Node.js error codes classified as TRANSIENT (retryable). */
+const TRANSIENT_NODE_CODES: ReadonlySet<string> = new Set([
+  'ETIMEDOUT',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EAI_AGAIN',
+  'ESOCKET',
+]);
+
+/**
+ * Decision: retry the send, or bail with a PermanentEmailError.
+ *
+ * Returns:
+ *   - 'permanent' → throw PermanentEmailError, no more attempts
+ *   - 'transient' → retry (until SMTP_RETRY_ATTEMPTS exhausted, then
+ *                          rethrow the original error so the OUTER job
+ *                          retry kicks in)
+ */
+type Classification = 'permanent' | 'transient';
+
+function classifyEmailError(err: unknown): Classification {
+  // Timeouts we produced are always transient (see utils/timeout.ts).
+  if (isTimeoutError(err)) return 'transient';
+
+  if (!(err instanceof Error)) return 'transient';
+
+  // Nodemailer typically decorates errors with `code` (Node) and/or
+  // `responseCode` (SMTP). Read both defensively — the `unknown` cast
+  // via a structural type keeps eslint's no-any rule happy.
+  const withProps = err as Error & {
+    code?: unknown;
+    responseCode?: unknown;
+  };
+
+  const smtpCode = typeof withProps.responseCode === 'number' ? withProps.responseCode : null;
+  if (smtpCode !== null) {
+    if (PERMANENT_SMTP_CODES.has(smtpCode)) return 'permanent';
+    if (TRANSIENT_SMTP_CODES.has(smtpCode)) return 'transient';
+  }
+
+  const nodeCode = typeof withProps.code === 'string' ? withProps.code : null;
+  if (nodeCode !== null && TRANSIENT_NODE_CODES.has(nodeCode)) return 'transient';
+
+  // Fall-through: unknown error. See file-level rationale — default to
+  // transient so we do not prematurely dead-letter a recoverable state.
+  return 'transient';
+}
+
+function extractSmtpCode(err: unknown): number | null {
+  if (!(err instanceof Error)) return null;
+  const c = (err as Error & { responseCode?: unknown }).responseCode;
+  return typeof c === 'number' ? c : null;
+}
+
+/** Sleep helper — resolves after `ms` (0 → next microtask). */
+function sleep(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Send the recap email.
+ *
+ * Contract:
+ *   - Runs UP TO `env.SMTP_RETRY_ATTEMPTS` internal attempts, sleeping
+ *     `env.SMTP_RETRY_DELAYS_MS[i]` between attempts i and i+1.
+ *   - On a PERMANENT error, throws `PermanentEmailError` immediately —
+ *     the caller must not spend outer job retries on a doomed send.
+ *   - On a TRANSIENT error after the last attempt, rethrows the original
+ *     error unchanged so the outer job retry kicks in.
+ *   - Each individual SMTP transaction is wrapped in `withTimeout` with
+ *     `TIMEOUT_SMTP_MS`. The Nodemailer transporter also enforces its
+ *     own socket-level timeouts (see getTransporter) — belt AND braces
+ *     to guarantee no leaked handle.
+ *
+ * Never logs patient data: `to` / `cc` are cabinet addresses, `appel_id`
+ * and `messageId` are technical identifiers.
  */
 export async function sendRecapEmail(args: {
   to: string;
@@ -342,20 +498,81 @@ export async function sendRecapEmail(args: {
   }
 
   const t = getTransporter();
-  // Nodemailer types SentMessageInfo as `any`. Narrow via unknown +
-  // structural cast so we can log messageId safely.
-  const info = (await t.sendMail(message)) as unknown as {
-    messageId?: string;
-  };
+  const attempts = env.SMTP_RETRY_ATTEMPTS;
+  const delays = env.SMTP_RETRY_DELAYS_MS;
 
-  // `to` is a cabinet-owned address, safe to log.
-  logger.info(
-    {
-      to,
-      cc: cc ?? null,
-      appel_id: appel.id,
-      message_id: info.messageId ?? null,
-    },
-    'email_recap_sent',
-  );
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      // Nodemailer types SentMessageInfo as `any`. Narrow via unknown +
+      // structural cast so we can log messageId safely.
+      const info = (await withTimeout(
+        t.sendMail(message),
+        env.TIMEOUT_SMTP_MS,
+        'smtp:sendMail',
+      )) as unknown as { messageId?: string };
+
+      // `to` is a cabinet-owned address, safe to log.
+      logger.info(
+        {
+          to,
+          cc: cc ?? null,
+          appel_id: appel.id,
+          message_id: info.messageId ?? null,
+          attempt,
+        },
+        'email_recap_sent',
+      );
+      return;
+    } catch (err: unknown) {
+      lastError = err;
+      const classification = classifyEmailError(err);
+      const smtpCode = extractSmtpCode(err);
+
+      if (classification === 'permanent') {
+        // Loud log — this is the ops-critical event for a bad recipient.
+        // No err.message: nodemailer may echo the recipient address which
+        // is a cabinet address (safe) but can also include the message
+        // subject in verbose modes. Class + code is enough.
+        logger.error(
+          {
+            to,
+            appel_id: appel.id,
+            attempt,
+            smtp_code: smtpCode,
+            err_name: err instanceof Error ? err.name : 'unknown',
+          },
+          'email_send_permanent_failure',
+        );
+        throw new PermanentEmailError(smtpCode);
+      }
+
+      // Transient. Retry unless we exhausted the budget.
+      const willRetry = attempt < attempts;
+      logger.warn(
+        {
+          to,
+          appel_id: appel.id,
+          attempt,
+          max_attempts: attempts,
+          will_retry: willRetry,
+          smtp_code: smtpCode,
+          err_name: err instanceof Error ? err.name : 'unknown',
+        },
+        'email_send_transient_error_retrying',
+      );
+      if (!willRetry) break;
+
+      // delays[attempt - 1] because attempt is 1-based and the first gap
+      // is delays[0] (between attempt 1 and 2). superRefine at boot has
+      // already verified the list length.
+      const delayIdx = attempt - 1;
+      const delay = delays[delayIdx] ?? 0;
+      await sleep(delay);
+    }
+  }
+
+  // Transient outcomes only reach here (permanent throws inside the loop).
+  // Rethrow so the OUTER job retry (worker + fail_job) kicks in.
+  throw lastError instanceof Error ? lastError : new Error('email_send_unknown_failure');
 }

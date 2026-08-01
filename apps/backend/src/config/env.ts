@@ -132,7 +132,180 @@ const envSchema = z.object({
   // in the admin back-office. Falls back to APP_BASE_URL when the back-office
   // still runs on the same origin as the API (dev).
   ADMIN_APP_URL: z.string().url().default('http://localhost:3001'),
-});
+
+  // ---- Session 4 — worker resilience + alerting ----
+  // How long a `processing` job may stay locked before claim_jobs reclaims
+  // it as a zombie. Kept SHORTER than requeue_stuck_jobs' 10-min filet so
+  // opportunistic reclaim happens first — see migration 20260801000000.
+  JOB_STALE_AFTER_SECONDS: z.coerce
+    .number()
+    .int()
+    .min(30)
+    .max(3600)
+    .default(300),
+  // Alive-heartbeat tick period. INDEPENDENT of the polling loop so a job
+  // that pends does not silence the "process alive" signal.
+  WORKER_HEARTBEAT_INTERVAL_MS: z.coerce
+    .number()
+    .int()
+    .min(1_000)
+    .max(60_000)
+    .default(10_000),
+  // Alerting threshold on `worker_heartbeats.last_seen_at`. If the API
+  // poller sees a worker whose alive-tick is older than this, it fires a
+  // `worker_stale` alert. `last_poll_at` uses a longer threshold (180 s)
+  // hard-coded in the poller — it's not a knob, it's a design decision
+  // (see services/alert-pollers.ts).
+  WORKER_STALE_THRESHOLD_SECONDS: z.coerce
+    .number()
+    .int()
+    .min(15)
+    .max(3600)
+    .default(60),
+  // Above this count of `pending` jobs older than 5 min, fire `jobs_backlog`.
+  JOBS_BACKLOG_ALERT_THRESHOLD: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(10_000)
+    .default(20),
+  // Recipient of ops alerts. REQUIRED in production only (superRefine below)
+  // so `npm run dev`, tests and the founder's local shell keep booting when
+  // it's absent from .env.local. Empty string is normalised to `undefined`
+  // so the alerting layer can key its "no recipient configured" branch off
+  // a single check.
+  ALERT_EMAIL: z
+    .string()
+    .trim()
+    .transform((v) => (v.length === 0 ? undefined : v))
+    .pipe(z.string().email().optional())
+    .optional(),
+  // Anti-spam window for the in-memory alert deduper. A worker looping on a
+  // deterministic error must NOT flood the inbox — 1 alert per type per
+  // window. 15 min is short enough that a real, sustained outage keeps
+  // pinging (about 4 emails/hour), long enough that we don't self-DDoS
+  // the SMTP outbox on a hot loop.
+  ALERT_DEDUP_WINDOW_MS: z.coerce
+    .number()
+    .int()
+    .min(60_000)
+    .max(24 * 60 * 60 * 1_000)
+    .default(15 * 60 * 1_000),
+  // Master switch. Kept as a boolean-shaped env var (not just "unset") so a
+  // future ops incident can silence alerts INTENTIONALLY without editing
+  // config elsewhere. When false, a WARN log is emitted at API AND worker
+  // boot — hard requirement of the founder. Default applied to the STRING
+  // side of the transform so the type inferred stays `boolean`.
+  ALERT_ENABLED: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true'),
+
+  // ---- Session 4 vague 3 — timeouts on external I/O ----
+  // Every external call is bounded. Missing timeouts historically let a
+  // hung Supabase request pin a worker slot indefinitely — see
+  // src/utils/timeout.ts and the audit trail in each service file.
+  TIMEOUT_DB_MS: z.coerce.number().int().min(200).max(60_000).default(5_000),
+  TIMEOUT_STORAGE_MS: z.coerce.number().int().min(1_000).max(120_000).default(30_000),
+  TIMEOUT_PDF_MS: z.coerce.number().int().min(1_000).max(60_000).default(15_000),
+  TIMEOUT_SMTP_MS: z.coerce.number().int().min(1_000).max(120_000).default(30_000),
+  TIMEOUT_RETELL_MS: z.coerce.number().int().min(1_000).max(60_000).default(10_000),
+
+  // ---- Session 4 vague 3 — SMTP internal retry policy ----
+  // Number of internal attempts INSIDE a single email job. Once exhausted
+  // the caller either lets the outer job retry (transient) or forces
+  // dead_letter (permanent) — see services/email.ts classifier.
+  SMTP_RETRY_ATTEMPTS: z.coerce.number().int().min(1).max(10).default(3),
+  // Delays between internal attempts, in ms, as a comma-separated list.
+  // Length must be >= SMTP_RETRY_ATTEMPTS - 1 (the FIRST attempt is
+  // immediate, subsequent attempts consume delays in order). Zod parses
+  // and validates the list eagerly.
+  // ---- Session 4 vague 4 — health + rate limiting ----
+  // Bearer-like token protecting /health/deep. Optional in dev/test so
+  // `npm run dev` boots without wiring monitoring; required in production
+  // (see superRefine below). NEVER logged, NEVER echoed to responses.
+  HEALTH_DEEP_TOKEN: z.string().min(16).optional(),
+  // TTL (ms) of the in-memory /health/deep cache. Prevents a monitor loop
+  // from hammering real Storage + DB connections.
+  HEALTH_DEEP_CACHE_MS: z.coerce.number().int().min(1_000).max(600_000).default(60_000),
+  // Global fixed-window rate limit for /webhooks/*. NOT per IP — see
+  // src/middleware/rate-limit.ts for rationale (Retell IP pool is small
+  // and the real defence is the SDK signature verify).
+  RATE_LIMIT_WEBHOOK_MAX: z.coerce.number().int().min(1).max(100_000).default(300),
+  RATE_LIMIT_WEBHOOK_WINDOW_MS: z.coerce
+    .number()
+    .int()
+    .min(1_000)
+    .max(60 * 60 * 1_000)
+    .default(60_000),
+  // Number of trusted reverse-proxy hops (Jelastic front). Numeric value
+  // only — Express `trust proxy: true` blindly trusts every hop and is
+  // never appropriate here. Kept even without an IP-scoped rate limit so
+  // pino-http logs the real client IP instead of the proxy address.
+  TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(10).default(1),
+
+  SMTP_RETRY_DELAYS_MS: z
+    .string()
+    .default('1000,5000,30000')
+    .transform((s, ctx) => {
+      const parts = s
+        .split(',')
+        .map((p) => p.trim())
+        .filter((p) => p.length > 0);
+      const out: number[] = [];
+      for (const raw of parts) {
+        const n = Number(raw);
+        if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0 || n > 600_000) {
+          ctx.addIssue({
+            code: 'custom',
+            message: `SMTP_RETRY_DELAYS_MS: invalid delay "${raw}" (must be integer ms in [0, 600000])`,
+          });
+          return z.NEVER;
+        }
+        out.push(n);
+      }
+      if (out.length === 0) {
+        ctx.addIssue({
+          code: 'custom',
+          message: 'SMTP_RETRY_DELAYS_MS: must contain at least one delay',
+        });
+        return z.NEVER;
+      }
+      return out;
+    }),
+})
+  .superRefine((v, ctx) => {
+    // Production must have an alert recipient wired. Anywhere else the
+    // ops team can (temporarily) run without one.
+    if (v.NODE_ENV === 'production' && v.ALERT_EMAIL === undefined) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['ALERT_EMAIL'],
+        message: 'ALERT_EMAIL is required in production',
+      });
+    }
+    // The delays list must cover EVERY inter-attempt gap. Attempt 1 fires
+    // immediately, then N-1 gaps are consumed in order. A shorter list
+    // means we would call `delays[undefined]` — surface it at boot, not
+    // at the first SMTP outage.
+    if (v.SMTP_RETRY_DELAYS_MS.length < v.SMTP_RETRY_ATTEMPTS - 1) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['SMTP_RETRY_DELAYS_MS'],
+        message: `SMTP_RETRY_DELAYS_MS needs at least ${v.SMTP_RETRY_ATTEMPTS - 1} entries for SMTP_RETRY_ATTEMPTS=${v.SMTP_RETRY_ATTEMPTS}`,
+      });
+    }
+    // /health/deep MUST be protected in production. Empty token in dev is
+    // fine (endpoint stays reachable behind the "give me the value" hurdle
+    // via the localhost network boundary during npm run dev).
+    if (v.NODE_ENV === 'production' && v.HEALTH_DEEP_TOKEN === undefined) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['HEALTH_DEEP_TOKEN'],
+        message: 'HEALTH_DEEP_TOKEN is required in production',
+      });
+    }
+  });
 
 export type Env = z.infer<typeof envSchema>;
 

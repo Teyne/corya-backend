@@ -18,11 +18,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const setContentMock = vi.fn(() => Promise.resolve(undefined));
 const pageClose = vi.fn(() => Promise.resolve(undefined));
 const pdfMock = vi.fn(() => Promise.resolve(Buffer.from('%PDF-1.4-mock')));
+// Session 4 vague 3: renderAppelPdf now calls page.setDefaultTimeout for
+// belt-and-braces resource reclamation. The mock records but is a no-op.
+const setDefaultTimeoutMock = vi.fn();
 const newPageMock = vi.fn(() =>
   Promise.resolve({
     setContent: setContentMock,
     pdf: pdfMock,
     close: pageClose,
+    setDefaultTimeout: setDefaultTimeoutMock,
   }),
 );
 const browserCloseMock = vi.fn(() => Promise.resolve(undefined));

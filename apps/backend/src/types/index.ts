@@ -160,6 +160,13 @@ export interface JobInsertRow {
   appel_id: string;
   payload: Record<string, unknown>;
   run_after?: string; // ISO 8601, defaults to NOW() server-side if omitted
+  /**
+   * Session 4: opaque correlation key stamped by the webhook handler for
+   * end-to-end log tracing. Column is nullable in DB (migration
+   * 20260801000002) so pre-Session-4 rows and legacy tests without the
+   * field remain valid.
+   */
+  correlation_id?: string | null;
 }
 
 /**
@@ -168,6 +175,14 @@ export interface JobInsertRow {
  * The RPC already flipped `status` to `'processing'` and INCREMENTED
  * `attempts`, so this value reflects the post-claim state. The worker uses
  * `attempts` directly for its backoff computation.
+ *
+ * Session 4 additions:
+ *   - `correlation_id` : opaque tracing key stamped by the webhook at enqueue
+ *     time (see migration 20260801000002). NULL for jobs enqueued before the
+ *     migration.
+ *   - `dead_letter_alerted_at` : audit flag set EXCLUSIVELY by the API-side
+ *     poller AFTER a successful alert email (see migration 20260801000000).
+ *     Backend never mutates this from any other path.
  */
 export interface Job {
   id: string;
@@ -183,6 +198,8 @@ export interface Job {
   last_error: string | null;
   created_at: string;
   updated_at: string;
+  correlation_id: string | null;
+  dead_letter_alerted_at: string | null;
 }
 
 /**

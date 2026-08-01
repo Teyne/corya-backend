@@ -35,11 +35,13 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import puppeteer, { type Browser } from 'puppeteer';
+import { env } from '../config/env.js';
 import { logger } from '../config/logger.js';
 import type {
   AppelProcessingRow,
   CabinetProcessingRow,
 } from '../types/index.js';
+import { withTimeout } from '../utils/timeout.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -205,17 +207,34 @@ export async function renderAppelPdf(
   const html = renderRecapHtml(appel, cabinet, extras);
   const browser = await getOrLaunchBrowser();
   const page = await browser.newPage();
+  // Session 4 vague 3: enforce the timeout at TWO layers.
+  //   1. `page.setDefaultTimeout` — Puppeteer's OWN cancellation, which
+  //      also closes the underlying CDP session cleanly. Without this,
+  //      a runaway render keeps a renderer tab alive forever even after
+  //      our outer promise rejects.
+  //   2. `withTimeout` around the whole render — our contract error
+  //      class (TimeoutError) is what the retry classifier keys on.
+  // If they disagree, Puppeteer usually wins first (it holds the tab
+  // control); if not, withTimeout rejects and the finally-block below
+  // still closes the page — both paths reclaim resources.
+  page.setDefaultTimeout(env.TIMEOUT_PDF_MS);
   try {
-    // waitUntil: 'load' is sufficient — the template has ZERO external
-    // resources (font-family stack is system-only). 'networkidle0' would
-    // add a needless idle window on every render.
-    await page.setContent(html, { waitUntil: 'load' });
-    const bytes = await page.pdf({
-      format: 'A4',
-      printBackground: true,
-      // A slight extra margin buffer; @page in the CSS is authoritative.
-      preferCSSPageSize: true,
-    });
+    const bytes = await withTimeout(
+      (async (): Promise<Uint8Array> => {
+        // waitUntil: 'load' is sufficient — the template has ZERO external
+        // resources (font-family stack is system-only). 'networkidle0'
+        // would add a needless idle window on every render.
+        await page.setContent(html, { waitUntil: 'load' });
+        return page.pdf({
+          format: 'A4',
+          printBackground: true,
+          // A slight extra margin buffer; @page in the CSS is authoritative.
+          preferCSSPageSize: true,
+        });
+      })(),
+      env.TIMEOUT_PDF_MS,
+      'pdf:renderAppelPdf',
+    );
     return Buffer.from(bytes);
   } finally {
     // Always close the page — a leaked page holds an entire renderer tab.

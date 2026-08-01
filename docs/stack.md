@@ -40,6 +40,29 @@ Validées explicitement par le fondateur. Elles font désormais partie de la sta
 
 Critères de validation appliqués à chaque ajout : licence permissive **MIT, Apache 2.0 ou ISC** (voir « Ajouts de dépendances » plus bas, qui fait foi — GPL exclue), dernière release < 12 mois, aucun advisory `npm audit`. Une dépendance qui ne passe pas ces trois critères n'est pas installée — l'agent s'arrête et remonte au fondateur.
 
+### Dépendances ajoutées (session 3, 31.07.2026)
+
+| Dépendance | Type | Rôle |
+|---|---|---|
+| `puppeteer` | prod | Rendu du PDF récap. Version complète (et non `puppeteer-core`) pour que Chromium soit téléchargé à l'install sans configuration manuelle. |
+| `nodemailer` | prod | Envoi SMTP vers Infomaniak, avec pièce jointe PDF. |
+| `@types/nodemailer` | dev | Typings |
+
+### Traitement asynchrone (verrouillé session 3)
+
+| Décision | Choix | Alternative écartée |
+|---|---|---|
+| File de travail | Table `jobs` en Postgres | Redis/BullMQ (dépendance d'infra supplémentaire), pg-boss |
+| Prise de job | RPC Postgres `claim_jobs`, `SELECT ... FOR UPDATE SKIP LOCKED` | Verrou applicatif (PostgREST n'ouvre pas de transaction explicite depuis supabase-js) |
+| Granularité | Job monolithique `process_appel` avec checkpoints dans `payload.steps` | Jobs séparés PDF / email (retry plus fin, mais orchestration et idempotence plus lourdes) |
+| Exécution | Process worker séparé de l'API (`npm run worker`) | Worker dans le process Express (Puppeteer y consomme trop de mémoire) |
+| Retry | Backoff exponentiel avec jitter, plafond 5 min, borné par `attempts`/`max_attempts` | Backoff constant (thundering herd sur panne SMTP prolongée) |
+
+Précisions de vocabulaire, souvent source de confusion : le statut d'un job en
+cours est **`processing`** (pas `running`), les colonnes de verrouillage sont
+**`locked_at`/`locked_by`** (pas `started_at`), et `claim_jobs` réserve un
+**batch** (pas un job unique). Il n'existe pas de fonction `claim_next_job`.
+
 ### Règles ESLint verrouillées
 
 Base : `@typescript-eslint` preset `recommended-type-checked`, plus :

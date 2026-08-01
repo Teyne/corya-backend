@@ -79,9 +79,22 @@ interface SendRecapEmailArgs {
 const sendRecapEmailMock = vi.fn<(args: SendRecapEmailArgs) => Promise<void>>(
   () => Promise.resolve(undefined),
 );
-vi.mock('../../src/services/email.js', () => ({
-  sendRecapEmail: sendRecapEmailMock,
-}));
+vi.mock('../../src/services/email.js', () => {
+  // Session 4 vague 3: appel-processor imports PermanentEmailError. Expose
+  // the class from the mock verbatim — the class name is the contract.
+  class PermanentEmailError extends Error {
+    public readonly smtpCode: number | null;
+    constructor(smtpCode: number | null) {
+      super('permanent_smtp_failure');
+      this.name = 'PermanentEmailError';
+      this.smtpCode = smtpCode;
+    }
+  }
+  return {
+    sendRecapEmail: sendRecapEmailMock,
+    PermanentEmailError,
+  };
+});
 
 // Replace the shared logger with one that writes to an inspectable stream.
 // `vi.mock` is hoisted to the top of the file, so any variables it
@@ -169,6 +182,8 @@ function makeJob(overrides?: Partial<{ id: string; attempts: number; payload: Re
     last_error: null,
     created_at: '2026-07-31T09:42:00.000Z',
     updated_at: '2026-07-31T09:42:00.000Z',
+    correlation_id: null,
+    dead_letter_alerted_at: null,
   };
 }
 

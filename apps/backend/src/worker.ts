@@ -13,11 +13,23 @@
  *   4. Wire SIGTERM / SIGINT for graceful shutdown: stop claiming, await
  *      in-flight jobs, close Puppeteer + SMTP pool, exit 0.
  */
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { logger } from './config/logger.js';
 import { runJobWorker } from './workers/job-worker.js';
 import { assertSmtpConfigured, closeTransporter } from './services/email.js';
 import { closeBrowser } from './services/pdf.js';
 import { ensureBucketAccessible } from './services/storage.js';
+import { closeAlertTransporter, logAlertingModeOnce } from './services/alert.js';
+
+// Version comes from package.json — same ESM-safe reading pattern as index.ts.
+const __dirname = dirname(fileURLToPath(import.meta.url));
+interface PackageJsonShape { version: string }
+const pkg = JSON.parse(
+  readFileSync(resolve(__dirname, '..', 'package.json'), 'utf-8'),
+) as PackageJsonShape;
+const version: string = pkg.version;
 
 async function main(): Promise<void> {
   try {
@@ -40,7 +52,11 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const worker = runJobWorker();
+  // Session 4: emit a boot-time line describing the alerting mode. Hard
+  // requirement from the founder — a silenced pipeline must be VISIBLE.
+  logAlertingModeOnce();
+
+  const worker = runJobWorker({ version });
 
   const shutdown = (signal: NodeJS.Signals): void => {
     logger.info({ signal }, 'worker_received_signal');
@@ -66,6 +82,14 @@ async function main(): Promise<void> {
           logger.warn(
             { err_name: err instanceof Error ? err.name : 'unknown' },
             'worker_smtp_close_failed',
+          );
+        }
+        try {
+          closeAlertTransporter();
+        } catch (err: unknown) {
+          logger.warn(
+            { err_name: err instanceof Error ? err.name : 'unknown' },
+            'worker_alert_close_failed',
           );
         }
         try {

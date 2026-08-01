@@ -198,6 +198,8 @@ async function main(): Promise<number> {
     last_error: null,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
+    correlation_id: null,
+    dead_letter_alerted_at: null,
   };
 
   try {

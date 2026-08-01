@@ -21,6 +21,7 @@ const {
   __setTemplateForTests,
   __setTransporterForTests,
   assertSmtpConfigured,
+  PermanentEmailError,
   renderEmailBodies,
   sendRecapEmail,
 } = await import('../../src/services/email.js');
@@ -180,8 +181,12 @@ describe('sendRecapEmail', () => {
     expect(message.cc).toBeUndefined();
   });
 
-  it('propagates SMTP failures so the caller can trigger a retry', async () => {
-    sendMailMock.mockRejectedValueOnce(new Error('smtp temporarily unavailable'));
+  it('propagates SMTP failures so the caller can trigger a retry (after exhausting internal attempts)', async () => {
+    // Session 4 vague 3: the internal retry loop tries SMTP_RETRY_ATTEMPTS
+    // times (3 in test setup). Persistent rejection must exhaust ALL of
+    // them before the outer throw. `mockRejectedValue` (not `Once`)
+    // guarantees every attempt fails.
+    sendMailMock.mockRejectedValue(new Error('smtp temporarily unavailable'));
     await expect(
       sendRecapEmail({
         to: 'cabinet@example.com',
@@ -193,5 +198,82 @@ describe('sendRecapEmail', () => {
         pdfBytes: Buffer.from(''),
       }),
     ).rejects.toThrow(/smtp temporarily unavailable/);
+    // 3 internal attempts consumed. Delays are 0,0,0 in tests/setup.ts so
+    // no real time was spent.
+    expect(sendMailMock).toHaveBeenCalledTimes(3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Session 4 vague 3 — SMTP error classification + retry policy
+// ---------------------------------------------------------------------------
+
+describe('sendRecapEmail — retry policy (session 4 vague 3)', () => {
+  const baseArgs = {
+    to: 'cabinet@example.com',
+    cc: null,
+    appel: APPEL,
+    cabinet: CABINET,
+    pdfUrl: 'u',
+    adminUrl: 'a',
+    pdfBytes: Buffer.from(''),
+  };
+
+  it('retries after a transient failure and eventually succeeds', async () => {
+    sendMailMock
+      .mockRejectedValueOnce(
+        Object.assign(new Error('temporarily unavailable'), { code: 'ETIMEDOUT' }),
+      )
+      .mockRejectedValueOnce(
+        Object.assign(new Error('slow relay'), { responseCode: 421 }),
+      )
+      .mockResolvedValueOnce({ messageId: '<final@ok>' });
+    await expect(sendRecapEmail(baseArgs)).resolves.toBeUndefined();
+    expect(sendMailMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('throws PermanentEmailError IMMEDIATELY on SMTP 550 (no retries)', async () => {
+    sendMailMock.mockRejectedValueOnce(
+      Object.assign(new Error('mailbox unknown'), { responseCode: 550 }),
+    );
+    await expect(sendRecapEmail(baseArgs)).rejects.toBeInstanceOf(PermanentEmailError);
+    // Only ONE attempt — no retries burned on a doomed send.
+    expect(sendMailMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('throws PermanentEmailError immediately on SMTP 553 (bad address syntax)', async () => {
+    sendMailMock.mockRejectedValueOnce(
+      Object.assign(new Error('syntax'), { responseCode: 553 }),
+    );
+    const promise = sendRecapEmail(baseArgs);
+    await expect(promise).rejects.toBeInstanceOf(PermanentEmailError);
+    await promise.catch((err: unknown) => {
+      // The class carries the original SMTP code — useful downstream.
+      expect((err as InstanceType<typeof PermanentEmailError>).smtpCode).toBe(553);
+    });
+  });
+
+  it('classifies a TimeoutError as transient (retryable)', async () => {
+    // First attempt: fake a TimeoutError shape. Second attempt: success.
+    class LocalTimeoutError extends Error {
+      constructor() {
+        super('timeout:smtp:sendMail:30000ms');
+        this.name = 'TimeoutError';
+      }
+    }
+    sendMailMock
+      .mockRejectedValueOnce(new LocalTimeoutError())
+      .mockResolvedValueOnce({ messageId: '<ok@x>' });
+    await expect(sendRecapEmail(baseArgs)).resolves.toBeUndefined();
+    expect(sendMailMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('classifies an unknown error as transient by default (safe path)', async () => {
+    // No `code`, no `responseCode` — defensive default is transient.
+    sendMailMock
+      .mockRejectedValueOnce(new Error('mysterious wobble'))
+      .mockResolvedValueOnce({ messageId: '<ok@x>' });
+    await expect(sendRecapEmail(baseArgs)).resolves.toBeUndefined();
+    expect(sendMailMock).toHaveBeenCalledTimes(2);
   });
 });
