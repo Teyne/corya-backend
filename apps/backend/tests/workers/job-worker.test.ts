@@ -55,6 +55,13 @@ vi.mock('../../src/services/alert.js', () => ({
   sendAlert: sendAlertMock,
 }));
 
+const deleteRetellCallMock = vi.fn<(callId: string) => Promise<'deleted' | 'not_found'>>(
+  () => Promise.resolve('deleted'),
+);
+vi.mock('../../src/services/retell.js', () => ({
+  deleteRetellCall: deleteRetellCallMock,
+}));
+
 const processAppelJobMock = vi.fn<(job: Job) => Promise<void>>(
   () => Promise.resolve(undefined),
 );
@@ -137,6 +144,7 @@ beforeEach(() => {
   workerHeartbeatAliveMock.mockReset().mockResolvedValue(undefined);
   workerHeartbeatPollMock.mockReset().mockResolvedValue(undefined);
   sendAlertMock.mockReset().mockResolvedValue(undefined);
+  deleteRetellCallMock.mockReset().mockResolvedValue('deleted');
 });
 
 afterEach(() => {
@@ -218,6 +226,7 @@ describe('runJobWorker', () => {
       makeJob({
         id: 'job-purge',
         type: 'purge_audio_retell',
+        payload: { retell_call_id: 'call-test' },
         // Even with attempts == max_attempts (worst-case timing) the
         // KNOWN-but-unimplemented branch must NOT fire an alert.
         attempts: 5,
@@ -232,11 +241,9 @@ describe('runJobWorker', () => {
     // fail_job must NOT be called — we skip the retry budget entirely.
     expect(failJobMock).not.toHaveBeenCalled();
     // forceDeadLetter called with a CONSTANT last_error string.
-    expect(forceDeadLetterMock).toHaveBeenCalledTimes(1);
-    expect(forceDeadLetterMock.mock.calls[0]?.[0]).toBe('job-purge');
-    expect(forceDeadLetterMock.mock.calls[0]?.[1]).toBe(
-      'not_implemented:purge_audio_retell',
-    );
+    expect(forceDeadLetterMock).not.toHaveBeenCalled();
+    expect(deleteRetellCallMock).toHaveBeenCalledWith('call-test');
+    expect(completeJobMock).toHaveBeenCalledWith('job-purge');
     // No alert whatsoever — critical: this is what avoids the inbox storm.
     expect(sendAlertMock).not.toHaveBeenCalled();
     // And of course no handler ran.
@@ -246,11 +253,12 @@ describe('runJobWorker', () => {
   it('does not fire an alert if forceDeadLetter itself fails on a KNOWN-but-unimplemented type', async () => {
     // Defence in depth: even when the RPC to force dead_letter breaks,
     // we must not fall through to the noisy branch and email the operator.
-    forceDeadLetterMock.mockRejectedValueOnce(new Error('db_down'));
+    deleteRetellCallMock.mockRejectedValueOnce(new Error('retell_down'));
     claimJobsMock.mockResolvedValueOnce([
       makeJob({
         id: 'job-purge-dberr',
         type: 'purge_audio_retell',
+        payload: { retell_call_id: 'call-test' },
         attempts: 5,
         max_attempts: 5,
       }),
@@ -260,9 +268,13 @@ describe('runJobWorker', () => {
     const worker = runJobWorker({ runOnce: true });
     await worker.stopped;
 
-    expect(forceDeadLetterMock).toHaveBeenCalledTimes(1);
+    expect(forceDeadLetterMock).not.toHaveBeenCalled();
     expect(failJobMock).not.toHaveBeenCalled();
-    expect(sendAlertMock).not.toHaveBeenCalled();
+    expect(completeJobMock).toHaveBeenCalledWith('job-purge-dberr');
+    expect(sendAlertMock).toHaveBeenCalledWith(
+      'retell_purge_failed',
+      expect.objectContaining({ job_id: 'job-purge-dberr' }),
+    );
   });
 
   it('exits cleanly when claimJobs returns [] and runOnce is set', async () => {

@@ -276,6 +276,7 @@ describe('checkCronStale (session 4 vague 4)', () => {
         'requeue-stuck-file-deletions',
         'purge-stale-worker-heartbeats',
         'purge-cron-run-details',
+        'purge-ancient-logs-actions',
       ].map((jobname) => ({
         jobname,
         schedule: '* * * * *',

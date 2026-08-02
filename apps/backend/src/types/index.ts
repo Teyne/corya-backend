@@ -202,6 +202,28 @@ export interface Job {
   dead_letter_alerted_at: string | null;
 }
 
+/** A claimed physical-deletion order. Contains technical identifiers only. */
+export interface FileDeletion {
+  id: string;
+  target: 'supabase_storage' | 'retell_audio';
+  bucket: string | null;
+  object_path: string | null;
+  external_ref: string | null;
+  reason: 'audio_expired_48h' | 'appel_purged_24m' | 'gdpr_erasure_request' | 'manual_admin_deletion';
+  status: 'pending' | 'processing' | 'deleted' | 'failed' | 'dead_letter' | 'not_found';
+  attempts: number;
+  max_attempts: number;
+  run_after: string;
+  locked_at: string | null;
+  locked_by: string | null;
+  last_error: string | null;
+  source_appel_id: string | null;
+  source_cabinet_id: string | null;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+}
+
 /**
  * A row from `public.cabinets` — only the columns the worker reads.
  * `statut` gates whether the pipeline actually runs (paused/terminated

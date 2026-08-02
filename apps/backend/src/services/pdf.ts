@@ -42,6 +42,7 @@ import type {
   CabinetProcessingRow,
 } from '../types/index.js';
 import { withTimeout } from '../utils/timeout.js';
+import { toLogFields } from '../utils/errors.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -128,7 +129,7 @@ export async function closeBrowser(): Promise<void> {
     // Best-effort. A failing close on shutdown must not mask the actual
     // shutdown cause. Log and move on.
     logger.warn(
-      { err_name: err instanceof Error ? err.name : 'unknown' },
+      { ...toLogFields(err) },
       'puppeteer_close_failed',
     );
   }

@@ -40,6 +40,7 @@ import type {
   CabinetProcessingRow,
 } from '../types/index.js';
 import { isTimeoutError, withTimeout } from '../utils/timeout.js';
+import { toLogFields } from '../utils/errors.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TEMPLATE_PATH = resolve(__dirname, '..', 'templates', 'email-recap.html');
@@ -540,7 +541,7 @@ export async function sendRecapEmail(args: {
             appel_id: appel.id,
             attempt,
             smtp_code: smtpCode,
-            err_name: err instanceof Error ? err.name : 'unknown',
+            ...toLogFields(err),
           },
           'email_send_permanent_failure',
         );
@@ -557,7 +558,7 @@ export async function sendRecapEmail(args: {
           max_attempts: attempts,
           will_retry: willRetry,
           smtp_code: smtpCode,
-          err_name: err instanceof Error ? err.name : 'unknown',
+          ...toLogFields(err),
         },
         'email_send_transient_error_retrying',
       );

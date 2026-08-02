@@ -14,6 +14,7 @@ import type {
   AppelInsertRow,
   AppelProcessingRow,
   CabinetProcessingRow,
+  FileDeletion,
   Job,
   JobInsertRow,
   ProcessAppelPayload,
@@ -552,6 +553,7 @@ export interface WorkerHeartbeatRow {
   worker_id: string;
   last_seen_at: string;
   last_poll_at: string | null;
+  last_deletion_poll_at: string | null;
 }
 
 /**
@@ -580,9 +582,9 @@ export async function getStaleWorkerHeartbeats(
     (signal) =>
       supabase
         .from('worker_heartbeats')
-        .select('worker_id, last_seen_at, last_poll_at')
+        .select('worker_id, last_seen_at, last_poll_at, last_deletion_poll_at')
         .or(
-          `last_seen_at.lt.${seenCutoff},and(last_poll_at.not.is.null,last_poll_at.lt.${pollCutoff})`,
+          `last_seen_at.lt.${seenCutoff},and(last_poll_at.not.is.null,last_poll_at.lt.${pollCutoff}),and(last_deletion_poll_at.not.is.null,last_deletion_poll_at.lt.${pollCutoff})`,
         )
         .abortSignal(signal),
     'db:getStaleWorkerHeartbeats',
@@ -730,6 +732,7 @@ export interface CronHealthRow {
   seconds_since_last_success: number | null;
   total_runs_last_24h: number;
   failed_runs_last_24h: number;
+  first_seen_at: string | null;
 }
 
 /**
@@ -765,4 +768,80 @@ export async function markDeadLetterAlerted(jobId: string): Promise<void> {
   if (error) {
     throw new Error(`db_mark_dead_letter_alerted_failed: ${error.message}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Physical file-deletion outbox
+// ---------------------------------------------------------------------------
+
+export async function claimFileDeletions(
+  workerId: string,
+  batchSize: number,
+  staleAfterSeconds: number,
+): Promise<FileDeletion[]> {
+  const supabase = getServiceClient();
+  const result = (await withDbTimeout(
+    (signal) => supabase.rpc('claim_file_deletions', {
+      p_worker_id: workerId,
+      p_batch_size: batchSize,
+      p_stale_after_seconds: staleAfterSeconds,
+    }).abortSignal(signal),
+    'db:claimFileDeletions',
+  )) as { data: unknown; error: { message: string } | null };
+  if (result.error) throw new Error(`db_claim_file_deletions_failed: ${result.error.message}`);
+  return (Array.isArray(result.data) ? result.data : []) as FileDeletion[];
+}
+
+export async function completeFileDeletion(
+  id: string,
+  status: 'deleted' | 'not_found',
+): Promise<void> {
+  const { error } = await withDbTimeout(
+    (signal) => getServiceClient().from('file_deletions_outbox').update({
+      status,
+      deleted_at: new Date().toISOString(),
+      locked_at: null,
+      locked_by: null,
+      last_error: null,
+    }).eq('id', id).eq('status', 'processing').abortSignal(signal),
+    'db:completeFileDeletion',
+  );
+  if (error) throw new Error(`db_complete_file_deletion_failed: ${error.message}`);
+}
+
+export async function failFileDeletion(
+  deletion: FileDeletion,
+  errorMessage: string,
+  backoffSeconds: number,
+): Promise<'pending' | 'dead_letter'> {
+  const terminal = deletion.attempts >= deletion.max_attempts;
+  const status = terminal ? 'dead_letter' : 'pending';
+  const { error } = await withDbTimeout(
+    (signal) => getServiceClient().from('file_deletions_outbox').update({
+      status,
+      run_after: terminal
+        ? deletion.run_after
+        : new Date(Date.now() + backoffSeconds * 1_000).toISOString(),
+      locked_at: null,
+      locked_by: null,
+      last_error: errorMessage.slice(0, 500),
+    }).eq('id', deletion.id).eq('status', 'processing').abortSignal(signal),
+    'db:failFileDeletion',
+  );
+  if (error) throw new Error(`db_fail_file_deletion_failed: ${error.message}`);
+  return status;
+}
+
+export async function workerHeartbeatDeletionPoll(
+  workerId: string,
+  deletionsProcessedDelta: number,
+): Promise<void> {
+  const { error } = await withDbTimeout(
+    (signal) => getServiceClient().rpc('worker_heartbeat_deletion_poll', {
+      p_worker_id: workerId,
+      p_deletions_processed_delta: deletionsProcessedDelta,
+    }).abortSignal(signal),
+    'db:workerHeartbeatDeletionPoll',
+  );
+  if (error) throw new Error(`db_worker_deletion_poll_failed: ${error.message}`);
 }

@@ -17,11 +17,13 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { logger } from './config/logger.js';
-import { runJobWorker } from './workers/job-worker.js';
+import { resolveWorkerId, runJobWorker } from './workers/job-worker.js';
+import { runFileDeletionWorker } from './workers/file-deletion-worker.js';
 import { assertSmtpConfigured, closeTransporter } from './services/email.js';
 import { closeBrowser } from './services/pdf.js';
 import { ensureBucketAccessible } from './services/storage.js';
 import { closeAlertTransporter, logAlertingModeOnce } from './services/alert.js';
+import { toLogFields } from './utils/errors.js';
 
 // Version comes from package.json — same ESM-safe reading pattern as index.ts.
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -36,7 +38,7 @@ async function main(): Promise<void> {
     assertSmtpConfigured();
   } catch (err: unknown) {
     logger.error(
-      { err_name: err instanceof Error ? err.name : 'unknown', err_msg: err instanceof Error ? err.message : 'unknown' },
+      { ...toLogFields(err) },
       'worker_smtp_not_configured',
     );
     process.exit(1);
@@ -46,7 +48,7 @@ async function main(): Promise<void> {
     await ensureBucketAccessible();
   } catch (err: unknown) {
     logger.error(
-      { err_name: err instanceof Error ? err.name : 'unknown', err_msg: err instanceof Error ? err.message : 'unknown' },
+      { ...toLogFields(err) },
       'worker_bucket_check_failed',
     );
     process.exit(1);
@@ -56,12 +58,15 @@ async function main(): Promise<void> {
   // requirement from the founder — a silenced pipeline must be VISIBLE.
   logAlertingModeOnce();
 
-  const worker = runJobWorker({ version });
+  const workerId = resolveWorkerId();
+  const worker = runJobWorker({ version, workerId });
+  const deletionWorker = runFileDeletionWorker({ workerId });
 
   const shutdown = (signal: NodeJS.Signals): void => {
     logger.info({ signal }, 'worker_received_signal');
     // Ask the loop to stop claiming new work.
     worker.stop();
+    deletionWorker.stop();
 
     // Force-exit safeguard: if in-flight jobs hang past the grace period,
     // do NOT let Jelastic SIGKILL us silently — surface the timeout in the
@@ -72,7 +77,7 @@ async function main(): Promise<void> {
     }, 25_000);
     forceTimer.unref();
 
-    worker.stopped
+    Promise.all([worker.stopped, deletionWorker.stopped])
       .then(async () => {
         // Close in the reverse order of use: SMTP first (cheapest), then
         // Puppeteer browser (heaviest).
@@ -80,7 +85,7 @@ async function main(): Promise<void> {
           closeTransporter();
         } catch (err: unknown) {
           logger.warn(
-            { err_name: err instanceof Error ? err.name : 'unknown' },
+            { ...toLogFields(err) },
             'worker_smtp_close_failed',
           );
         }
@@ -88,7 +93,7 @@ async function main(): Promise<void> {
           closeAlertTransporter();
         } catch (err: unknown) {
           logger.warn(
-            { err_name: err instanceof Error ? err.name : 'unknown' },
+            { ...toLogFields(err) },
             'worker_alert_close_failed',
           );
         }
@@ -96,7 +101,7 @@ async function main(): Promise<void> {
           await closeBrowser();
         } catch (err: unknown) {
           logger.warn(
-            { err_name: err instanceof Error ? err.name : 'unknown' },
+            { ...toLogFields(err) },
             'worker_browser_close_failed',
           );
         }
@@ -105,7 +110,7 @@ async function main(): Promise<void> {
       })
       .catch((err: unknown) => {
         logger.error(
-          { err_name: err instanceof Error ? err.name : 'unknown' },
+          { ...toLogFields(err) },
           'worker_shutdown_error',
         );
         process.exit(1);
@@ -120,7 +125,7 @@ async function main(): Promise<void> {
 // leak an unhandled rejection to the top level.
 main().catch((err: unknown) => {
   logger.error(
-    { err_name: err instanceof Error ? err.name : 'unknown' },
+    { ...toLogFields(err) },
     'worker_boot_failed',
   );
   process.exit(1);

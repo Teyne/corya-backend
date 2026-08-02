@@ -136,3 +136,29 @@ export async function createSignedPdfUrl(
   }
   return data.signedUrl;
 }
+
+/** Physically remove a PDF object. An already-absent object is success. */
+export async function deleteStoredPdf(
+  bucket: string,
+  objectPath: string,
+): Promise<'deleted' | 'not_found'> {
+  if (bucket !== PDF_BUCKET) throw new Error('storage_delete_unsupported_bucket');
+  const objects = getServiceClient().storage.from(bucket);
+  const existsResult = await withTimeout(
+    objects.exists(objectPath),
+    env.TIMEOUT_STORAGE_MS,
+    'storage:exists',
+  );
+  if (existsResult.error) {
+    throw new Error(`storage_exists_failed: ${existsResult.error.message}`);
+  }
+  if (!existsResult.data) return 'not_found';
+
+  const { error } = await withTimeout(
+    objects.remove([objectPath]),
+    env.TIMEOUT_STORAGE_MS,
+    'storage:remove',
+  );
+  if (error) throw new Error(`storage_delete_failed: ${error.message}`);
+  return 'deleted';
+}

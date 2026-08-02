@@ -55,7 +55,7 @@ import {
   workerHeartbeatAlive,
   workerHeartbeatPoll,
 } from '../db/queries.js';
-import type { Job, JobType } from '../types/index.js';
+import type { Job } from '../types/index.js';
 import {
   EmailPipelineError,
   PdfPipelineError,
@@ -64,6 +64,8 @@ import {
 import { PermanentEmailError } from '../services/email.js';
 import { computeBackoffSeconds } from '../utils/backoff.js';
 import { sendAlert } from '../services/alert.js';
+import { deleteRetellCall } from '../services/retell.js';
+import { toLogFields } from '../utils/errors.js';
 
 /**
  * Error classes whose `.message` is constant-by-construction and therefore
@@ -80,6 +82,9 @@ const PII_SAFE_ERROR_NAMES: ReadonlySet<string> = new Set([
   EmailPipelineError.name,
   PermanentEmailError.name,
 ]);
+
+/** Kept as an empty compatibility export; every accepted current type is handled. */
+export const KNOWN_UNIMPLEMENTED_JOB_TYPES: ReadonlySet<string> = new Set();
 
 /**
  * ---------------------------------------------------------------------------
@@ -114,10 +119,6 @@ const PII_SAFE_ERROR_NAMES: ReadonlySet<string> = new Set([
  * handler arrivera. Trace `dead_letter` = « à requeuer », pas « à
  * investiguer ».
  */
-export const KNOWN_UNIMPLEMENTED_JOB_TYPES: ReadonlySet<JobType> = new Set<JobType>([
-  'purge_audio_retell',
-]);
-
 /**
  * Build the string persisted into `jobs.last_error`. The RPC truncates to
  * 500 chars as defence in depth, but the primary contract is that the
@@ -231,6 +232,24 @@ async function handleOne(job: Job): Promise<void> {
       return;
     }
 
+    if (job.type === 'purge_audio_retell') {
+      const callId = job.payload.retell_call_id;
+      if (typeof callId !== 'string' || callId.length === 0) {
+        logger.error(corr, 'retell_purge_missing_call_id');
+        await sendAlert('retell_purge_failed', { ...corr, reason: 'missing_call_id' });
+      } else {
+        try {
+          const status = await deleteRetellCall(callId);
+          logger.info({ ...corr, status }, 'retell_purge_completed');
+        } catch (err: unknown) {
+          logger.error({ ...corr, ...toLogFields(err) }, 'retell_purge_failed');
+          await sendAlert('retell_purge_failed', { ...corr, reason: 'remote_delete_failed' });
+        }
+      }
+      await completeJob(job.id);
+      return;
+    }
+
     // KNOWN but not yet implemented (see KNOWN_UNIMPLEMENTED_JOB_TYPES).
     // These are enfilés on purpose (compliance reservation) and MUST NOT
     // trigger any alert — a cabinet actif = one such job per call, 48 h
@@ -250,7 +269,7 @@ async function handleOne(job: Job): Promise<void> {
         logger.error(
           {
             ...corr,
-            err_name: forceErr instanceof Error ? forceErr.name : 'unknown',
+            ...toLogFields(forceErr),
           },
           'force_dead_letter_failed',
         );
@@ -278,7 +297,7 @@ async function handleOne(job: Job): Promise<void> {
     //     (PdfPipelineError / EmailPipelineError / PermanentEmailError)
     //     have constant messages by construction and are safe to keep
     //     verbatim.
-    const errName = err instanceof Error ? err.name : 'unknown';
+    const errName = toLogFields(err).err_name;
     const redacted = redactedFailureMessage(err);
 
     // Session 4 vague 3: PERMANENT SMTP failure short-circuits the retry
@@ -296,7 +315,7 @@ async function handleOne(job: Job): Promise<void> {
         logger.error(
           {
             ...corr,
-            err_name: forceErr instanceof Error ? forceErr.name : 'unknown',
+            ...toLogFields(forceErr),
           },
           'force_dead_letter_failed',
         );
@@ -473,7 +492,7 @@ export function runJobWorker(options?: JobWorkerOptions): RunningWorker {
       // Never let a heartbeat failure kill the worker. Downgrade to warn:
       // the poller in the API will detect the resulting gap.
       logger.warn(
-        { err_name: err instanceof Error ? err.name : 'unknown' },
+        { ...toLogFields(err) },
         'worker_heartbeat_alive_failed',
       );
     });
@@ -501,7 +520,7 @@ export function runJobWorker(options?: JobWorkerOptions): RunningWorker {
       } catch (err: unknown) {
         // A DB blip should not kill the worker. Log and back off a bit.
         logger.error(
-          { err_name: err instanceof Error ? err.name : 'unknown' },
+          { ...toLogFields(err) },
           'job_claim_failed',
         );
         // Still record the poll tick so we can distinguish "DB down" (poll
@@ -579,7 +598,7 @@ export function runJobWorker(options?: JobWorkerOptions): RunningWorker {
 function pollTick(workerId: string, jobsProcessedDelta: number): void {
   workerHeartbeatPoll(workerId, jobsProcessedDelta).catch((err: unknown) => {
     logger.warn(
-      { err_name: err instanceof Error ? err.name : 'unknown' },
+      { ...toLogFields(err) },
       'worker_heartbeat_poll_failed',
     );
   });

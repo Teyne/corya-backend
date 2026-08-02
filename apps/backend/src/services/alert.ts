@@ -43,6 +43,7 @@
 import nodemailer, { type SendMailOptions, type Transporter } from 'nodemailer';
 import { env } from '../config/env.js';
 import { logger } from '../config/logger.js';
+import { toLogFields } from '../utils/errors.js';
 
 /**
  * The exhaustive list of alert types. Adding a value here is a deliberate
@@ -56,7 +57,9 @@ export type AlertType =
   | 'pdf_orphelin'
   | 'worker_stale'
   | 'jobs_backlog'
-  | 'cron_stale';
+  | 'cron_stale'
+  | 'file_deletion_dead_letter'
+  | 'retell_purge_failed';
 
 /** Sanitisation deny-list. Matched case-insensitively at ANY nesting depth. */
 const SENSITIVE_KEYS: ReadonlySet<string> = new Set(
@@ -367,7 +370,7 @@ export async function sendAlert(
     logger.error(
       {
         alert_type: type,
-        err_name: err instanceof Error ? err.name : 'unknown',
+        ...toLogFields(err),
       },
       'alert_send_failed',
     );

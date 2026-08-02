@@ -32,6 +32,7 @@ import {
   genReqId,
 } from './middleware/correlation.js';
 import { buildWebhookRateLimiter } from './middleware/rate-limit.js';
+import { toLogFields } from './utils/errors.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -152,14 +153,14 @@ app.use('/health', healthRouter);
 // ---------------------------------------------------------------------------
 const errorHandler: ErrorRequestHandler = (err, req, res, _next) => {
   // pino-http attached a request-scoped logger to req.log.
-  req.log.error({ err }, 'unhandled error in request pipeline');
+  req.log.error({ ...toLogFields(err) }, 'unhandled error in request pipeline');
   if (res.headersSent) return;
   const body =
     env.NODE_ENV === 'production'
       ? { error: 'internal_server_error' }
       : {
           error: 'internal_server_error',
-          message: err instanceof Error ? err.message : String(err),
+          error_name: toLogFields(err).err_name,
         };
   res.status(500).json(body);
 };
@@ -218,7 +219,7 @@ if (isEntryPoint) {
         closeReceiptTransporter();
       } catch (closeErr: unknown) {
         logger.warn(
-          { err_name: closeErr instanceof Error ? closeErr.name : 'unknown' },
+          { ...toLogFields(closeErr) },
           'api_alert_close_failed',
         );
       }

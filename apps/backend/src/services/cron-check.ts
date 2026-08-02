@@ -62,7 +62,21 @@ export const CRON_TOLERANCES_SECONDS = {
   'requeue-stuck-file-deletions': 30 * 60,
   'purge-stale-worker-heartbeats': 8 * 24 * 3600,
   'purge-cron-run-details': 8 * 24 * 3600,
+  'purge-ancient-logs-actions': 32 * 24 * 3600,
 } as const;
+
+/** Expected maximum wait before the first scheduled run (not stale tolerance). */
+const CRON_PERIODS_SECONDS: Record<keyof typeof CRON_TOLERANCES_SECONDS, number> = {
+  'purge-expired-audio': 3600,
+  'anonymize-old-transcripts': 24 * 3600,
+  'purge-old-pdfs': 24 * 3600,
+  'purge-ancient-appels': 31 * 24 * 3600,
+  'requeue-stuck-jobs': 5 * 60,
+  'requeue-stuck-file-deletions': 10 * 60,
+  'purge-stale-worker-heartbeats': 7 * 24 * 3600,
+  'purge-cron-run-details': 7 * 24 * 3600,
+  'purge-ancient-logs-actions': 31 * 24 * 3600,
+};
 
 /** Reason a cron is flagged stale. Kept as a stable string union. */
 export type CronStaleReason =
@@ -84,6 +98,7 @@ export interface StaleCron {
 export interface CronCheckReport {
   jobs_checked: number;
   stale: StaleCron[];
+  pending_first_run: string[];
 }
 
 /**
@@ -133,6 +148,7 @@ function evaluateRow(row: CronHealthRow, toleranceSec: number): StaleCron | null
  */
 export function reportCronHealth(rows: CronHealthRow[]): CronCheckReport {
   const stale: StaleCron[] = [];
+  const pendingFirstRun: string[] = [];
   const seenNames = new Set<string>();
 
   // Compare each DB row against its tolerance entry.
@@ -145,6 +161,14 @@ export function reportCronHealth(rows: CronHealthRow[]): CronCheckReport {
       // an out-of-band manual `cron.schedule(...)`. Loudly report it.
       stale.push({ jobname: row.jobname, reason: 'unknown_cron_in_db' });
       continue;
+    }
+    if (row.last_run_at === null && row.first_seen_at !== null) {
+      const ageSeconds = (Date.now() - new Date(row.first_seen_at).getTime()) / 1_000;
+      const period = CRON_PERIODS_SECONDS[row.jobname as keyof typeof CRON_TOLERANCES_SECONDS];
+      if (ageSeconds <= period) {
+        pendingFirstRun.push(row.jobname);
+        continue;
+      }
     }
     const evaluation = evaluateRow(row, tolerance);
     if (evaluation !== null) stale.push(evaluation);
@@ -166,6 +190,7 @@ export function reportCronHealth(rows: CronHealthRow[]): CronCheckReport {
   return {
     jobs_checked: seenNames.size,
     stale,
+    pending_first_run: pendingFirstRun,
   };
 }
 

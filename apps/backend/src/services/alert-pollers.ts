@@ -51,6 +51,7 @@ import {
 import { sendAlert } from './alert.js';
 import { computeCronHealthReport } from './cron-check.js';
 import type { Job } from '../types/index.js';
+import { toLogFields } from '../utils/errors.js';
 
 // Session 4 vague 3 — same override as services/alert.ts so tests can
 // flip ALERT_ENABLED locally. Keep it here (instead of importing from
@@ -96,7 +97,7 @@ export async function checkWorkerStale(): Promise<void> {
     );
   } catch (err: unknown) {
     logger.error(
-      { err_name: err instanceof Error ? err.name : 'unknown' },
+      { ...toLogFields(err) },
       'alert_poller_worker_stale_query_failed',
     );
     return;
@@ -147,7 +148,7 @@ export async function checkCronStale(): Promise<void> {
     });
   } catch (err: unknown) {
     logger.error(
-      { err_name: err instanceof Error ? err.name : 'unknown' },
+      { ...toLogFields(err) },
       'alert_poller_cron_stale_query_failed',
     );
   }
@@ -162,7 +163,7 @@ export async function checkJobsBacklog(): Promise<void> {
     backlog = await countPendingJobsOlderThan(BACKLOG_MIN_AGE_SECONDS);
   } catch (err: unknown) {
     logger.error(
-      { err_name: err instanceof Error ? err.name : 'unknown' },
+      { ...toLogFields(err) },
       'alert_poller_backlog_query_failed',
     );
     return;
@@ -215,7 +216,7 @@ export async function pollDeadLetterAlerts(): Promise<void> {
     jobs = await getDeadLetterJobsToAlert(DEAD_LETTER_BATCH);
   } catch (err: unknown) {
     logger.error(
-      { err_name: err instanceof Error ? err.name : 'unknown' },
+      { ...toLogFields(err) },
       'alert_poller_dead_letter_query_failed',
     );
     return;
@@ -270,7 +271,7 @@ export async function pollDeadLetterAlerts(): Promise<void> {
       logger.error(
         {
           job_id: job.id,
-          err_name: err instanceof Error ? err.name : 'unknown',
+          ...toLogFields(err),
         },
         'alert_poller_mark_alerted_failed',
       );
@@ -378,7 +379,7 @@ async function sendAlertWithReceipt(
     return true;
   } catch (err: unknown) {
     logger.error(
-      { alert_type: type, err_name: err instanceof Error ? err.name : 'unknown' },
+      { alert_type: type, ...toLogFields(err) },
       'alert_send_failed',
     );
     return false;
@@ -503,7 +504,7 @@ export function startAlertPollers(options?: AlertPollerOptions): RunningPollers 
     // (Node ignores it) and must not throw (crash-safe).
     void tick().catch((err: unknown) => {
       logger.error(
-        { err_name: err instanceof Error ? err.name : 'unknown' },
+        { ...toLogFields(err) },
         'alert_poller_tick_unexpected_error',
       );
     });

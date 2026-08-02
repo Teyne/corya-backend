@@ -57,6 +57,7 @@ import {
   DEFAULT_SIGNED_URL_TTL_SECONDS,
   uploadPdf,
 } from './storage.js';
+import { toLogFields } from '../utils/errors.js';
 
 export class PdfPipelineError extends Error {
   constructor(message: string) {
@@ -201,7 +202,7 @@ export async function processAppelJob(job: Job): Promise<void> {
   } catch (err: unknown) {
     // Loud alerting event — without a PDF we can't send the email.
     logger.error(
-      { ...corrWithCall, err_name: err instanceof Error ? err.name : 'unknown' },
+      { ...corrWithCall, ...toLogFields(err) },
       'pdf_generation_failed',
     );
     throw new PdfPipelineError('pdf_render_failed');
@@ -213,7 +214,7 @@ export async function processAppelJob(job: Job): Promise<void> {
       await uploadPdf(objectPath, pdfBytes);
     } catch (err: unknown) {
       logger.error(
-        { ...corrWithCall, err_name: err instanceof Error ? err.name : 'unknown' },
+        { ...corrWithCall, ...toLogFields(err) },
         'pdf_upload_failed',
       );
       throw new PdfPipelineError('pdf_upload_failed');
@@ -253,7 +254,7 @@ export async function processAppelJob(job: Job): Promise<void> {
     );
   } catch (err: unknown) {
     logger.error(
-      { ...corrWithCall, err_name: err instanceof Error ? err.name : 'unknown' },
+      { ...corrWithCall, ...toLogFields(err) },
       'pdf_sign_url_failed',
     );
     throw new PdfPipelineError('pdf_sign_url_failed');
@@ -287,7 +288,7 @@ export async function processAppelJob(job: Job): Promise<void> {
       throw err;
     }
     logger.warn(
-      { ...corrWithCall, err_name: err instanceof Error ? err.name : 'unknown' },
+      { ...corrWithCall, ...toLogFields(err) },
       'email_send_failed_will_retry',
     );
     throw new EmailPipelineError('email_send_failed');

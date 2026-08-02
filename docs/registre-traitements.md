@@ -1,5 +1,15 @@
 # Registre des activités de traitement — Corya
 
+> **Note d'état — 2 août 2026.** BetterStack est envisagé, pas actif confirmé.
+> Les suppressions physiques et la purge `logs_actions` sont livrées dans le
+> code et les migrations locales, mais ne deviennent effectives qu'après
+> migration et déploiement. Les droits sont actuellement traités manuellement.
+>
+> Le site public séparé utilise Lovable, Cloudflare et, lorsque ses secrets
+> runtime sont configurés, Resend pour le formulaire de contact. Une mesure
+> d'audience Lovable/Cloudflare est active. Les données de contact ont une
+> durée de conservation prévue de 24 mois.
+
 **Version 1.0 — 2026-08-01**
 
 > *Sous réserve de validation juridique. L'art. 12 al. 5 nLPD et l'OPDo prévoient une exemption de registre pour les entreprises de moins de 250 collaborateurs, sauf traitement de données sensibles à grande échelle ou profilage à risque élevé. Corya tient ce registre volontairement, à la fois par prudence et comme élément de réassurance commerciale auprès des cabinets clients.*
@@ -8,15 +18,15 @@
 
 ## Responsable du traitement
 
-- **Raison sociale** : Corya *(forme juridique à préciser — SA / Sàrl / raison individuelle)*
-- **Adresse** : Renens (VD), Suisse *(numéro de rue et code postal à préciser)*
-- **Contact protection des données** : `privacy@corya.ch` *(adresse à activer)*
-- **Contact opérationnel** : `contact@corya.ch`
-- **Représentant légal** : *(à préciser — dirigeant / fondateur)*
+- **Raison sociale** : Théo Coudert – Corya (raison individuelle)
+- **Adresse publiée** : 2025 Chez-le-Bart (NE), Suisse
+- **Contact protection des données** : `info@corya.ch`
+- **Contact opérationnel** : `info@corya.ch`
+- **Responsable / éditeur** : Théo Coudert
 
 ## Champ d'application
 
-Le présent registre couvre l'ensemble des traitements mis en œuvre par Corya dans le cadre de son service **Corya Tea**, un agent vocal d'accueil téléphonique destiné aux cabinets médicaux romands. Il ne couvre pas les traitements internes à Corya en tant qu'employeur ni les traitements du site vitrine `corya.ch`, qui feront l'objet d'entrées séparées lorsqu'ils seront activés.
+Le présent registre couvre les traitements du service **Corya Tea**, agent vocal d'accueil téléphonique destiné aux cabinets médicaux romands, ainsi que le traitement n° 8 du site public `corya.ch`. Il ne couvre pas les traitements internes à Corya en tant qu'employeur.
 
 Les cabinets médicaux clients sont **responsables du traitement** au sens de l'art. 5 let. j nLPD pour les données de leurs patients ; **Corya intervient en qualité de sous-traitant** au sens de l'art. 5 let. k nLPD dans le cadre du contrat de prestation signé avec chaque cabinet. Un contrat de sous-traitance (DPA) est établi avec chaque cabinet et régit les conditions du traitement.
 
@@ -32,6 +42,9 @@ Corya recourt aux sous-traitants ultérieurs suivants, avec lesquels un contrat 
 | Supabase Inc. | Base de données PostgreSQL, stockage de fichiers, authentification | **Zurich (Suisse)** — région `eu-central-2` explicitement sélectionnée | Non applicable (traitement en Suisse) |
 | Infomaniak Network SA | Hébergement applicatif (Jelastic), serveur de messagerie SMTP sortant | Suisse | Non applicable (traitement en Suisse) |
 | BetterStack (Better Stack, s.r.o.) | Supervision applicative, journalisation externe, page de statut publique | Union européenne (République tchèque / Allemagne) | Non applicable (protection adéquate au sens de l'art. 16 nLPD, UE reconnue par le Conseil fédéral) |
+| Lovable Labs AB | Construction, hébergement applicatif et mesure technique du site public | Union européenne et infrastructure mondiale | Selon les garanties contractuelles du fournisseur ; à archiver |
+| Cloudflare, Inc. | CDN, sécurité et mesure technique du site public | Réseau mondial, traitements possibles aux États-Unis | CCT suisses / garanties contractuelles à archiver |
+| Plus Five Five, Inc. (Resend) | Envoi des e-mails du formulaire de contact, si configuré | États-Unis | CCT suisses / garanties contractuelles à archiver |
 
 Les deux transferts vers les États-Unis (Retell AI, ElevenLabs) sont documentés au registre comme point d'attention prioritaire. Aucun autre transfert hors Suisse ou UE n'est effectué à ce jour. Toute donnée de patient traitée en base par Corya est stockée en Suisse (Supabase Zurich). Les données transitant par Retell AI et ElevenLabs sont uniquement celles nécessaires à la conduite de la conversation vocale en temps réel.
 
@@ -307,3 +320,26 @@ Les mesures suivantes s'appliquent transversalement, en complément des mesures 
 | 1.0 | 2026-08-01 | Création initiale : couverture des 7 traitements post-Session 4. |
 
 Ce registre est révisé à chaque introduction d'un nouveau traitement, à chaque changement de sous-traitant ultérieur, et au minimum une fois par an.
+# Traitement n° 8 — Formulaire de contact et mesure d'audience du site public
+
+**État** : actif sur le site public séparé. L'envoi automatisé par Resend est
+conditionné à la présence des secrets runtime ; sinon l'interface propose un
+repli `mailto:`.
+
+**Finalités** : répondre aux prospects, transmettre une confirmation de prise
+en charge, mesurer techniquement l'audience et protéger le site contre les abus.
+
+**Données** : nom, coordonnées et contenu saisis volontairement, métadonnées
+techniques anti-abus et identifiant de session de mesure d'audience. Les champs
+libres ne doivent pas être utilisés pour transmettre des données médicales.
+
+**Destinataires / sous-traitants** : Corya ; Resend pour l'e-mail lorsque le
+connecteur est configuré ; Lovable et Cloudflare pour l'hébergement, la mesure
+et la protection technique.
+
+**Conservation** : demandes de contact, 24 mois maximum ; métriques et cookies
+techniques selon les durées publiées sur les pages légales du site.
+
+**Mesures** : validation Zod, honeypot, limitation par IP en mémoire, clés
+d'idempotence Resend et repli sans transmission automatisée en cas de mauvaise
+configuration.

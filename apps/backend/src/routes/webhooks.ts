@@ -57,7 +57,7 @@ import {
   parseRetellEvent,
   verifyRetellSignature,
 } from '../services/retell.js';
-import { RetellSignatureError, WebhookValidationError } from '../utils/errors.js';
+import { RetellSignatureError, toLogFields, WebhookValidationError } from '../utils/errors.js';
 
 /**
  * Extend Express' Request type locally: the raw body Buffer captured by the
@@ -210,11 +210,13 @@ webhooksRouter.post(
     const payload = event;
     const correlationId = req.correlationId ?? null;
     void processCallAnalyzed(payload, correlationId).catch((err: unknown) => {
+      // `toLogFields` scrubs any patient phone number that could appear in
+      // a raw PG or SDK error message before it reaches the log stream.
       logger.error(
         {
           retell_call_id: payload.call.call_id,
           correlation_id: correlationId,
-          err_name: err instanceof Error ? err.name : 'unknown',
+          ...toLogFields(err),
         },
         'webhook_async_processing_failed',
       );

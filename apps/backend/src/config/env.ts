@@ -128,6 +128,11 @@ const envSchema = z.object({
   // How many jobs the worker claims in a single RPC call. Bounded by DB row
   // lock contention: 5 gives us parallelism without holding too many locks.
   JOB_BATCH_SIZE: z.coerce.number().int().min(1).max(50).default(5),
+  // Separate physical-deletion outbox loop. Its own cadence and stale
+  // threshold prevent a healthy jobs loop from masking a stuck purge loop.
+  FILE_DELETION_BATCH_SIZE: z.coerce.number().int().min(1).max(50).default(5),
+  FILE_DELETION_POLL_INTERVAL_MS: z.coerce.number().int().min(500).max(60_000).default(10_000),
+  FILE_DELETION_STALE_AFTER_SECONDS: z.coerce.number().int().min(30).max(3600).default(300),
   // URL prefix the email links point to for a "view details" call-to-action
   // in the admin back-office. Falls back to APP_BASE_URL when the back-office
   // still runs on the same origin as the API (dev).

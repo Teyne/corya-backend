@@ -1,5 +1,11 @@
 # Corya — Stack technique verrouillé
 
+> **Mise à jour du 2 août 2026.** Les sections Next.js sont un choix historique
+> pour un futur back-office, pas un composant existant. Le site public actuel
+> est dans `corya-frontend/corya` et utilise TanStack Start, React 19, Lovable
+> et Cloudflare. BetterStack est prévu mais non activé/confirmé. Le backend est
+> un projet npm unique sous `apps/backend/`, sans workspaces.
+
 Toutes les décisions listées ci-dessous sont **verrouillées**. Toute remise en question doit passer par le fondateur, pas par un agent.
 
 ## Backend api.corya.ch

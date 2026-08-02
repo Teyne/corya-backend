@@ -50,6 +50,7 @@ import { ensureBucketAccessible } from '../services/storage.js';
 import { getSharedTransporterForHealth } from '../services/email.js';
 import { computeCronHealthReport } from '../services/cron-check.js';
 import type { StaleCron } from '../services/cron-check.js';
+import { extractErrorInfo } from '../utils/errors.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -209,13 +210,19 @@ async function checkCrons(): Promise<Check> {
   try {
     const report = await computeCronHealthReport();
     return report.stale.length === 0
-      ? { ok: true, jobs_checked: report.jobs_checked, stale: [] }
+      ? {
+          ok: true,
+          jobs_checked: report.jobs_checked,
+          stale: [],
+          pending_first_run: report.pending_first_run,
+        }
       : {
           ok: false,
           jobs_checked: report.jobs_checked,
           // Stale entries carry jobname + reason + tolerances — no PII
           // possible (pg_cron rows don't reference appels/patients).
           stale: report.stale,
+          pending_first_run: report.pending_first_run,
         };
   } catch (err: unknown) {
     return { ok: false, err_name: errName(err) };
@@ -238,8 +245,14 @@ async function checkSmtp(): Promise<Check> {
   return { ok: true, duration_ms: ms };
 }
 
+// errName() is kept for backwards compat with the /health/deep RESPONSE
+// shape (JSON to callers, not just an internal log). Internally it now
+// delegates to `extractErrorInfo` so the result is consistent with
+// log-site behaviour. New callers should prefer `toLogFields(err)` from
+// utils/errors.ts for logs — it additionally surfaces message + PG
+// code/details/hint.
 function errName(err: unknown): string {
-  return err instanceof Error ? err.name : 'unknown';
+  return extractErrorInfo(err).name;
 }
 
 // ---------------------------------------------------------------------------

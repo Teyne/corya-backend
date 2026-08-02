@@ -1,6 +1,7 @@
 # Session 4 — état complet
 
-Dernière mise à jour : 2026-08-01, en cours de session.
+Dernière mise à jour : 2026-08-01, soir — post-merge PR #8, migrations appliquées,
+validation locale effectuée.
 
 Ce document sert de source de vérité pour reprendre la Session 4 après une
 coupure. Il est écrit parce que le brief de la Session 4 avait été rédigé
@@ -235,3 +236,198 @@ Après merge, côté fondateur : `supabase db push` (5 migrations
 nouvelles variables, génération de `HEALTH_DEEP_TOKEN`. Si §5.4 (purge
 `logs_actions`) est traité plus tard, le compte de migrations à pousser
 changera.
+
+---
+
+## 6. Écarts découverts pendant la validation locale (1er août, soir)
+
+Trois écarts supplémentaires entre la documentation et la réalité, découverts
+en appliquant les migrations et en validant le pipeline en local. Même famille
+que les 7 du §1. **À corriger en vague 7.**
+
+### 6.1 Schéma réel de la table `jobs`
+
+Relevé via `information_schema.columns`. Les noms annoncés dans les docs
+depuis la Session 3 sont faux :
+
+| Doc annonçait | Colonne réelle |
+|---|---|
+| `worker_id` | **`locked_by`** |
+| `started_at` | **`locked_at`** |
+| `scheduled_for` | **`run_after`** |
+| `error` | **`last_error`** |
+| `retell_call_id` | **n'existe pas** — c'est `appel_id` (UUID, colonne dédiée) |
+| `completed_at` | n'existe pas |
+
+Schéma complet réel : `id`, `type`, `appel_id`, `payload`, `status`,
+`attempts`, `max_attempts`, `run_after`, `locked_at`, `locked_by`,
+`last_error`, `created_at`, `updated_at`, `dead_letter_alerted_at`,
+`correlation_id`.
+
+Le schéma réel est meilleur que celui de la doc : `appel_id` en colonne
+dédiée plutôt qu'enfoui dans le payload, et `dead_letter_alerted_at` pour
+l'exactement-une-fois.
+
+### 6.2 Pas de `package.json` à la racine — pas de workspaces npm
+
+`git ls-files | grep '^package'` ne retourne rien. Le fichier n'a **jamais
+été versionné** et n'existe pas sur disque. Le dépôt n'est pas un monorepo
+npm workspaces : c'est une arborescence de dossiers avec un seul projet npm,
+`apps/backend/`.
+
+**Toutes les commandes `npm` se lancent depuis `apps/backend/`.** Toutes les
+commandes `git`, `gh`, `supabase` et celles touchant `.env.local` se lancent
+depuis la racine.
+
+Les docs annoncent « monorepo workspaces » depuis la Session 1. À corriger
+dans `docs/architecture.md`, `docs/stack.md`, `CLAUDE.md` et
+`corya_architecture_technique.md`.
+
+Ne pas créer de `package.json` racine à ce stade : le hoisting des
+`node_modules` déplacerait Chromium et les chemins Puppeteer, pour zéro
+bénéfice.
+
+### 6.3 Deux migrations de la Session 3 n'avaient jamais été appliquées
+
+Le premier `supabase db push` a révélé deux migrations en attente :
+`20260731100000_job_claim_and_pdf_purge.sql` et
+`20260731110000_purge_old_pdfs_cover_unsent.sql`. Les docs de Session 3
+affirmaient pourtant « migrations appliquées ✅ ».
+
+Appliquées le 1er août sans incident. Leçon : vérifier l'état réel via
+`supabase db push` (qui liste avant d'agir) plutôt que de se fier à la doc.
+
+### 6.4 `never_run` traité comme un échec — faux positif sur tout cron neuf
+
+`cron-check.ts` classe `last_run_at IS NULL` en `reason: 'never_run'`, donc en
+échec. Conséquence immédiate : les deux crons hebdomadaires créés par les
+migrations de cette session (`purge-cron-run-details` et
+`purge-stale-worker-heartbeats`, tous deux le dimanche) déclenchent
+`cron_stale` dès le premier poller et jusqu'à leur première exécution.
+
+Tentative de contournement écartée : appeler les fonctions manuellement en SQL
+n'écrit rien dans `cron.job_run_details` — seul pg_cron y écrit lors de ses
+exécutions planifiées.
+
+**Correctif à faire en vague 7** : un cron actif dont la création est plus
+récente que sa période d'exécution ne doit pas être considéré en panne.
+Piste : comparer avec une date de création de job, ou introduire un statut
+neutre `pending_first_run` distinct de l'échec.
+
+### 6.5 `ALERT_ENABLED=false` — temporaire, à réactiver
+
+Conséquence de §6.4. Mis à `false` dans `.env.local` le 1er août pour éviter
+un flux d'alertes en fausse alarme pendant la validation locale.
+
+**À remettre à `true` le dimanche 2 août au soir**, après le premier passage
+des deux crons hebdomadaires. Alarme posée côté fondateur (02.08, 20h).
+
+Le WARN `alerting_disabled` au démarrage de l'API et du worker (correction
+§2.4) est la garantie que cet état ne passe pas inaperçu. Vérifié en local :
+le poller détecte bien `cron_stale` et loggue `alert_suppressed_disabled` —
+toute la chaîne fonctionne, seule la sortie email est coupée.
+
+---
+
+## 7. État de la validation locale (1er août, soir)
+
+Tout ce qui suit a été vérifié manuellement sur la machine du fondateur.
+
+| Élément | Résultat |
+|---|---|
+| PR #8 | Mergée sur `main` (`5daf2fb`) |
+| Migrations | 5 appliquées (`20260801000000` → `20260801000004`) + 2 rattrapées de la Session 3 |
+| Tests | **178 unitaires verts**, `type-check` propre |
+| `.env.local` | 51 variables, `diff` avec `.env.example` vide |
+| Worker | Démarre. `worker_id: dev-worker-local`, `poll_ms: 2000`, `batch: 5`, `stale_after_seconds: 300`, `heartbeat_interval_ms: 10000` |
+| API | Démarre sur le port 3000, correlation ID présent dans toutes les réponses |
+| WARN alerting | Émis sur l'API **et** le worker ✅ |
+| `alert_suppressed_disabled` | Émis sur `cron_stale` ✅ — détection OK, sortie coupée |
+| `/health/deep` sans token | **404** `{"error":"not_found"}` ✅ |
+| `/health/deep` avec token | **503 `degraded`** — `db` ok (246 ms), `storage` ok (282 ms), `worker` ok (`last_seen_seconds_ago: 1`), `jobs_backlog` ok, `crons` ko (2 × `never_run`, attendu) |
+| Fuite d'info | Aucune URL, aucun ID interne, aucun nom de bucket dans la réponse ✅ |
+| `get_cron_health()` | Fonctionne — 8 crons, 0 échec, `purge-old-pdfs` bien à `30 3 * * *` |
+| Reclaim manuel | **Non testé** — `test:email-pipeline` court-circuite (`email_already_sent_skip`) et n'enfile aucun job réel. Couvert par `worker-resilience.e2e.test.ts`. |
+
+Le script `test:email-pipeline` appelle le processeur directement avec un
+`job_id` factice (`00000000-0000-0000-0000-000000000001`) : il ne passe pas
+par la file `jobs`. Pour un test de reclaim manuel, il faut insérer un job
+réel et utiliser le flag `force_resend` du script.
+
+---
+
+## 8. Contexte externe acté le 1er août
+
+### Retell — rétention audio
+
+Ramenée à **1 jour** dans le dashboard. C'est la seule garantie réelle sur
+l'audio tant que §5.3 n'est pas traité (le job `purge_audio_retell` part en
+`dead_letter` silencieux).
+
+Retell propose trois niveaux de stockage : intégralité des données, tout sauf
+les PII (scrubbing), ou attributs de base seulement (métadonnées, sans
+enregistrements ni transcriptions). **À évaluer** : un niveau plus restrictif
+réduirait l'exposition art. 321 CP, mais il faut vérifier par un appel de test
+que le payload webhook contient toujours nom, téléphone et motif — sans quoi
+le PDF récap serait incomplet.
+
+### Peoplefone — numéro obtenu
+
+- Numéro : **+41 32 552 00 11** (préfixe 032 Neuchâtel, conforme à la cible)
+- SIP trunking vers un tiers : **autorisé**
+- ⚠️ **Numéro d'essai** : test jusqu'au **31.08.2026**, incapacité à partir du
+  10.09.2026, retiré le 30.10.2026. À convertir en abonnement payant avant fin
+  août, sous peine de perdre le numéro après avoir configuré le trunking et
+  possiblement communiqué le numéro à un prospect.
+
+### Supabase — DPA
+
+Data Processing Addendum intégré aux Terms of Service v3, effectif le
+01.08.2026. Aucun DPA signé séparément n'est nécessaire. Documents archivés
+côté fondateur. Restent à obtenir : **Retell** et **Infomaniak**.
+
+---
+
+## 9. Périmètre proposé pour la vague 7
+
+Par ordre de priorité :
+
+1. **§5.3** — consommateur `file_deletions_outbox` + suppression audio côté
+   Retell. Écart de conformité majeur.
+2. **§5.4** — purge `logs_actions` à 24 mois ; BetterStack marqué « prévu,
+   non actif » dans `docs/compliance.md` et le registre.
+3. **§6.4** — `never_run` sur cron récent ne doit pas être un échec.
+4. **§6.1 / §6.2** — corriger `docs/architecture.md`, `docs/stack.md` et
+   `CLAUDE.md` : noms de colonnes réels de `jobs`, absence de workspaces npm,
+   commandes npm depuis `apps/backend/`.
+
+Piste structurelle à évoquer : générer la documentation du schéma depuis la
+base plutôt que de l'écrire à la main. Trois écarts doc/code découverts en une
+seule journée — le problème est le procédé, pas les occurrences.
+
+---
+
+## 10. Vague 7 — état local final (2 août 2026)
+
+Les quatre blocs techniques sont maintenant raccordés localement : erreurs
+structurées et nettoyées, consommateur de `file_deletions_outbox`, suppression
+Retell à +48 h, purge `logs_actions` à 24 mois, registre `cron_first_seen` et
+heartbeat propre à la boucle de suppression. Les crons attendus sont désormais
+au nombre de neuf.
+
+La suppression Retell utilise le SDK officiel (`client.call.delete(callId)`).
+Un 404 est un succès idempotent. Le job programmé à +48 h journalise et alerte
+un échec distant puis se termine afin de ne pas bloquer la file ; la rétention
+Retell configurée à un jour reste le filet indépendant. L'outbox, elle, conserve
+ses retries bornés et alerte en `dead_letter`.
+
+Correction de la source historique : le site public séparé rend aujourd'hui le
+formulaire de contact, utilise Resend quand le connecteur runtime est configuré
+et retombe sur `mailto:` sinon. Lovable/Cloudflare réalisent une mesure
+d'audience ; elle n'est pas désactivée. Le traitement n° 8 du registre reflète
+donc cet état actif et non l'hypothèse du prompt initial.
+
+Ces changements ne sont pas déployés. Les migrations
+`20260802000000`–`20260802000003` restent à appliquer avant le worker, puis les
+variables `FILE_DELETION_*`, les health checks et les heartbeats doivent être
+vérifiés sur l'environnement cible. BetterStack reste prévu/non confirmé.

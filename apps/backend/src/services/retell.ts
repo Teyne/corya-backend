@@ -73,11 +73,37 @@
  *     timing-safe : c'est le SDK qui s'en charge en interne.
  * ---------------------------------------------------------------------------
  */
-import { verify as retellSdkVerify } from 'retell-sdk';
+import Retell, { verify as retellSdkVerify } from 'retell-sdk';
 import { z } from 'zod';
 import { env } from '../config/env.js';
 import { logger } from '../config/logger.js';
-import { RetellSignatureError, WebhookValidationError } from '../utils/errors.js';
+import { RetellSignatureError, toLogFields, WebhookValidationError } from '../utils/errors.js';
+
+let retellClient: Retell | null = null;
+
+function getRetellClient(): Retell {
+  retellClient ??= new Retell({
+    apiKey: env.RETELL_API_KEY,
+    timeout: env.TIMEOUT_RETELL_MS,
+    maxRetries: 0,
+  });
+  return retellClient;
+}
+
+/** Delete a Retell call and its associated hosted data. 404 is idempotent success. */
+export async function deleteRetellCall(callId: string): Promise<'deleted' | 'not_found'> {
+  try {
+    await getRetellClient().call.delete(callId);
+    return 'deleted';
+  } catch (err: unknown) {
+    const status =
+      typeof err === 'object' && err !== null && 'status' in err
+        ? (err as { status?: unknown }).status
+        : undefined;
+    if (status === 404) return 'not_found';
+    throw err;
+  }
+}
 import type {
   RetellCallAnalyzed,
   RetellCallEnded,
@@ -240,12 +266,12 @@ export async function verifyRetellSignature(
     return await retellSdkVerify(bodyStr, secret, signatureStr);
   } catch (err) {
     // Le SDK peut throw si le runtime n'a pas Web Crypto (impossible sur
-    // Node 20+, mais défense en profondeur). On ne relaye JAMAIS le message
-    // du SDK dans un log — il pourrait, dans une version future, mentionner
-    // le secret ou des fragments du corps. On logue uniquement le NOM de
-    // l'erreur.
+    // Node 20+, mais défense en profondeur). Le message est passé par
+    // `toLogFields` → `scrubText`, ce qui neutralise tout numéro de
+    // téléphone patient qui aurait pu être concaténé par une future
+    // version du SDK dans un message d'erreur.
     logger.error(
-      { err_name: err instanceof Error ? err.name : 'unknown' },
+      { ...toLogFields(err) },
       'retell_sdk_verify_threw',
     );
     return false;

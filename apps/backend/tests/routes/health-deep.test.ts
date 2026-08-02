@@ -82,6 +82,7 @@ function makeAllHealthyCronRows(): Array<{
     'requeue-stuck-file-deletions',
     'purge-stale-worker-heartbeats',
     'purge-cron-run-details',
+    'purge-ancient-logs-actions',
   ].map((jobname) => ({
     jobname,
     schedule: '* * * * *',

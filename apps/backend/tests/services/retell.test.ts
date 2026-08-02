@@ -26,6 +26,8 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+const sdkDelete = vi.hoisted(() => vi.fn());
+
 // -- Mock du SDK Retell AVANT tout import du code sous test. ---------------
 // `retell-sdk` expose une fonction async `verify(body, apiKey, signature)`
 // (cf. node_modules/retell-sdk/lib/webhook_auth.d.ts). On la remplace par un
@@ -33,6 +35,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('retell-sdk', () => {
   return {
     verify: vi.fn(),
+    default: class RetellMock {
+      call = { delete: sdkDelete };
+    },
   };
 });
 
@@ -44,6 +49,7 @@ const {
   parseRetellPayload,
   verifyAndParse,
   verifyRetellSignature,
+  deleteRetellCall,
 } = await import('../../src/services/retell.js');
 const { RetellSignatureError, WebhookValidationError } = await import(
   '../../src/utils/errors.js'
@@ -55,10 +61,24 @@ const mockSdkVerify = vi.mocked(sdkVerify);
 
 beforeEach(() => {
   mockSdkVerify.mockReset();
+  sdkDelete.mockReset();
 });
 
 afterEach(() => {
   vi.clearAllMocks();
+});
+
+describe('deleteRetellCall', () => {
+  it('returns deleted after the SDK 204/no-content success', async () => {
+    sdkDelete.mockResolvedValue(undefined);
+    await expect(deleteRetellCall('call-1')).resolves.toBe('deleted');
+    expect(sdkDelete).toHaveBeenCalledWith('call-1');
+  });
+
+  it('maps a 404 to idempotent not_found', async () => {
+    sdkDelete.mockRejectedValue({ status: 404 });
+    await expect(deleteRetellCall('call-missing')).resolves.toBe('not_found');
+  });
 });
 
 // ---------------------------------------------------------------------------

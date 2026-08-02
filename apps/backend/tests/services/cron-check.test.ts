@@ -34,6 +34,7 @@ function healthy(jobname: string, ageSec = 5): CronHealthRow {
     seconds_since_last_success: ageSec,
     total_runs_last_24h: 100,
     failed_runs_last_24h: 0,
+    first_seen_at: null,
   };
 }
 
@@ -58,6 +59,22 @@ describe('reportCronHealth', () => {
     const report = reportCronHealth([broken, ...rest.map((n) => healthy(n))]);
     expect(report.stale).toHaveLength(1);
     expect(report.stale[0]).toMatchObject({ jobname: first, reason: 'never_run' });
+  });
+
+  it('keeps a newly registered cron neutral until its first period elapses', () => {
+    const [first, ...rest] = KNOWN_NAMES;
+    if (first === undefined) throw new Error('table empty');
+    const fresh = {
+      ...healthy(first),
+      last_run_at: null,
+      last_success_at: null,
+      seconds_since_last_run: null,
+      seconds_since_last_success: null,
+      first_seen_at: new Date().toISOString(),
+    };
+    const report = reportCronHealth([fresh, ...rest.map((n) => healthy(n))]);
+    expect(report.stale).toEqual([]);
+    expect(report.pending_first_run).toEqual([first]);
   });
 
   it('flags stale_last_run when seconds_since_last_run exceeds the tolerance', () => {

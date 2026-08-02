@@ -1,9 +1,10 @@
 # Backend scripts
 
 Local-only maintenance and diagnostic tools. Not shipped in the production
-image. Nothing here touches the DB. The only network call authorised is
-the ngrok inspector at `127.0.0.1:4040`, and it is gated behind the
-`--capture-from-ngrok` flag on the diagnostic script.
+image. Read the script before running it: `test-email-pipeline.ts` writes a
+test row to the configured database and sends a real email. The Retell
+signature diagnostic does not touch the DB; its optional network call is the
+ngrok inspector at `127.0.0.1:4040`.
 
 ## `diagnose-retell-signature.ts`
 

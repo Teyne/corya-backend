@@ -21,6 +21,8 @@ const createSignedUrlMock = vi.fn<
 const listBucketsMock = vi.fn<
   () => Promise<{ data: { name: string }[] | null; error: { message: string } | null }>
 >();
+const existsMock = vi.fn<() => Promise<{ data: boolean; error: { message: string } | null }>>();
+const removeMock = vi.fn<() => Promise<{ data: unknown; error: { message: string } | null }>>();
 
 vi.mock('../../src/config/supabase.js', () => ({
   getServiceClient: () => ({
@@ -28,6 +30,8 @@ vi.mock('../../src/config/supabase.js', () => ({
       from: (_name: string) => ({
         upload: uploadMock,
         createSignedUrl: createSignedUrlMock,
+        exists: existsMock,
+        remove: removeMock,
       }),
       listBuckets: listBucketsMock,
     },
@@ -41,12 +45,15 @@ const {
   MAX_SIGNED_URL_TTL_SECONDS,
   PDF_BUCKET,
   uploadPdf,
+  deleteStoredPdf,
 } = await import('../../src/services/storage.js');
 
 beforeEach(() => {
   uploadMock.mockReset();
   createSignedUrlMock.mockReset();
   listBucketsMock.mockReset();
+  existsMock.mockReset();
+  removeMock.mockReset();
 });
 
 afterEach(() => {
@@ -135,5 +142,20 @@ describe('ensureBucketAccessible', () => {
   it('throws when the pdf-recaps bucket is missing', async () => {
     listBucketsMock.mockResolvedValue({ data: [{ name: 'other' }], error: null });
     await expect(ensureBucketAccessible()).rejects.toThrow(/storage_bucket_missing/);
+  });
+});
+
+describe('deleteStoredPdf', () => {
+  it('returns not_found without issuing a remove when the object is absent', async () => {
+    existsMock.mockResolvedValue({ data: false, error: null });
+    await expect(deleteStoredPdf(PDF_BUCKET, 'missing.pdf')).resolves.toBe('not_found');
+    expect(removeMock).not.toHaveBeenCalled();
+  });
+
+  it('removes an existing object', async () => {
+    existsMock.mockResolvedValue({ data: true, error: null });
+    removeMock.mockResolvedValue({ data: [], error: null });
+    await expect(deleteStoredPdf(PDF_BUCKET, 'present.pdf')).resolves.toBe('deleted');
+    expect(removeMock).toHaveBeenCalledWith(['present.pdf']);
   });
 });

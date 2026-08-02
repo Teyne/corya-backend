@@ -335,6 +335,7 @@ export function installQueryMocks(): void {
           worker_id: workerId,
           last_seen_at: new Date().toISOString(),
           last_poll_at: existing?.last_poll_at ?? null,
+          last_deletion_poll_at: existing?.last_deletion_poll_at ?? null,
           ...(version !== null ? { version } : {}),
         });
         return Promise.resolve();
@@ -349,6 +350,7 @@ export function installQueryMocks(): void {
           worker_id: workerId,
           last_seen_at: now,
           last_poll_at: now,
+          last_deletion_poll_at: existing?.last_deletion_poll_at ?? null,
           ...(existing ?? {}),
         });
         return Promise.resolve();
