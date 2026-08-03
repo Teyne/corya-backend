@@ -348,4 +348,71 @@ describe('Puppeteer smoke options and lifecycle', () => {
     expect(browserCloseCalled).toBe(true);
     expect(killedSignals).toEqual(['SIGKILL']);
   });
+
+  it('fails explicitly when page cleanup times out after a successful render', async () => {
+    const errors: string[] = [];
+    const browser = {
+      newPage: () => Promise.resolve({
+        setDefaultTimeout: () => undefined,
+        setContent: () => Promise.resolve(),
+        pdf: () => Promise.resolve(Uint8Array.from([1, 2, 3])),
+        close: () => new Promise<void>(() => undefined),
+      }),
+      close: () => Promise.resolve(),
+      process: () => null,
+    };
+
+    await expect(
+      runSmoke(
+        { renders: 1, timeoutMs: 1_000 },
+        {
+          puppeteerApi: { launch: () => Promise.resolve(browser) },
+          output: {
+            log: () => undefined,
+            error: (message: string) => errors.push(message),
+          },
+          cleanupTimeoutMs: 5,
+        },
+      ),
+    ).rejects.toThrow('page cleanup failed');
+
+    expect(errors).toEqual(['[puppeteer-smoke] page cleanup failed']);
+  });
+
+  it('fails explicitly and kills its browser when browser cleanup times out', async () => {
+    const errors: string[] = [];
+    const killedSignals: string[] = [];
+    const browser = {
+      newPage: () => Promise.resolve({
+        setDefaultTimeout: () => undefined,
+        setContent: () => Promise.resolve(),
+        pdf: () => Promise.resolve(Uint8Array.from([1, 2, 3])),
+        close: () => Promise.resolve(),
+      }),
+      close: () => new Promise<void>(() => undefined),
+      process: () => ({
+        kill: (signal: string) => {
+          killedSignals.push(signal);
+          return true;
+        },
+      }),
+    };
+
+    await expect(
+      runSmoke(
+        { renders: 1, timeoutMs: 1_000 },
+        {
+          puppeteerApi: { launch: () => Promise.resolve(browser) },
+          output: {
+            log: () => undefined,
+            error: (message: string) => errors.push(message),
+          },
+          cleanupTimeoutMs: 5,
+        },
+      ),
+    ).rejects.toThrow('browser cleanup failed');
+
+    expect(errors).toEqual(['[puppeteer-smoke] browser cleanup failed']);
+    expect(killedSignals).toEqual(['SIGKILL']);
+  });
 });

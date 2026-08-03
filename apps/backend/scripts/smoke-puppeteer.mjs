@@ -99,6 +99,7 @@ export async function runSmoke(
   } = {},
 ) {
   let browser;
+  let browserCleanupFailed = false;
   const startedAt = now();
   const initialNodeRssMiB = nodeRssMiB(memoryUsage);
   const results = [];
@@ -113,6 +114,8 @@ export async function runSmoke(
     for (let index = 1; index <= options.renders; index += 1) {
       const page = await browser.newPage();
       const renderStartedAt = now();
+      let renderFailure;
+      let pageClosed = false;
       try {
         page.setDefaultTimeout(options.timeoutMs);
         await page.setContent(syntheticHtml(index), {
@@ -132,20 +135,32 @@ export async function runSmoke(
         };
         results.push(result);
         output.log(`[puppeteer-smoke] render ${JSON.stringify(result)}`);
+      } catch (error) {
+        renderFailure = error;
       } finally {
-        await settleWithin(() => page.close(), cleanupTimeoutMs);
+        pageClosed = await settleWithin(() => page.close(), cleanupTimeoutMs);
+      }
+
+      if (renderFailure !== undefined) throw renderFailure;
+      if (!pageClosed) {
+        output.error?.('[puppeteer-smoke] page cleanup failed');
+        throw new Error('page cleanup failed');
       }
     }
   } finally {
     if (browser !== undefined) {
       const closed = await settleWithin(() => browser.close(), cleanupTimeoutMs);
       if (!closed) {
+        output.error?.('[puppeteer-smoke] browser cleanup failed');
         // This handle belongs to the browser instance launched above. Never
         // enumerate or terminate unrelated Chromium processes on the host.
         browser.process()?.kill('SIGKILL');
+        browserCleanupFailed = true;
       }
     }
   }
+
+  if (browserCleanupFailed) throw new Error('browser cleanup failed');
 
   const summary = {
     renders: results.length,
