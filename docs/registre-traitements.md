@@ -177,7 +177,8 @@ Les mesures suivantes s'appliquent transversalement, en complément des mesures 
 
 ## Traitement n° 4 — Purges et anonymisations automatiques
 
-**Statut** : actif.
+**Statut** : actif localement ; déploiement vague 7 requis pour les garanties
+de suppression physique et de preuve ci-dessous.
 
 **Finalité** : appliquer, sans intervention humaine, les durées de conservation limitées prévues aux traitements n° 1 à n° 3 et n° 7 ; produire une trace vérifiable de chaque suppression.
 
@@ -203,13 +204,16 @@ Les mesures suivantes s'appliquent transversalement, en complément des mesures 
 | Journalisation applicative (voir traitement n° 5) | 12 mois |
 | Journalisation des actions d'administration | 24 mois |
 
-- La trace des suppressions (horodatage, motif, identifiant de la donnée supprimée) est conservée à des fins de preuve d'audit et purgée avec la donnée d'origine.
+- La preuve terminale `deleted` / `not_found` est purgée avec la ligne d'appel
+  source. Sans appel source, elle est conservée 24 mois après `deleted_at`.
+  Un ordre `dead_letter` n'est jamais purgé automatiquement : il reste visible
+  jusqu'à la remédiation de la suppression physique.
 
 **Transferts internationaux** : aucun (traitement exécuté en Suisse). La suppression physique du fichier audio auprès de l'opérateur conversationnel américain (Retell AI) est déclenchée depuis la Suisse et confirmée avant que la référence ne soit effacée en base.
 
 **Mesures de sécurité spécifiques** :
-- Traitement en deux temps pour la suppression des fichiers hébergés en externe : (a) la référence à supprimer est inscrite dans un registre interne de demandes de suppression ; (b) un processus applicatif indépendant exécute la suppression physique et n'efface la référence en base qu'après confirmation.
-- Ce mécanisme garantit qu'un incident technique ne peut pas laisser un fichier orphelin non supprimé.
+- Traitement en deux temps pour la suppression des fichiers hébergés en externe : (a) la référence à supprimer est inscrite dans un registre interne de demandes de suppression ; (b) une boucle worker indépendante exécute la suppression physique, avec transitions fencées par lease et reprise bornée après incident.
+- Un `not_found` distant est un succès idempotent. Les échecs terminalisés en `dead_letter` donnent lieu à une alerte persistante réclamée par le poller API, sans exposer de données patient.
 - Surveillance active de l'exécution des tâches de purge : toute défaillance d'une purge planifiée génère une alerte opérationnelle.
 - Bornes strictes : aucun mécanisme applicatif ne peut, même en cas de dysfonctionnement, prolonger une durée de conservation au-delà des bornes ci-dessus.
 
@@ -217,7 +221,7 @@ Les mesures suivantes s'appliquent transversalement, en complément des mesures 
 
 ## Traitement n° 5 — Journalisation applicative et supervision technique
 
-**Statut** : actif.
+**Statut** : actif ; intégration BetterStack prévue, non active/confirmée.
 
 **Finalité** : surveiller le bon fonctionnement du service, diagnostiquer les incidents techniques, produire une piste d'audit des actions d'administration, satisfaire aux obligations de sécurité de l'art. 8 OPDo.
 
@@ -234,14 +238,18 @@ Les mesures suivantes s'appliquent transversalement, en complément des mesures 
 
 **Destinataires** :
 - Internes à Corya.
-- Sous-traitant ultérieur : BetterStack (agrégation et rétention des journaux applicatifs, alerting).
+- BetterStack est un sous-traitant ultérieur prévu ; il ne reçoit pas de
+  journaux tant que son activation n'est pas confirmée et documentée.
 
 **Durée de conservation** :
-- Journaux applicatifs techniques : 12 mois maximum (rotation gérée par BetterStack).
+- Journaux applicatifs techniques : 12 mois maximum ; le mécanisme de rotation
+  de l'hébergeur doit être confirmé avant activation de BetterStack.
 - Journaux d'actions d'administration : 24 mois maximum.
 - Signaux d'état des composants applicatifs : 30 jours après la dernière activité du composant.
 
-**Transferts internationaux** : les journaux applicatifs techniques sont traités par BetterStack au sein de l'Union européenne, qui bénéficie de la reconnaissance de protection adéquate par le Conseil fédéral. Aucun transfert hors UE / CH.
+**Transferts internationaux** : aucun transfert BetterStack n'est actif à ce
+jour. En cas d'activation, documenter le traitement UE et les garanties avant
+tout envoi de journaux.
 
 **Mesures de sécurité spécifiques** :
 - Règle technique appliquée en amont de l'écriture : les champs susceptibles de contenir une donnée identifiante de patient sont systématiquement remplacés par un placeholder avant journalisation.

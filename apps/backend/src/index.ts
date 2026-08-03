@@ -33,6 +33,7 @@ import {
 } from './middleware/correlation.js';
 import { buildWebhookRateLimiter } from './middleware/rate-limit.js';
 import { toLogFields } from './utils/errors.js';
+import { runWave7GatedStartup } from './services/startup.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -173,7 +174,11 @@ const isEntryPoint =
   process.argv[1] !== undefined &&
   resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
-if (isEntryPoint) {
+async function startApiServer(): Promise<void> {
+  await runWave7GatedStartup(startApiRuntime);
+}
+
+function startApiRuntime(): void {
   const server = createServer(app);
   // Alert pollers live in the API process (a dead worker cannot report its
   // own death). Kept as a mutable ref so shutdown can call stop().
@@ -234,4 +239,11 @@ if (isEntryPoint) {
 
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
+}
+
+if (isEntryPoint) {
+  void startApiServer().catch((err: unknown) => {
+    logger.error({ ...toLogFields(err) }, 'api_boot_failed');
+    process.exit(1);
+  });
 }

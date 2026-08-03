@@ -11,11 +11,16 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Transporter, SendMailOptions } from 'nodemailer';
-import type { Job } from '../../src/types/index.js';
+import type { FileDeletion, Job } from '../../src/types/index.js';
 
 // -- DB queries mock -------------------------------------------------------
 const getStaleWorkerHeartbeatsMock = vi.fn<
-  (seenSec: number, pollSec: number) => Promise<{ worker_id: string; last_seen_at: string; last_poll_at: string | null }[]>
+  (seenSec: number, pollSec: number) => Promise<{
+    worker_id: string;
+    last_seen_at: string;
+    last_poll_at: string | null;
+    last_deletion_poll_at: string | null;
+  }[]>
 >(() => Promise.resolve([]));
 const countPendingJobsOlderThanMock = vi.fn<(sec: number) => Promise<number>>(
   () => Promise.resolve(0),
@@ -26,6 +31,15 @@ const getDeadLetterJobsToAlertMock = vi.fn<(limit: number) => Promise<Job[]>>(
 const markDeadLetterAlertedMock = vi.fn<(jobId: string) => Promise<void>>(
   () => Promise.resolve(undefined),
 );
+const claimFileDeletionDeadLetterAlertsMock = vi.fn<
+  (alerterId: string, batchSize: number, staleAfterSeconds: number) => Promise<FileDeletion[]>
+>(() => Promise.resolve([]));
+const markFileDeletionDeadLetterAlertedMock = vi.fn<
+  (deletionId: string, alerterId: string, lockedAt: string) => Promise<boolean>
+>(() => Promise.resolve(true));
+const releaseFileDeletionDeadLetterAlertMock = vi.fn<
+  (deletionId: string, alerterId: string, lockedAt: string) => Promise<boolean>
+>(() => Promise.resolve(true));
 // Session 4 vague 4 — cron_stale poller depends on getCronHealth.
 const getCronHealthMock = vi.fn<() => Promise<unknown[]>>(() => Promise.resolve([]));
 
@@ -34,6 +48,9 @@ vi.mock('../../src/db/queries.js', () => ({
   countPendingJobsOlderThan: countPendingJobsOlderThanMock,
   getDeadLetterJobsToAlert: getDeadLetterJobsToAlertMock,
   markDeadLetterAlerted: markDeadLetterAlertedMock,
+  claimFileDeletionDeadLetterAlerts: claimFileDeletionDeadLetterAlertsMock,
+  markFileDeletionDeadLetterAlerted: markFileDeletionDeadLetterAlertedMock,
+  releaseFileDeletionDeadLetterAlert: releaseFileDeletionDeadLetterAlertMock,
   getCronHealth: getCronHealthMock,
 }));
 
@@ -58,6 +75,7 @@ const {
   checkJobsBacklog,
   checkCronStale,
   pollDeadLetterAlerts,
+  pollFileDeletionDeadLetterAlerts,
   startAlertPollers,
   __setReceiptTransporterForTests,
 } = await import('../../src/services/alert-pollers.js');
@@ -83,11 +101,42 @@ function makeDeadLetterJob(overrides?: Partial<Job>): Job {
   };
 }
 
+function makeDeadLetterDeletion(overrides?: Partial<FileDeletion>): FileDeletion {
+  return {
+    id: 'deletion-1',
+    target: 'supabase_storage',
+    bucket: 'pdf-recaps',
+    object_path: 'sensitive/object.pdf',
+    external_ref: null,
+    reason: 'appel_purged_24m',
+    status: 'dead_letter',
+    attempts: 10,
+    max_attempts: 10,
+    run_after: '2026-08-01T09:00:00.000Z',
+    locked_at: null,
+    locked_by: null,
+    last_error: 'TimeoutError:redacted_external_error',
+    enqueued_by: 'purge_ancient_appels',
+    source_appel_id: 'source-appel-secret',
+    source_cabinet_id: 'source-cabinet-secret',
+    created_at: '2026-08-01T09:00:00.000Z',
+    updated_at: '2026-08-01T09:00:00.000Z',
+    deleted_at: null,
+    dead_letter_alerted_at: null,
+    dead_letter_alert_locked_at: '2026-08-03T10:11:12.123456Z',
+    dead_letter_alert_locked_by: 'api-alert-owner',
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   getStaleWorkerHeartbeatsMock.mockReset().mockResolvedValue([]);
   countPendingJobsOlderThanMock.mockReset().mockResolvedValue(0);
   getDeadLetterJobsToAlertMock.mockReset().mockResolvedValue([]);
   markDeadLetterAlertedMock.mockReset().mockResolvedValue(undefined);
+  claimFileDeletionDeadLetterAlertsMock.mockReset().mockResolvedValue([]);
+  markFileDeletionDeadLetterAlertedMock.mockReset().mockResolvedValue(true);
+  releaseFileDeletionDeadLetterAlertMock.mockReset().mockResolvedValue(true);
   getCronHealthMock.mockReset().mockResolvedValue([]);
   sendAlertMock.mockReset().mockResolvedValue(undefined);
   sendMailMock.mockReset().mockResolvedValue({ messageId: '<id@test>' });
@@ -114,6 +163,7 @@ describe('checkWorkerStale', () => {
         worker_id: 'worker-abc-123',
         last_seen_at: new Date(Date.now() - 120_000).toISOString(),
         last_poll_at: new Date(Date.now() - 300_000).toISOString(),
+        last_deletion_poll_at: new Date(Date.now() - 300_000).toISOString(),
       },
     ]);
     await checkWorkerStale();
@@ -124,6 +174,62 @@ describe('checkWorkerStale', () => {
       stale_worker_count: 1,
       first_worker_id: 'worker-abc-123',
     });
+  });
+});
+
+// -----------------------------------------------------------------------
+describe('pollFileDeletionDeadLetterAlerts — persistent fenced delivery', () => {
+  it('claims then marks the exact opaque alert lease after SMTP success', async () => {
+    const row = makeDeadLetterDeletion();
+    claimFileDeletionDeadLetterAlertsMock.mockResolvedValueOnce([row]);
+
+    await pollFileDeletionDeadLetterAlerts();
+
+    const alerterId = claimFileDeletionDeadLetterAlertsMock.mock.calls[0]?.[0];
+    expect(alerterId).toBeTruthy();
+    expect(markFileDeletionDeadLetterAlertedMock).toHaveBeenCalledWith(
+      row.id,
+      alerterId,
+      '2026-08-03T10:11:12.123456Z',
+    );
+    expect(releaseFileDeletionDeadLetterAlertMock).not.toHaveBeenCalled();
+  });
+
+  it('releases the exact lease after SMTP failure so a later pass can retry', async () => {
+    const row = makeDeadLetterDeletion();
+    claimFileDeletionDeadLetterAlertsMock.mockResolvedValueOnce([row]);
+    sendMailMock.mockRejectedValueOnce(new Error('smtp unavailable'));
+
+    await pollFileDeletionDeadLetterAlerts();
+
+    const alerterId = claimFileDeletionDeadLetterAlertsMock.mock.calls[0]?.[0];
+    expect(releaseFileDeletionDeadLetterAlertMock).toHaveBeenCalledWith(
+      row.id,
+      alerterId,
+      '2026-08-03T10:11:12.123456Z',
+    );
+    expect(markFileDeletionDeadLetterAlertedMock).not.toHaveBeenCalled();
+  });
+
+  it('never includes deletion coordinates or source identifiers in the alert body', async () => {
+    claimFileDeletionDeadLetterAlertsMock.mockResolvedValueOnce([makeDeadLetterDeletion({
+      bucket: 'BUCKET-PII-SENTINEL',
+      object_path: 'OBJECT-PATH-PII-SENTINEL',
+      external_ref: null,
+      source_appel_id: 'SOURCE-APPEL-PII-SENTINEL',
+      last_error: 'LAST-ERROR-PII-SENTINEL',
+    })]);
+
+    await pollFileDeletionDeadLetterAlerts();
+
+    const rawText = sendMailMock.mock.calls[0]?.[0]?.text;
+    const body = typeof rawText === 'string' ? rawText : '';
+    expect(body).not.toContain('BUCKET-PII-SENTINEL');
+    expect(body).not.toContain('OBJECT-PATH-PII-SENTINEL');
+    expect(body).not.toContain('SOURCE-APPEL-PII-SENTINEL');
+    expect(body).not.toContain('LAST-ERROR-PII-SENTINEL');
+    expect(body).not.toContain('source_cabinet_id');
+    expect(body).not.toContain('external_ref');
   });
 });
 
@@ -236,6 +342,7 @@ describe('startAlertPollers — runOnce boot pass', () => {
         worker_id: 'w-1',
         last_seen_at: new Date(Date.now() - 120_000).toISOString(),
         last_poll_at: null,
+        last_deletion_poll_at: null,
       },
     ]);
     countPendingJobsOlderThanMock.mockResolvedValueOnce(999);
@@ -277,6 +384,7 @@ describe('checkCronStale (session 4 vague 4)', () => {
         'purge-stale-worker-heartbeats',
         'purge-cron-run-details',
         'purge-ancient-logs-actions',
+        'purge-terminal-file-deletions',
       ].map((jobname) => ({
         jobname,
         schedule: '* * * * *',

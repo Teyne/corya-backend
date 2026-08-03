@@ -380,7 +380,7 @@ export async function sendAlert(
   // 7. Only stamp the deduper on confirmed SMTP acceptance.
   lastSentAt.set(type, now);
   logger.info(
-    { alert_type: type, to: recipient },
+    { alert_type: type, alert_email_set: true },
     'alert_sent',
   );
 }

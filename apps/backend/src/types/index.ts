@@ -217,11 +217,15 @@ export interface FileDeletion {
   locked_at: string | null;
   locked_by: string | null;
   last_error: string | null;
+  enqueued_by: string | null;
   source_appel_id: string | null;
   source_cabinet_id: string | null;
   created_at: string;
   updated_at: string;
   deleted_at: string | null;
+  dead_letter_alerted_at: string | null;
+  dead_letter_alert_locked_at: string | null;
+  dead_letter_alert_locked_by: string | null;
 }
 
 /**

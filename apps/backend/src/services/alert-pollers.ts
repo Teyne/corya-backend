@@ -39,19 +39,24 @@
  * the timer and quietly disable alerting — the very failure mode we are
  * trying to prevent.
  */
+import { hostname } from 'node:os';
 import { env } from '../config/env.js';
 import { logger } from '../config/logger.js';
 import {
   countPendingJobsOlderThan,
+  claimFileDeletionDeadLetterAlerts,
   getDeadLetterJobsToAlert,
   getStaleWorkerHeartbeats,
+  markFileDeletionDeadLetterAlerted,
   markDeadLetterAlerted,
+  releaseFileDeletionDeadLetterAlert,
   type WorkerHeartbeatRow,
 } from '../db/queries.js';
 import { sendAlert } from './alert.js';
 import { computeCronHealthReport } from './cron-check.js';
-import type { Job } from '../types/index.js';
+import type { FileDeletion, Job } from '../types/index.js';
 import { toLogFields } from '../utils/errors.js';
+import { withTimeout } from '../utils/timeout.js';
 
 // Session 4 vague 3 — same override as services/alert.ts so tests can
 // flip ALERT_ENABLED locally. Keep it here (instead of importing from
@@ -78,6 +83,8 @@ const BACKLOG_MIN_AGE_SECONDS = 5 * 60;
 
 /** Batch cap for dead_letter alerts per pass (protects the outbox). */
 const DEAD_LETTER_BATCH = 20;
+const FILE_DELETION_ALERT_LEASE_SECONDS = 5 * 60;
+const FILE_DELETION_ALERTER_ID = `api-alert-${hostname()}-${process.pid}`;
 
 // ---------------------------------------------------------------------------
 // Individual checks
@@ -279,6 +286,78 @@ export async function pollDeadLetterAlerts(): Promise<void> {
   }
 }
 
+/**
+ * Persistently deliver deletion-outbox dead letters claimed through a fenced
+ * DB lease. The worker never alerts this transition: one API poller owns the
+ * SMTP send, then marks or releases the exact lease it received.
+ */
+export async function pollFileDeletionDeadLetterAlerts(): Promise<void> {
+  let rows: FileDeletion[];
+  try {
+    rows = await claimFileDeletionDeadLetterAlerts(
+      FILE_DELETION_ALERTER_ID,
+      DEAD_LETTER_BATCH,
+      FILE_DELETION_ALERT_LEASE_SECONDS,
+    );
+  } catch (err: unknown) {
+    logger.error(
+      { ...toLogFields(err) },
+      'alert_poller_file_deletion_dead_letter_claim_failed',
+    );
+    return;
+  }
+
+  for (const row of rows) {
+    const alertLockedAt = row.dead_letter_alert_locked_at;
+    if (alertLockedAt === null) {
+      logger.error(
+        { deletion_id: row.id },
+        'alert_poller_file_deletion_dead_letter_missing_lease',
+      );
+      continue;
+    }
+
+    // Deliberately exclude bucket, object_path, external_ref and every
+    // source identifier from both the SMTP body and logs.
+    const context = {
+      deletion_id: row.id,
+      deletion_target: row.target,
+      deletion_reason: row.reason,
+      attempts: row.attempts,
+      max_attempts: row.max_attempts,
+      source: 'api_poller',
+    };
+    const delivered = await sendAlertWithReceipt('file_deletion_dead_letter', context);
+
+    try {
+      const leaseKept = delivered
+        ? await markFileDeletionDeadLetterAlerted(
+            row.id,
+            FILE_DELETION_ALERTER_ID,
+            alertLockedAt,
+          )
+        : await releaseFileDeletionDeadLetterAlert(
+            row.id,
+            FILE_DELETION_ALERTER_ID,
+            alertLockedAt,
+          );
+      if (!leaseKept) {
+        logger.warn(
+          { deletion_id: row.id },
+          'alert_poller_file_deletion_dead_letter_lease_lost',
+        );
+      }
+    } catch (err: unknown) {
+      logger.error(
+        { deletion_id: row.id, ...toLogFields(err) },
+        delivered
+          ? 'alert_poller_file_deletion_dead_letter_mark_failed'
+          : 'alert_poller_file_deletion_dead_letter_release_failed',
+      );
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // sendAlertWithReceipt — internal helper
 // ---------------------------------------------------------------------------
@@ -324,6 +403,9 @@ function getReceiptTransporter(): Transporter | null {
     pool: true,
     maxConnections: 1,
     requireTLS: true,
+    connectionTimeout: env.TIMEOUT_SMTP_MS,
+    greetingTimeout: env.TIMEOUT_SMTP_MS,
+    socketTimeout: env.TIMEOUT_SMTP_MS,
   });
   return receiptTransporter;
 }
@@ -350,7 +432,7 @@ export function closeReceiptTransporter(): void {
  * `sendAlert` from services/alert.ts.
  */
 async function sendAlertWithReceipt(
-  type: 'job_dead_letter' | 'pdf_orphelin',
+  type: 'job_dead_letter' | 'pdf_orphelin' | 'file_deletion_dead_letter',
   context: Record<string, unknown>,
 ): Promise<boolean> {
   if (!isEnabled()) {
@@ -374,8 +456,12 @@ async function sendAlertWithReceipt(
     text: composeBody(type, context),
   };
   try {
-    await transport.sendMail(message);
-    logger.info({ alert_type: type, to: env.ALERT_EMAIL }, 'alert_sent');
+    await withTimeout(
+      transport.sendMail(message),
+      env.TIMEOUT_SMTP_MS,
+      'smtp:alert-receipt',
+    );
+    logger.info({ alert_type: type, alert_email_set: true }, 'alert_sent');
     return true;
   } catch (err: unknown) {
     logger.error(
@@ -459,6 +545,7 @@ async function runOnePass(): Promise<void> {
     checkJobsBacklog(),
     checkCronStale(),
     pollDeadLetterAlerts(),
+    pollFileDeletionDeadLetterAlerts(),
   ]);
 }
 

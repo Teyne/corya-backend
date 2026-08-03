@@ -1,6 +1,6 @@
 # Session 4 — état complet
 
-Dernière mise à jour : 2026-08-01, soir — post-merge PR #8, migrations appliquées,
+Dernière mise à jour : 2026-08-02, soir — post-merge PR #8, migrations appliquées,
 validation locale effectuée.
 
 Ce document sert de source de vérité pour reprendre la Session 4 après une
@@ -185,10 +185,15 @@ le vrai chiffre sur les 8 crons schedulés est **~458/jour**, soit ~41 250 ligne
 Free. `CRON_TOLERANCES_SECONDS['purge-cron-run-details']` reste à 8 jours : cette
 tolérance porte sur la fréquence d'exécution, pas sur la rétention.
 
-### 5.3 Écart de conformité majeur — `file_deletions_outbox` sans consommateur
+### 5.3 Écart de conformité majeur — `file_deletions_outbox` sans consommateur *(historique, résolu localement en vague 7)*
 
-**Aucun fichier de `src/` ne référence `file_deletions_outbox`.** Vérifié
-directement. Conséquences :
+Le constat ci-dessous décrit l'état observé le 1er août, avant la vague 7. Il
+ne décrit plus le code local : la boucle de consommation, les finalisations
+fencées et l'alerting persistant sont désormais implémentés ; voir §10 pour le
+contrat de publication restant.
+
+**À la date de ce constat, aucun fichier de `src/` ne référençait
+`file_deletions_outbox`.** Vérifié directement. Conséquences :
 
 - `purge_old_pdfs()` met `pdf_url` à NULL et enfile un ordre de suppression,
   **mais personne ne le consomme**. Le binaire reste dans le bucket
@@ -388,7 +393,7 @@ côté fondateur. Restent à obtenir : **Retell** et **Infomaniak**.
 
 ---
 
-## 9. Périmètre proposé pour la vague 7
+## 9. Périmètre réalisé localement en vague 7
 
 Par ordre de priorité :
 
@@ -407,27 +412,44 @@ seule journée — le problème est le procédé, pas les occurrences.
 
 ---
 
-## 10. Vague 7 — état local final (2 août 2026)
+## 10. Vague 7 — état local final (3 août 2026)
 
-Les quatre blocs techniques sont maintenant raccordés localement : erreurs
-structurées et nettoyées, consommateur de `file_deletions_outbox`, suppression
-Retell à +48 h, purge `logs_actions` à 24 mois, registre `cron_first_seen` et
-heartbeat propre à la boucle de suppression. Les crons attendus sont désormais
-au nombre de neuf.
+La vague 7 raccorde localement le consommateur de `file_deletions_outbox`, la
+suppression Retell, la purge `logs_actions`, le registre `cron_first_seen`, le
+heartbeat de suppression et les finalisations concurrentes sûres. Les appels
+`complete_file_deletion` et `fail_file_deletion` n'agissent que si le couple
+`(worker_id, locked_at)` correspond encore au lease obtenu par le claim.
 
-La suppression Retell utilise le SDK officiel (`client.call.delete(callId)`).
-Un 404 est un succès idempotent. Le job programmé à +48 h journalise et alerte
-un échec distant puis se termine afin de ne pas bloquer la file ; la rétention
-Retell configurée à un jour reste le filet indépendant. L'outbox, elle, conserve
-ses retries bornés et alerte en `dead_letter`.
+Les alertes `file_deletion_dead_letter` ne sont plus émises par le worker : un
+poller API persistant les réclame sous lease, les marque remises seulement après
+SMTP confirmé, les libère en cas d'échec et les reprend après expiration. Les
+preuves terminales `deleted` / `not_found` sont purgées avec leur appel source,
+ou 24 mois après `deleted_at` sans source ; les `dead_letter` restent pour
+remédiation. Dix crons sont attendus, dont les purges terminale d'outbox et de
+`logs_actions`.
 
-Correction de la source historique : le site public séparé rend aujourd'hui le
-formulaire de contact, utilise Resend quand le connecteur runtime est configuré
-et retombe sur `mailto:` sinon. Lovable/Cloudflare réalisent une mesure
-d'audience ; elle n'est pas désactivée. Le traitement n° 8 du registre reflète
-donc cet état actif et non l'hypothèse du prompt initial.
+`/health/deep` expose la boucle de suppression : `last_deletion_poll_at = NULL`
+est neutre (`deletion_loop_not_started`), tandis qu'une valeur de plus de 180 s
+dégrade le health (`deletion_loop_stale`). L'API et le worker vérifient avant
+tout démarrage `get_wave7_contract_version() = 7`; un schéma vague 7 incomplet
+est donc fail-fast.
 
-Ces changements ne sont pas déployés. Les migrations
-`20260802000000`–`20260802000003` restent à appliquer avant le worker, puis les
-variables `FILE_DELETION_*`, les health checks et les heartbeats doivent être
-vérifiés sur l'environnement cible. BetterStack reste prévu/non confirmé.
+Ces changements ne sont pas déployés. Avant publication, confirmer par
+`supabase migration list` que les quatre migrations
+`20260802000000`–`20260802000003` sont réellement non appliquées. Elles sont
+append-only : si l'une est déjà appliquée, ne pas la modifier et créer une
+migration correctrice. Si elles sont absentes, les appliquer dans cet ordre
+avant l'API puis le worker. Valider le contrat uniquement sur Supabase local
+jetable :
+
+```bash
+supabase start
+supabase db reset
+psql "postgresql://postgres:postgres@127.0.0.1:54322/postgres" -v ON_ERROR_STOP=1 -f supabase/tests/wave7_invariants.sql
+```
+
+Le script n'utilise que des identifiants synthétiques et annule ses mutations.
+En incident, arrêter/revenir d'abord le worker, puis l'API ; conserver les
+migrations additives. Les suppressions physiques déjà effectuées et les lignes
+`logs_actions` purgées nécessitent une restauration fournisseur ou backup/PITR,
+pas un rollback applicatif. BetterStack reste prévu/non confirmé.

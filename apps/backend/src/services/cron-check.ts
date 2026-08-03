@@ -52,6 +52,7 @@ import { getCronHealth, type CronHealthRow } from '../db/queries.js';
  *   - requeue-stuck-file-deletions  : every 10 min. 30 min = 3 missed ticks.
  *   - purge-stale-worker-heartbeats : weekly Sun 05:00. 8 days = 1 day grace.
  *   - purge-cron-run-details        : weekly Sun 05:30. 8 days = 1 day grace.
+ *   - purge-terminal-file-deletions : monthly. 32 days = 2 days grace.
  */
 export const CRON_TOLERANCES_SECONDS = {
   'purge-expired-audio': 2 * 3600,
@@ -63,6 +64,7 @@ export const CRON_TOLERANCES_SECONDS = {
   'purge-stale-worker-heartbeats': 8 * 24 * 3600,
   'purge-cron-run-details': 8 * 24 * 3600,
   'purge-ancient-logs-actions': 32 * 24 * 3600,
+  'purge-terminal-file-deletions': 32 * 24 * 3600,
 } as const;
 
 /** Expected maximum wait before the first scheduled run (not stale tolerance). */
@@ -76,6 +78,7 @@ const CRON_PERIODS_SECONDS: Record<keyof typeof CRON_TOLERANCES_SECONDS, number>
   'purge-stale-worker-heartbeats': 7 * 24 * 3600,
   'purge-cron-run-details': 7 * 24 * 3600,
   'purge-ancient-logs-actions': 31 * 24 * 3600,
+  'purge-terminal-file-deletions': 31 * 24 * 3600,
 };
 
 /** Reason a cron is flagged stale. Kept as a stable string union. */

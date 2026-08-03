@@ -23,6 +23,7 @@ import { assertSmtpConfigured, closeTransporter } from './services/email.js';
 import { closeBrowser } from './services/pdf.js';
 import { ensureBucketAccessible } from './services/storage.js';
 import { closeAlertTransporter, logAlertingModeOnce } from './services/alert.js';
+import { runWave7GatedStartup } from './services/startup.js';
 import { toLogFields } from './utils/errors.js';
 
 // Version comes from package.json — same ESM-safe reading pattern as index.ts.
@@ -34,6 +35,10 @@ const pkg = JSON.parse(
 const version: string = pkg.version;
 
 async function main(): Promise<void> {
+  await runWave7GatedStartup(startWorkerRuntime);
+}
+
+async function startWorkerRuntime(): Promise<void> {
   try {
     assertSmtpConfigured();
   } catch (err: unknown) {

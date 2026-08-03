@@ -104,6 +104,13 @@ describe('sendAlert — deduplication', () => {
     expect(sendMailMock).toHaveBeenCalledTimes(2);
   });
 
+  it('logs only whether the alert recipient is configured', async () => {
+    await sendAlert('jobs_backlog', {});
+    const raw = capture.chunks.join('');
+    expect(raw).toContain('"alert_email_set":true');
+    expect(raw).not.toContain('ops@test.local');
+  });
+
   it('does NOT stamp the deduper on SMTP failure — a following call retries', async () => {
     sendMailMock.mockRejectedValueOnce(new Error('smtp 421 temp'));
     await sendAlert('job_dead_letter', {});

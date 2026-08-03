@@ -110,10 +110,10 @@ const envSchema = z.object({
   SMTP_FROM_NAME: z.string().min(1).optional(),
   SMTP_FROM_EMAIL: z.string().email().optional(),
 
-  // ---- nLPD retention windows (optional, have defaults matching compliance.md) ----
+  // ---- Runtime nLPD retention window ----
+  // Transcript/appel retention periods are fixed in SQL migrations and are
+  // intentionally not exposed as environment configuration.
   AUDIO_RETENTION_HOURS: z.coerce.number().int().positive().max(72).default(48),
-  TRANSCRIPT_RETENTION_DAYS: z.coerce.number().int().positive().max(30).default(7),
-  APPEL_RETENTION_MONTHS: z.coerce.number().int().positive().max(60).default(24),
 
   // ---- Worker (session 3 — post-call pipeline: PDF -> upload -> email) ----
   // Optional stable identifier for a worker instance. Written to jobs.locked_by

@@ -6,7 +6,6 @@ import {
   failFileDeletion,
   workerHeartbeatDeletionPoll,
 } from '../db/queries.js';
-import { sendAlert } from '../services/alert.js';
 import { deleteRetellCall } from '../services/retell.js';
 import { deleteStoredPdf } from '../services/storage.js';
 import type { FileDeletion } from '../types/index.js';
@@ -42,7 +41,7 @@ async function deletePhysicalFile(row: FileDeletion): Promise<'deleted' | 'not_f
   return deleteRetellCall(row.external_ref);
 }
 
-async function handleDeletion(row: FileDeletion): Promise<void> {
+async function handleDeletion(row: FileDeletion, workerId: string): Promise<void> {
   const context = {
     deletion_id: row.id,
     deletion_target: row.target,
@@ -51,17 +50,22 @@ async function handleDeletion(row: FileDeletion): Promise<void> {
   };
   try {
     const status = await deletePhysicalFile(row);
-    await completeFileDeletion(row.id, status);
+    const completed = await completeFileDeletion(row, workerId, status);
+    if (completed === null) {
+      logger.warn(context, 'file_deletion_lease_lost');
+      return;
+    }
     logger.info({ ...context, status }, 'file_deletion_completed');
   } catch (err: unknown) {
     logger.warn({ ...context, ...toLogFields(err) }, 'file_deletion_failed');
     const status = await failFileDeletion(
       row,
+      workerId,
       `${toLogFields(err).err_name}:redacted_external_error`,
       computeBackoffSeconds(row.attempts),
     );
-    if (status === 'dead_letter') {
-      await sendAlert('file_deletion_dead_letter', { ...context, source: 'deletion_worker' });
+    if (status === null) {
+      logger.warn(context, 'file_deletion_lease_lost');
     }
   }
 }
@@ -81,7 +85,7 @@ export function runFileDeletionWorker(
       let rows: FileDeletion[] = [];
       try {
         rows = await claimFileDeletions(options.workerId, batchSize, staleAfterSeconds);
-        await Promise.all(rows.map(handleDeletion));
+        await Promise.all(rows.map((row) => handleDeletion(row, options.workerId)));
       } catch (err: unknown) {
         logger.error({ ...toLogFields(err) }, 'file_deletion_poll_failed');
       }

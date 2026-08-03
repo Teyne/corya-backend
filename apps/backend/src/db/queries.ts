@@ -717,6 +717,32 @@ export async function getMostRecentHeartbeat(): Promise<{ last_seen_at: string }
 }
 
 /**
+ * Freshest non-null heartbeat of the deletion loop across all workers.
+ * A null result is neutral: no deployed worker has started that loop yet.
+ */
+export async function getMostRecentDeletionPoll(): Promise<{
+  last_deletion_poll_at: string;
+} | null> {
+  const supabase = getServiceClient();
+  const { data, error } = await withDbTimeout(
+    (signal) =>
+      supabase
+        .from('worker_heartbeats')
+        .select('last_deletion_poll_at')
+        .not('last_deletion_poll_at', 'is', null)
+        .order('last_deletion_poll_at', { ascending: false })
+        .limit(1)
+        .abortSignal(signal)
+        .maybeSingle<{ last_deletion_poll_at: string }>(),
+    'db:getMostRecentDeletionPoll',
+  );
+  if (error) {
+    throw new Error(`db_get_most_recent_deletion_poll_failed: ${error.message}`);
+  }
+  return data ?? null;
+}
+
+/**
  * Row shape returned by public.get_cron_health() (migration
  * 20260801000003). We only project the fields the health check consumes;
  * the RPC returns more (24 h stats, last_status) that we leave for a
@@ -793,43 +819,122 @@ export async function claimFileDeletions(
 }
 
 export async function completeFileDeletion(
-  id: string,
+  deletion: FileDeletion,
+  workerId: string,
   status: 'deleted' | 'not_found',
-): Promise<void> {
-  const { error } = await withDbTimeout(
-    (signal) => getServiceClient().from('file_deletions_outbox').update({
-      status,
-      deleted_at: new Date().toISOString(),
-      locked_at: null,
-      locked_by: null,
-      last_error: null,
-    }).eq('id', id).eq('status', 'processing').abortSignal(signal),
+): Promise<'deleted' | 'not_found' | null> {
+  const result = (await withDbTimeout(
+    (signal) => getServiceClient().rpc('complete_file_deletion', {
+      p_deletion_id: deletion.id,
+      p_worker_id: workerId,
+      // Opaque lease token: never round-trip through Date.
+      p_locked_at: deletion.locked_at,
+      p_status: status,
+    }).abortSignal(signal),
     'db:completeFileDeletion',
-  );
-  if (error) throw new Error(`db_complete_file_deletion_failed: ${error.message}`);
+  )) as { data: unknown; error: { message: string } | null };
+  if (result.error) throw new Error(`db_complete_file_deletion_failed: ${result.error.message}`);
+  if (result.data === null) return null;
+  if (result.data === 'deleted' || result.data === 'not_found') return result.data;
+  throw new Error('db_complete_file_deletion_invalid_result');
 }
 
 export async function failFileDeletion(
   deletion: FileDeletion,
+  workerId: string,
   errorMessage: string,
   backoffSeconds: number,
-): Promise<'pending' | 'dead_letter'> {
-  const terminal = deletion.attempts >= deletion.max_attempts;
-  const status = terminal ? 'dead_letter' : 'pending';
-  const { error } = await withDbTimeout(
-    (signal) => getServiceClient().from('file_deletions_outbox').update({
-      status,
-      run_after: terminal
-        ? deletion.run_after
-        : new Date(Date.now() + backoffSeconds * 1_000).toISOString(),
-      locked_at: null,
-      locked_by: null,
-      last_error: errorMessage.slice(0, 500),
-    }).eq('id', deletion.id).eq('status', 'processing').abortSignal(signal),
+): Promise<'pending' | 'dead_letter' | null> {
+  const result = (await withDbTimeout(
+    (signal) => getServiceClient().rpc('fail_file_deletion', {
+      p_deletion_id: deletion.id,
+      p_worker_id: workerId,
+      // Opaque lease token: never round-trip through Date.
+      p_locked_at: deletion.locked_at,
+      p_error: errorMessage.slice(0, 500),
+      p_backoff_seconds: backoffSeconds,
+    }).abortSignal(signal),
     'db:failFileDeletion',
-  );
-  if (error) throw new Error(`db_fail_file_deletion_failed: ${error.message}`);
-  return status;
+  )) as { data: unknown; error: { message: string } | null };
+  if (result.error) throw new Error(`db_fail_file_deletion_failed: ${result.error.message}`);
+  if (result.data === null) return null;
+  if (result.data === 'pending' || result.data === 'dead_letter') return result.data;
+  throw new Error('db_fail_file_deletion_invalid_result');
+}
+
+export async function claimFileDeletionDeadLetterAlerts(
+  alerterId: string,
+  batchSize: number,
+  staleAfterSeconds: number,
+): Promise<FileDeletion[]> {
+  const result = (await withDbTimeout(
+    (signal) => getServiceClient().rpc('claim_file_deletion_dead_letter_alerts', {
+      p_alerter_id: alerterId,
+      p_batch_size: batchSize,
+      p_stale_after_seconds: staleAfterSeconds,
+    }).abortSignal(signal),
+    'db:claimFileDeletionDeadLetterAlerts',
+  )) as { data: unknown; error: { message: string } | null };
+  if (result.error) {
+    throw new Error(`db_claim_file_deletion_dead_letter_alerts_failed: ${result.error.message}`);
+  }
+  return (Array.isArray(result.data) ? result.data : []) as FileDeletion[];
+}
+
+export async function markFileDeletionDeadLetterAlerted(
+  deletionId: string,
+  alerterId: string,
+  alertLockedAt: string,
+): Promise<boolean> {
+  const result = (await withDbTimeout(
+    (signal) => getServiceClient().rpc('mark_file_deletion_dead_letter_alerted', {
+      p_deletion_id: deletionId,
+      p_alerter_id: alerterId,
+      // Opaque lease token: never round-trip through Date.
+      p_alert_locked_at: alertLockedAt,
+    }).abortSignal(signal),
+    'db:markFileDeletionDeadLetterAlerted',
+  )) as { data: unknown; error: { message: string } | null };
+  if (result.error) {
+    throw new Error(`db_mark_file_deletion_dead_letter_alerted_failed: ${result.error.message}`);
+  }
+  if (typeof result.data !== 'boolean') {
+    throw new Error('db_mark_file_deletion_dead_letter_alerted_invalid_result');
+  }
+  return result.data;
+}
+
+export async function releaseFileDeletionDeadLetterAlert(
+  deletionId: string,
+  alerterId: string,
+  alertLockedAt: string,
+): Promise<boolean> {
+  const result = (await withDbTimeout(
+    (signal) => getServiceClient().rpc('release_file_deletion_dead_letter_alert', {
+      p_deletion_id: deletionId,
+      p_alerter_id: alerterId,
+      // Opaque lease token: never round-trip through Date.
+      p_alert_locked_at: alertLockedAt,
+    }).abortSignal(signal),
+    'db:releaseFileDeletionDeadLetterAlert',
+  )) as { data: unknown; error: { message: string } | null };
+  if (result.error) {
+    throw new Error(`db_release_file_deletion_dead_letter_alert_failed: ${result.error.message}`);
+  }
+  if (typeof result.data !== 'boolean') {
+    throw new Error('db_release_file_deletion_dead_letter_alert_invalid_result');
+  }
+  return result.data;
+}
+
+export async function getWave7ContractVersion(): Promise<number> {
+  const result = (await withDbTimeout(
+    (signal) => getServiceClient().rpc('get_wave7_contract_version').abortSignal(signal),
+    'db:getWave7ContractVersion',
+  )) as { data: unknown; error: { message: string } | null };
+  if (result.error) throw new Error(`db_get_wave7_contract_version_failed: ${result.error.message}`);
+  if (typeof result.data !== 'number') throw new Error('db_wave7_contract_version_invalid');
+  return result.data;
 }
 
 export async function workerHeartbeatDeletionPoll(

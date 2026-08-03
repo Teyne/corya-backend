@@ -153,7 +153,7 @@ COMMENT ON TABLE public.cron_first_seen IS
 COMMENT ON COLUMN public.cron_first_seen.first_seen_at IS
   'Horodatage de la première fois où get_cron_health() a vu ce cron. '
   'Seed initial : NOW() au moment de la migration 20260802000002 pour les '
-  '9 crons alors actifs. Nouveaux crons : upsert à chaque appel de '
+  '10 crons alors actifs. Nouveaux crons : upsert à chaque appel de '
   'get_cron_health() (ON CONFLICT DO NOTHING).';
 
 
@@ -168,9 +168,9 @@ ALTER TABLE public.cron_first_seen ENABLE ROW LEVEL SECURITY;
 -- -----------------------------------------------------------------------------
 -- 3. SEED des crons actifs au moment de la migration
 -- -----------------------------------------------------------------------------
--- Objectif : garantir que TOUS les crons présents au déploiement (les 9
+-- Objectif : garantir que TOUS les crons présents au déploiement (les 10
 -- actifs après application des migrations 20260802000000 et 20260802000001,
--- soit les 8 existants + purge-ancient-logs-actions) reçoivent un
+-- soit les 8 existants + les purges terminale outbox et logs_actions) reçoivent un
 -- `first_seen_at = NOW()` immédiat. Sans ce seed, ils passeraient tous en
 -- `pending_first_run` au premier appel de get_cron_health() et l'alerting
 -- sur `never_run` réel serait suspendu pour la durée maximale de leur

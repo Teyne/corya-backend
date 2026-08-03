@@ -74,6 +74,12 @@ COMMENT ON FUNCTION public.purge_ancient_logs_actions() IS
   'Aligne la rétention effective sur celle annoncée dans docs/compliance.md. '
   'Base légale : art. 6 nLPD (limitation de la conservation).';
 
+-- La fonction s'exécute avec les droits de l'appelant. Le cron reste exécuté
+-- par son propriétaire postgres; seul service_role reçoit un droit manuel.
+REVOKE ALL ON FUNCTION public.purge_ancient_logs_actions() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.purge_ancient_logs_actions() FROM anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.purge_ancient_logs_actions() TO service_role;
+
 
 -- -----------------------------------------------------------------------------
 -- 2. Planification pg_cron
@@ -91,6 +97,7 @@ COMMENT ON FUNCTION public.purge_ancient_logs_actions() IS
 --   requeue-stuck-file-deletions   */10 * * * *  every 10 min
 --   purge-stale-worker-heartbeats  0 5 * * 0      weekly (dim. 05:00)
 --   purge-cron-run-details         30 5 * * 0     weekly (dim. 05:30)
+--   purge-terminal-file-deletions  37 4 1 * *     monthly (1er, 04:37 UTC)
 --
 -- Créneau retenu : '17 4 15 * *' — le 15 de chaque mois à 04:17 UTC.
 --
@@ -106,9 +113,9 @@ COMMENT ON FUNCTION public.purge_ancient_logs_actions() IS
 --     simplifie la lecture de cron.job_run_details en cas d'incident.
 --   - 04:xx UTC : plage nocturne européenne, comme les autres purges nLPD.
 --
--- On passe à **9 crons actifs**. L'inventaire volumétrique de 20260801000003
+-- On passe à **10 crons actifs**. L'inventaire volumétrique de 20260801000003
 -- §2 (~458 lignes/jour dans cron.job_run_details, ~41 250 lignes à 90 jours)
--- devient ~458,03 lignes/jour — variation négligeable, aucune mise à jour
+-- devient ~458,06 lignes/jour — variation négligeable, aucune mise à jour
 -- de commentaire nécessaire dans la migration d'élagage.
 
 DO $$

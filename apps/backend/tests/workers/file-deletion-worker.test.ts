@@ -2,8 +2,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { FileDeletion } from '../../src/types/index.js';
 
 const claimMock = vi.fn<() => Promise<FileDeletion[]>>();
-const completeMock = vi.fn<() => Promise<void>>();
-const failMock = vi.fn<() => Promise<'pending' | 'dead_letter'>>();
+const completeMock = vi.fn<() => Promise<'deleted' | 'not_found' | null>>();
+const failMock = vi.fn<() => Promise<'pending' | 'dead_letter' | null>>();
 const heartbeatMock = vi.fn<() => Promise<void>>();
 vi.mock('../../src/db/queries.js', () => ({
   claimFileDeletions: claimMock,
@@ -17,9 +17,6 @@ const retellDeleteMock = vi.fn<() => Promise<'deleted' | 'not_found'>>();
 vi.mock('../../src/services/storage.js', () => ({ deleteStoredPdf: storageDeleteMock }));
 vi.mock('../../src/services/retell.js', () => ({ deleteRetellCall: retellDeleteMock }));
 
-const alertMock = vi.fn<() => Promise<void>>();
-vi.mock('../../src/services/alert.js', () => ({ sendAlert: alertMock }));
-
 const { runFileDeletionWorker } = await import('../../src/workers/file-deletion-worker.js');
 
 function deletion(overrides: Partial<FileDeletion> = {}): FileDeletion {
@@ -28,20 +25,21 @@ function deletion(overrides: Partial<FileDeletion> = {}): FileDeletion {
     object_path: 'cabinet/2026-08/appel.pdf', external_ref: null,
     reason: 'appel_purged_24m', status: 'processing', attempts: 1,
     max_attempts: 10, run_after: new Date().toISOString(), locked_at: new Date().toISOString(),
-    locked_by: 'worker-test', last_error: null, source_appel_id: null,
+    locked_by: 'worker-test', last_error: null, enqueued_by: 'test', source_appel_id: null,
     source_cabinet_id: null, created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(), deleted_at: null, ...overrides,
+    updated_at: new Date().toISOString(), deleted_at: null,
+    dead_letter_alerted_at: null, dead_letter_alert_locked_at: null,
+    dead_letter_alert_locked_by: null, ...overrides,
   };
 }
 
 beforeEach(() => {
   claimMock.mockReset().mockResolvedValue([]);
-  completeMock.mockReset().mockResolvedValue(undefined);
+  completeMock.mockReset().mockResolvedValue('deleted');
   failMock.mockReset().mockResolvedValue('pending');
   heartbeatMock.mockReset().mockResolvedValue(undefined);
   storageDeleteMock.mockReset().mockResolvedValue('deleted');
   retellDeleteMock.mockReset().mockResolvedValue('deleted');
-  alertMock.mockReset().mockResolvedValue(undefined);
 });
 
 describe('runFileDeletionWorker', () => {
@@ -51,7 +49,11 @@ describe('runFileDeletionWorker', () => {
     await worker.stopped;
     await Promise.resolve();
     expect(storageDeleteMock).toHaveBeenCalledWith('pdf-recaps', 'cabinet/2026-08/appel.pdf');
-    expect(completeMock).toHaveBeenCalledWith('del-1', 'deleted');
+    expect(completeMock).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'del-1' }),
+      'worker-test',
+      'deleted',
+    );
     expect(heartbeatMock).toHaveBeenCalledWith('worker-test', 1);
   });
 
@@ -62,7 +64,11 @@ describe('runFileDeletionWorker', () => {
     })]);
     const worker = runFileDeletionWorker({ workerId: 'worker-test', runOnce: true });
     await worker.stopped;
-    expect(completeMock).toHaveBeenCalledWith('del-1', 'not_found');
+    expect(completeMock).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'del-1' }),
+      'worker-test',
+      'not_found',
+    );
   });
 
   it('requeues a transient physical deletion failure', async () => {
@@ -70,19 +76,39 @@ describe('runFileDeletionWorker', () => {
     claimMock.mockResolvedValueOnce([deletion()]);
     const worker = runFileDeletionWorker({ workerId: 'worker-test', runOnce: true });
     await worker.stopped;
-    expect(failMock).toHaveBeenCalledWith(expect.objectContaining({ id: 'del-1' }), expect.any(String), expect.any(Number));
-    expect(alertMock).not.toHaveBeenCalled();
+    expect(failMock).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'del-1' }),
+      'worker-test',
+      expect.any(String),
+      expect.any(Number),
+    );
   });
 
-  it('alerts when the retry budget is exhausted', async () => {
+  it('leaves dead-letter alerting exclusively to the persistent API poller', async () => {
     storageDeleteMock.mockRejectedValueOnce(new Error('remote down'));
     failMock.mockResolvedValueOnce('dead_letter');
     claimMock.mockResolvedValueOnce([deletion({ attempts: 10 })]);
     const worker = runFileDeletionWorker({ workerId: 'worker-test', runOnce: true });
     await worker.stopped;
-    expect(alertMock).toHaveBeenCalledWith(
-      'file_deletion_dead_letter',
-      expect.objectContaining({ deletion_id: 'del-1' }),
-    );
+    expect(failMock).toHaveBeenCalledOnce();
+  });
+
+  it('does not attempt another transition after losing the completion lease', async () => {
+    completeMock.mockResolvedValueOnce(null);
+    claimMock.mockResolvedValueOnce([deletion()]);
+    const worker = runFileDeletionWorker({ workerId: 'worker-test', runOnce: true });
+    await worker.stopped;
+    expect(completeMock).toHaveBeenCalledOnce();
+    expect(failMock).not.toHaveBeenCalled();
+  });
+
+  it('does not attempt another transition after losing the failure lease', async () => {
+    storageDeleteMock.mockRejectedValueOnce(new Error('remote down'));
+    failMock.mockResolvedValueOnce(null);
+    claimMock.mockResolvedValueOnce([deletion()]);
+    const worker = runFileDeletionWorker({ workerId: 'worker-test', runOnce: true });
+    await worker.stopped;
+    expect(failMock).toHaveBeenCalledOnce();
+    expect(completeMock).not.toHaveBeenCalled();
   });
 });

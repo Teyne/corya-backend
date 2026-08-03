@@ -31,18 +31,15 @@
  * a job cut mid-SMTP would be the worst case (partial send).
  *
  * ---------------------------------------------------------------------------
- * Unknown job type routing
+ * Job type routing
  * ---------------------------------------------------------------------------
- * The worker knows how to run `process_appel`. Two other cases are handled
- * distinctly:
- *   - Types in `KNOWN_UNIMPLEMENTED_JOB_TYPES` (e.g. `purge_audio_retell`)
- *     are enfilés on purpose but have no handler yet. They go STRAIGHT to
- *     `dead_letter` (via `fail_job_permanent`) with NO alert — otherwise
- *     every cabinet actif would spam the operator's inbox 48 h after each
- *     call. These rows are meant to be requeued manually the day the
- *     handler ships.
- *   - Anything else is a TRUE unknown (bad enqueue, migration regression):
- *     `fail_job` + backoff + `maybeAlertDeadLetter`. Loud on purpose.
+ * The worker actively handles both current canonical types:
+ *   - `process_appel` runs the PDF / Storage / email pipeline.
+ *   - `purge_audio_retell` performs the direct Retell deletion scheduled
+ *     at +AUDIO_RETENTION_HOURS (48 h by default).
+ * `KNOWN_UNIMPLEMENTED_JOB_TYPES` remains an empty compatibility hook. The
+ * generic unknown-type branch therefore concerns no currently accepted type;
+ * it stays loud for bad enqueues or a migration/code mismatch.
  */
 import { hostname } from 'node:os';
 import { env } from '../config/env.js';
@@ -83,41 +80,22 @@ const PII_SAFE_ERROR_NAMES: ReadonlySet<string> = new Set([
   PermanentEmailError.name,
 ]);
 
-/** Kept as an empty compatibility export; every accepted current type is handled. */
+/** Empty compatibility hook; every accepted current job type has a handler. */
 export const KNOWN_UNIMPLEMENTED_JOB_TYPES: ReadonlySet<string> = new Set();
 
 /**
  * ---------------------------------------------------------------------------
- * Job types the DB CHECK constraint accepts and the webhook actively
- * enqueues, but for which THIS worker has no handler yet.
+ * Retell deletion paths
  * ---------------------------------------------------------------------------
  *
- * (a) Why is such a job enqueued at all ?
- *     `purge_audio_retell` is enfilé pour chaque appel (voir
- *     `services/appel.ts` — enqueue immédiat + `run_after = date_appel +
- *     AUDIO_RETENTION_HOURS`). Le webhook n'a pas à savoir si le worker
- *     sait encore le traiter : la charge symbolique reste posée, ce qui
- *     garantit qu'aucun appel ne passera à travers la maille le jour où
- *     le handler existera. Retirer l'enfilement serait une régression
- *     compliance.
+ * `purge_audio_retell` is an active direct handler: `services/appel.ts`
+ * schedules it at `date_appel + AUDIO_RETENTION_HOURS`, then this worker
+ * calls Retell and completes the job.
  *
- * (b) Où la suppression réelle finira par vivre.
- *     La suppression du média chez Retell passera par le consommateur de
- *     `file_deletions_outbox` (planifié Session 5). Ce n'est PAS ce
- *     handler-ci qui appellera l'API Retell : ce set n'existe QUE pour
- *     dire au worker « ce job est attendu, n'alerte pas ».
- *
- * (c) TODO — dès que le handler `purge_audio_retell` est implémenté,
- *     RETIRER le type de ce set (sinon les vrais échecs de purge seraient
- *     silencieusement enterrés en dead_letter sans alerte). Idem pour
- *     tout futur type ajouté ici en transit.
- *
- * Conséquence opérationnelle assumée : chaque appel produit, 48 h plus
- * tard, un job qui atterrit immédiatement en `dead_letter` (aucune
- * consommation de `max_attempts`, aucun email d'alerte). Ces lignes
- * devront être requeueées manuellement (script one-shot) quand le
- * handler arrivera. Trace `dead_letter` = « à requeuer », pas « à
- * investiguer ».
+ * `file_deletions_outbox` is separate. It persists physical-deletion orders
+ * created by SQL retention flows and provides fenced claim/retry/recovery.
+ * The two paths can safely converge on the same remote call because deletion
+ * is idempotent: a second attempt returning `not_found` is a success.
  */
 /**
  * Build the string persisted into `jobs.last_error`. The RPC truncates to
@@ -233,6 +211,8 @@ async function handleOne(job: Job): Promise<void> {
     }
 
     if (job.type === 'purge_audio_retell') {
+      // Active +48 h direct deletion. `not_found` is returned as a successful
+      // idempotent status when an outbox order or Retell retention got there first.
       const callId = job.payload.retell_call_id;
       if (typeof callId !== 'string' || callId.length === 0) {
         logger.error(corr, 'retell_purge_missing_call_id');
@@ -250,22 +230,18 @@ async function handleOne(job: Job): Promise<void> {
       return;
     }
 
-    // KNOWN but not yet implemented (see KNOWN_UNIMPLEMENTED_JOB_TYPES).
-    // These are enfilés on purpose (compliance reservation) and MUST NOT
-    // trigger any alert — a cabinet actif = one such job per call, 48 h
-    // later. Route them straight to `dead_letter` via `fail_job_permanent`
-    // to avoid burning `max_attempts` * backoff on a no-op. `last_error`
-    // is a CONSTANT string built from the type — never concatenated with
-    // an external message, so no PII can leak here.
+    // Compatibility hook for a future accepted type during a staged rollout.
+    // The set is currently empty, so no current job enters this branch. If a
+    // type is temporarily added, fail it terminally without repeated retries;
+    // `last_error` remains a constant built only from the technical type.
     if (KNOWN_UNIMPLEMENTED_JOB_TYPES.has(job.type)) {
       logger.warn(corr, 'job_type_known_but_unimplemented');
       try {
         await forceDeadLetter(job.id, `not_implemented:${job.type}`);
       } catch (forceErr: unknown) {
         // On DB failure, log and return — do NOT fall through to the
-        // "unknown type" branch, which would trigger an alert. The
-        // requeue_stuck_jobs SQL net will eventually reclaim + we'll
-        // land back here on the next attempt.
+        // unknown-type branch. Standard stuck-job recovery retains ownership
+        // of any later retry if this compatibility hook is ever populated.
         logger.error(
           {
             ...corr,

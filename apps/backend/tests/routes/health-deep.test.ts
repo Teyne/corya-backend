@@ -19,9 +19,10 @@ import request from 'supertest';
 const pingDbMock = vi.fn<(ms: number) => Promise<void>>(() => Promise.resolve(undefined));
 const getMostRecentHeartbeatMock = vi.fn<
   () => Promise<{ last_seen_at: string } | null>
->(() =>
-  Promise.resolve({ last_seen_at: new Date().toISOString() }),
-);
+>(() => Promise.resolve({ last_seen_at: new Date().toISOString() }));
+const getMostRecentDeletionPollMock = vi.fn<
+  () => Promise<{ last_deletion_poll_at: string } | null>
+>(() => Promise.resolve({ last_deletion_poll_at: new Date().toISOString() }));
 const countPendingJobsOlderThanMock = vi.fn<(sec: number) => Promise<number>>(
   () => Promise.resolve(0),
 );
@@ -35,6 +36,7 @@ vi.mock('../../src/db/queries.js', async () => {
     ...actual,
     pingDb: pingDbMock,
     getMostRecentHeartbeat: getMostRecentHeartbeatMock,
+    getMostRecentDeletionPoll: getMostRecentDeletionPollMock,
     countPendingJobsOlderThan: countPendingJobsOlderThanMock,
     getCronHealth: getCronHealthMock,
   };
@@ -83,6 +85,7 @@ function makeAllHealthyCronRows(): Array<{
     'purge-stale-worker-heartbeats',
     'purge-cron-run-details',
     'purge-ancient-logs-actions',
+    'purge-terminal-file-deletions',
   ].map((jobname) => ({
     jobname,
     schedule: '* * * * *',
@@ -114,6 +117,9 @@ beforeEach(() => {
   ensureBucketAccessibleMock.mockReset().mockResolvedValue(undefined);
   getMostRecentHeartbeatMock.mockReset().mockResolvedValue({
     last_seen_at: new Date().toISOString(),
+  });
+  getMostRecentDeletionPollMock.mockReset().mockResolvedValue({
+    last_deletion_poll_at: new Date().toISOString(),
   });
   countPendingJobsOlderThanMock.mockReset().mockResolvedValue(0);
   getCronHealthMock.mockReset().mockResolvedValue(makeAllHealthyCronRows());
@@ -215,6 +221,35 @@ describe('GET /health/deep — degraded / unhealthy semantics', () => {
     const res = await request(app).get('/health/deep').set('X-Health-Token', TOKEN);
     expect(res.status).toBe(503);
     expect((res.body as DeepBody).status).toBe('degraded');
+  });
+
+  it('keeps a never-started deletion loop neutral', async () => {
+    getMostRecentDeletionPollMock.mockResolvedValue(null);
+    const res = await request(app).get('/health/deep').set('X-Health-Token', TOKEN);
+    expect(res.status).toBe(200);
+    const body = res.body as DeepBody;
+    expect(body.status).toBe('ok');
+    expect(body.checks.file_deletion_loop).toMatchObject({
+      ok: true,
+      reason: 'deletion_loop_not_started',
+    });
+  });
+
+  it('is explicitly degraded when the deletion loop heartbeat is stale', async () => {
+    getMostRecentDeletionPollMock.mockResolvedValue({
+      last_deletion_poll_at: new Date(Date.now() - 10 * 60_000).toISOString(),
+    });
+    const res = await request(app).get('/health/deep').set('X-Health-Token', TOKEN);
+    expect(res.status).toBe(503);
+    const body = res.body as DeepBody;
+    expect(body.checks.file_deletion_loop).toMatchObject({
+      ok: false,
+      reason: 'deletion_loop_stale',
+    });
+    const raw = JSON.stringify(body.checks.file_deletion_loop);
+    expect(raw).not.toContain('worker_id');
+    expect(raw).not.toContain('source_appel_id');
+    expect(raw).not.toContain('object_path');
   });
 
   it('is "degraded" (503) when jobs_backlog exceeds the threshold', async () => {

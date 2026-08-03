@@ -30,8 +30,8 @@
  * Semantics of the returned `status`:
  *   - "ok"         : every check.ok === true
  *   - "unhealthy"  : at least one CORE check failed (db, storage)
- *   - "degraded"   : only auxiliary checks failed (worker, jobs_backlog,
- *                    crons, smtp when queried)
+ *   - "degraded"   : only auxiliary checks failed (worker, deletion loop,
+ *                    jobs_backlog, crons, smtp when queried)
  * HTTP status is 200 for "ok", 503 for anything else (per brief).
  *
  * NEVER leak URLs, IDs, bucket names, or secrets in the response body.
@@ -45,7 +45,12 @@ import { timingSafeEqual } from 'node:crypto';
 import { Router, type Request, type Response } from 'express';
 import { env } from '../config/env.js';
 import { logger } from '../config/logger.js';
-import { getMostRecentHeartbeat, pingDb, countPendingJobsOlderThan } from '../db/queries.js';
+import {
+  countPendingJobsOlderThan,
+  getMostRecentDeletionPoll,
+  getMostRecentHeartbeat,
+  pingDb,
+} from '../db/queries.js';
 import { ensureBucketAccessible } from '../services/storage.js';
 import { getSharedTransporterForHealth } from '../services/email.js';
 import { computeCronHealthReport } from '../services/cron-check.js';
@@ -85,6 +90,7 @@ const DB_TIMEOUT_MS = 2_000;
 // (60 s default) is the real gate against burst calls.
 const SMTP_TIMEOUT_MS = 3_000;
 const BACKLOG_MIN_AGE_SECONDS = 5 * 60;
+const DELETION_POLL_STALE_THRESHOLD_SECONDS = 180;
 
 // ---------------------------------------------------------------------------
 // Process boot marker for uptime_seconds on GET /health
@@ -185,6 +191,30 @@ async function checkWorker(): Promise<Check> {
       : { ok: true, last_seen_seconds_ago: ageSec };
   } catch (err: unknown) {
     return { ok: false, err_name: errName(err) };
+  }
+}
+
+async function checkFileDeletionLoop(): Promise<Check> {
+  try {
+    const row = await getMostRecentDeletionPoll();
+    if (row === null) {
+      return { ok: true, reason: 'deletion_loop_not_started' };
+    }
+    const ageSec = Math.max(
+      0,
+      Math.round((Date.now() - new Date(row.last_deletion_poll_at).getTime()) / 1_000),
+    );
+    if (ageSec > DELETION_POLL_STALE_THRESHOLD_SECONDS) {
+      return {
+        ok: false,
+        reason: 'deletion_loop_stale',
+        last_poll_seconds_ago: ageSec,
+        threshold_seconds: DELETION_POLL_STALE_THRESHOLD_SECONDS,
+      };
+    }
+    return { ok: true, last_poll_seconds_ago: ageSec };
+  } catch (err: unknown) {
+    return { ok: false, reason: 'deletion_loop_check_failed', err_name: errName(err) };
   }
 }
 
@@ -325,10 +355,11 @@ healthRouter.get('/deep', async (req: Request, res: Response) => {
   if (pending === undefined) {
     pending = (async () => {
       // Run the checks in parallel — no dependency between them.
-      const [db, storage, worker, jobsBacklog, crons, smtp] = await Promise.all([
+      const [db, storage, worker, fileDeletionLoop, jobsBacklog, crons, smtp] = await Promise.all([
         checkDb(),
         checkStorage(),
         checkWorker(),
+        checkFileDeletionLoop(),
         checkJobsBacklog(),
         checkCrons(),
         full ? checkSmtp() : Promise.resolve<Check | null>(null),
@@ -338,6 +369,7 @@ healthRouter.get('/deep', async (req: Request, res: Response) => {
         db,
         storage,
         worker,
+        file_deletion_loop: fileDeletionLoop,
         jobs_backlog: jobsBacklog,
         crons,
       };

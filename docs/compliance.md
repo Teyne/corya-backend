@@ -1,6 +1,6 @@
 # Corya — Règles de conformité nLPD et santé
 
-> **État vérifié le 2 août 2026.** BetterStack, la page de statut et les
+> **État local vérifié le 3 août 2026.** BetterStack, la page de statut et les
 > endpoints automatisés d'exercice des droits ne sont pas actifs/confirmés.
 > Les demandes passent actuellement par le contact publié et un traitement
 > manuel sous 30 jours. La suppression physique Storage/Retell et la purge
@@ -106,7 +106,7 @@ Aucune configuration d'agent Retell ne peut désactiver cette annonce. C'est un 
 | Transcript anonymisé | 24 mois | Purge mensuelle |
 | Métadonnées appel (durée, résultat) | 24 mois | Purge mensuelle (`purge_ancient_appels`) |
 | PDF récap | **30 jours max après création de l'appel** (voir détail ci-dessous) | Purge quotidienne à 03:30 UTC (`purge_old_pdfs`) |
-| Logs applicatifs (sans données perso) | 12 mois | Rotation BetterStack |
+| Logs applicatifs (sans données perso) | 12 mois | Rotation d'hébergeur à confirmer ; BetterStack non actif |
 | Logs audit (`logs_actions`) | 24 mois | Purge mensuelle |
 
 ### PDF récap — précisions sur la rétention 30 jours
@@ -118,35 +118,32 @@ Règle appliquée depuis les migrations `20260731100000_job_claim_and_pdf_purge.
 - **Cas nominal** — email récap envoyé avec succès : le PDF est purgé **30 jours après `pdf_envoye_at`** (motif d'audit `pdf_purged_30d`).
 - **Cas dégradé** — email jamais parti (job `process_appel` en `dead_letter` sur défaillance SMTP prolongée) : le PDF est purgé **30 jours après `appels.created_at`** (motif d'audit distinct `pdf_purged_30d_unsent`, qui permet de détecter en revue les vagues d'échecs SMTP).
 - **Garantie borne dure** : aucun PDF ne survit plus de 30 jours après la création de l'appel, quel que soit le sort de l'email. Cette borne évite qu'un job bloqué en dead_letter n'orphelinise un PDF jusqu'à `purge_ancient_appels` (24 mois).
-- Purge en deux temps via `file_deletions_outbox` : la fonction SQL enfile un ordre de suppression Storage et met `appels.pdf_url` à NULL ; le worker backend est censé consommer l'outbox et supprimer le binaire côté bucket, en horodatant `deleted_at` comme preuve d'audit.
+- Purge en deux temps via `file_deletions_outbox` : la fonction SQL enfile un
+  ordre de suppression Storage ou Retell avant d'effacer sa référence métier ;
+  la seconde boucle du worker exécute ensuite la suppression physique.
+- Les transitions terminales sont fencées par le lease exact
+  `(worker_id, locked_at)`. Un worker retardé ne peut donc pas finaliser un
+  ordre repris entre-temps par un autre worker.
+- L'absence distante confirmée est un succès idempotent `not_found`. Les
+  erreurs externes sont redigées, réessayées avec backoff borné, puis placées
+  en `dead_letter` si le budget est épuisé.
+- Les alertes de `dead_letter` sont persistantes : le poller API les réclame
+  sous lease, les marque remises seulement après SMTP confirmé et libère ou
+  reprend un lease expiré. Un crash ne doit donc pas faire disparaître une
+  alerte.
 
-> ### ⚠️ Écart connu — le consommateur de `file_deletions_outbox` n'existe pas
->
-> Constaté en Session 4 (01.08.2026). Aucun fichier de `apps/backend/src/`
-> ne lit `file_deletions_outbox`. Conséquences factuelles, à ne pas
-> présenter autrement à un cabinet ou à un auditeur :
->
-> - **PDF** : la garantie « aucun PDF ne survit plus de 30 jours » est vraie
->   de la migration SQL, **fausse du système**. À J+30 le PDF est
->   déréférencé (`pdf_url = NULL`, donc plus atteignable depuis le
->   back-office ni par une URL signée) et l'ordre de suppression est enfilé,
->   mais **le binaire reste dans le bucket Supabase**.
-> - **Audio Retell** : le job `purge_audio_retell`, enfilé à chaque appel
->   pour T+48 h, n'a pas de handler. L'audio **n'est pas supprimé chez
->   Retell** par Corya. La rétention effective est celle configurée dans le
->   dashboard Retell, qui doit donc être vérifiée et documentée par le
->   fondateur tant que cet écart subsiste.
->
-> Pour éviter une alerte email par appel, ce job est routé directement en
-> `dead_letter` avec `last_error = 'not_implemented:purge_audio_retell'` et
-> **sans alerte** (`KNOWN_UNIMPLEMENTED_JOB_TYPES` dans
-> `src/workers/job-worker.ts`). Le silence est délibéré et borné à ce type
-> précis : tout autre type de job non géré déclenche toujours une alerte.
-> Ces lignes `dead_letter` sont la trace de l'écart et devront être
-> requeuées manuellement le jour où le handler existe.
->
-> **Résolution prévue** : Session 5, priorité 1 — consommateur d'outbox +
-> appel de l'API de suppression d'enregistrement Retell.
+Ces garanties sont présentes localement ; elles ne deviennent effectives sur
+une cible qu'après application ordonnée des migrations vague 7 et déploiement
+du worker. La rétention Retell configurée côté fournisseur reste un filet
+indépendant, à confirmer lors de la mise en service.
+
+### Preuves de suppression et rétention
+
+Une preuve terminale `deleted` ou `not_found` est purgée lorsque l'appel source
+n'existe plus. Si l'ordre n'a pas d'appel source, elle est conservée au plus 24
+mois après `deleted_at`. Les `dead_letter` ne sont jamais purgés
+automatiquement : l'objet externe peut encore exister et l'ordre doit rester
+visible jusqu'à résolution manuelle.
 
 Statut du PDF vis-à-vis du patient :
 
@@ -177,8 +174,7 @@ Corya utilise des sous-traitants pour le traitement. **Un DPA (Data Processing A
 | Peoplefone | Téléphonie SIP | Suisse | Obligatoire |
 | Supabase | DB + Storage + Auth | Zurich (CH) | Obligatoire |
 | Infomaniak | Hébergement + email | Suisse | Obligatoire |
-| MessageBird / Twilio | SMS | EU / US | Obligatoire |
-| BetterStack | Monitoring | EU | Obligatoire |
+| BetterStack | Monitoring | EU | Prévu, non actif/confirmé |
 | ElevenLabs / Cartesia | TTS | US (majoritairement) | Obligatoire |
 
 Un tracking des DPA signés doit exister (Google Sheet ou table dédiée dans Supabase).
@@ -238,6 +234,7 @@ n'arrive pas au cabinet, sans que personne ne s'en rende compte).
 | `job_dead_letter` | Job en `dead_letter` après `max_attempts` ou échec permanent    | Worker (immédiat) + poller API    |
 | `pdf_orphelin`    | `dead_letter` avec PDF uploadé mais email jamais envoyé          | Worker (immédiat) + poller API    |
 | `worker_stale`    | Heartbeat worker > 60 s (`last_seen_at`) ou > 180 s (`last_poll_at`) | Poller API (5 min + boot)     |
+| `file_deletion_dead_letter` | Ordre de suppression physique en `dead_letter` | Poller API persistant |
 | `jobs_backlog`    | > `JOBS_BACKLOG_ALERT_THRESHOLD` jobs `pending` de plus de 5 min | Poller API                        |
 | `cron_stale`      | Un cron pg_cron hors de sa fenêtre de tolérance                  | Poller API                        |
 
@@ -251,6 +248,9 @@ n'arrive pas au cabinet, sans que personne ne s'en rende compte).
 - Le poller `dead_letter` marque `dead_letter_alerted_at` UNIQUEMENT après
   un envoi SMTP confirmé, garantissant qu'aucune alerte n'est perdue sur
   panne SMTP.
+- Les alertes de suppression physique sont elles aussi persistantes : le
+  marqueur n'est écrit qu'après SMTP confirmé et le lease est repris après son
+  TTL en cas de crash.
 - Déduplication mémoire : 1 alerte max par type par fenêtre
   `ALERT_DEDUP_WINDOW_MS` (15 min par défaut). Un worker qui boucle sur
   une erreur ne peut pas générer 1800 emails/heure.
@@ -267,6 +267,12 @@ les planifications des migrations sont exprimées en UTC :
 - `anonymize-old-transcripts` : `0 3 * * *` = 03:00 UTC (04:00 CET / 05:00 CEST)
 - `purge-old-pdfs` : `30 3 * * *` = 03:30 UTC (04:30 CET / 05:30 CEST)
 - `purge-ancient-appels` : `0 4 1 * *` = 04:00 UTC le 1er du mois
+- `purge-terminal-file-deletions` : `37 4 1 * *` = 04:37 UTC le 1er du mois
+- `purge-ancient-logs-actions` : `17 4 15 * *` = 04:17 UTC le 15 du mois
+
+Les dix crons attendus comprennent aussi `requeue-stuck-jobs`,
+`requeue-stuck-file-deletions`, `purge-stale-worker-heartbeats` et
+`purge-cron-run-details`.
 
 Le décalage 1-2 h avec l'heure suisse est **intentionnel** : les purges
 tournent la nuit heure locale, quand aucun cabinet n'est actif. Ne pas

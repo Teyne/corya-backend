@@ -86,6 +86,32 @@
 -- de raison opérationnelle de séparer — la supervision passera par le poller
 -- backend qui interroge directement le statut des lignes.
 
+-- Persistance des alertes dead_letter. Les deux colonnes de lease permettent
+-- plusieurs pollers concurrents et la reprise d'un claim abandonne.
+ALTER TABLE public.file_deletions_outbox
+  ADD COLUMN IF NOT EXISTS dead_letter_alerted_at TIMESTAMPTZ;
+
+ALTER TABLE public.file_deletions_outbox
+  ADD COLUMN IF NOT EXISTS dead_letter_alert_locked_at TIMESTAMPTZ;
+
+ALTER TABLE public.file_deletions_outbox
+  ADD COLUMN IF NOT EXISTS dead_letter_alert_locked_by TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_fdo_dead_letter_unalerted
+  ON public.file_deletions_outbox (dead_letter_alert_locked_at, updated_at)
+  WHERE status = 'dead_letter' AND dead_letter_alerted_at IS NULL;
+
+COMMENT ON COLUMN public.file_deletions_outbox.dead_letter_alerted_at IS
+  'Horodatage ecrit uniquement apres remise confirmee de l''alerte dead_letter. '
+  'NULL signifie que l''alerte reste a remettre.';
+
+COMMENT ON COLUMN public.file_deletions_outbox.dead_letter_alert_locked_at IS
+  'Debut du lease du poller d''alertes dead_letter. Un lease stale est '
+  'reclamable par claim_file_deletion_dead_letter_alerts.';
+
+COMMENT ON COLUMN public.file_deletions_outbox.dead_letter_alert_locked_by IS
+  'Identifiant technique du poller proprietaire du lease d''alerte.';
+
 CREATE OR REPLACE FUNCTION public.requeue_stuck_file_deletions()
 RETURNS INTEGER
 LANGUAGE plpgsql
@@ -102,7 +128,10 @@ BEGIN
     SET status     = 'dead_letter',
         locked_at  = NULL,
         locked_by  = NULL,
-        last_error = 'stuck_deletion_exhausted_attempts'
+        last_error = 'stuck_deletion_exhausted_attempts',
+        dead_letter_alerted_at = NULL,
+        dead_letter_alert_locked_at = NULL,
+        dead_letter_alert_locked_by = NULL
     WHERE status = 'processing'
       AND locked_at IS NOT NULL
       AND locked_at < NOW() - INTERVAL '10 minutes'
@@ -182,6 +211,13 @@ SECURITY DEFINER
 SET search_path = public, pg_temp
 AS $$
 BEGIN
+  IF NULLIF(BTRIM(p_worker_id), '') IS NULL
+     OR p_batch_size IS NULL OR p_batch_size < 1 OR p_batch_size > 100
+     OR p_stale_after_seconds IS NULL OR p_stale_after_seconds < 1 THEN
+    RAISE EXCEPTION 'invalid_file_deletion_claim_parameters'
+      USING ERRCODE = '22023';
+  END IF;
+
   RETURN QUERY
   WITH candidates AS (
     SELECT id
@@ -223,7 +259,324 @@ GRANT  EXECUTE ON FUNCTION public.claim_file_deletions(TEXT, INTEGER, INTEGER) T
 
 
 -- -----------------------------------------------------------------------------
--- 3. NOTE POUR LE BACKEND (contrat d'utilisation de claim_file_deletions)
+-- 3. Finalisation atomique fencee par le proprietaire du verrou
+-- -----------------------------------------------------------------------------
+-- Une ligne reclaim peut encore etre traitee par l'ancien worker. Ces RPC
+-- refusent silencieusement sa finalisation des que le couple
+-- (locked_by, locked_at) ne designe plus son lease exact.
+
+CREATE OR REPLACE FUNCTION public.complete_file_deletion(
+  p_deletion_id UUID,
+  p_worker_id   TEXT,
+  p_locked_at   TIMESTAMPTZ,
+  p_status      TEXT
+)
+RETURNS TEXT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+  v_status TEXT;
+BEGIN
+  IF p_status IS NULL OR p_status NOT IN ('deleted', 'not_found') THEN
+    RAISE EXCEPTION 'invalid_file_deletion_completion_status'
+      USING ERRCODE = '22023';
+  END IF;
+
+  UPDATE public.file_deletions_outbox
+  SET status       = p_status,
+      deleted_at   = NOW(),
+      locked_at    = NULL,
+      locked_by    = NULL,
+      last_error   = NULL
+  WHERE id = p_deletion_id
+    AND status = 'processing'
+    AND locked_by = p_worker_id
+    AND locked_at = p_locked_at
+  RETURNING status INTO v_status;
+
+  RETURN v_status;
+END;
+$$;
+
+COMMENT ON FUNCTION public.complete_file_deletion(UUID, TEXT, TIMESTAMPTZ, TEXT) IS
+  'Finalise deleted/not_found uniquement si (p_worker_id, p_locked_at) '
+  'identifie encore le lease courant. Retourne le statut, ou NULL si le '
+  'lease a ete perdu. p_locked_at doit etre retransmis sans conversion.';
+
+CREATE OR REPLACE FUNCTION public.fail_file_deletion(
+  p_deletion_id     UUID,
+  p_worker_id       TEXT,
+  p_locked_at       TIMESTAMPTZ,
+  p_error           TEXT,
+  p_backoff_seconds INTEGER
+)
+RETURNS TEXT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+  v_status TEXT;
+BEGIN
+  UPDATE public.file_deletions_outbox
+  SET status = CASE
+        WHEN attempts >= max_attempts THEN 'dead_letter'
+        ELSE 'pending'
+      END,
+      run_after = CASE
+        WHEN attempts >= max_attempts THEN run_after
+        ELSE NOW() + make_interval(secs => GREATEST(0, COALESCE(p_backoff_seconds, 0)))
+      END,
+      locked_at  = NULL,
+      locked_by  = NULL,
+      last_error = LEFT(COALESCE(p_error, ''), 500),
+      dead_letter_alerted_at = CASE
+        WHEN attempts >= max_attempts THEN NULL
+        ELSE dead_letter_alerted_at
+      END,
+      dead_letter_alert_locked_at = NULL,
+      dead_letter_alert_locked_by = NULL
+  WHERE id = p_deletion_id
+    AND status = 'processing'
+    AND locked_by = p_worker_id
+    AND locked_at = p_locked_at
+  RETURNING status INTO v_status;
+
+  RETURN v_status;
+END;
+$$;
+
+COMMENT ON FUNCTION public.fail_file_deletion(UUID, TEXT, TIMESTAMPTZ, TEXT, INTEGER) IS
+  'Consigne un echec uniquement si (p_worker_id, p_locked_at) identifie '
+  'encore le lease courant. Retourne pending/dead_letter, ou NULL si le '
+  'lease a ete perdu. Erreur tronquee a 500 caracteres; le backend doit la '
+  'fournir deja redactee. p_locked_at doit etre retransmis sans conversion.';
+
+REVOKE ALL ON FUNCTION public.complete_file_deletion(UUID, TEXT, TIMESTAMPTZ, TEXT) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.complete_file_deletion(UUID, TEXT, TIMESTAMPTZ, TEXT) FROM anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.complete_file_deletion(UUID, TEXT, TIMESTAMPTZ, TEXT) TO service_role;
+
+REVOKE ALL ON FUNCTION public.fail_file_deletion(UUID, TEXT, TIMESTAMPTZ, TEXT, INTEGER) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.fail_file_deletion(UUID, TEXT, TIMESTAMPTZ, TEXT, INTEGER) FROM anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.fail_file_deletion(UUID, TEXT, TIMESTAMPTZ, TEXT, INTEGER) TO service_role;
+
+
+-- -----------------------------------------------------------------------------
+-- 4. Outbox persistante des alertes dead_letter
+-- -----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION public.claim_file_deletion_dead_letter_alerts(
+  p_alerter_id          TEXT,
+  p_batch_size          INTEGER DEFAULT 20,
+  p_stale_after_seconds INTEGER DEFAULT 300
+)
+RETURNS SETOF public.file_deletions_outbox
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+  IF NULLIF(BTRIM(p_alerter_id), '') IS NULL
+     OR p_batch_size IS NULL OR p_batch_size < 1 OR p_batch_size > 100
+     OR p_stale_after_seconds IS NULL OR p_stale_after_seconds < 1 THEN
+    RAISE EXCEPTION 'invalid_file_deletion_alert_claim_parameters'
+      USING ERRCODE = '22023';
+  END IF;
+
+  RETURN QUERY
+  WITH candidates AS (
+    SELECT id
+    FROM public.file_deletions_outbox
+    WHERE status = 'dead_letter'
+      AND dead_letter_alerted_at IS NULL
+      AND (
+        dead_letter_alert_locked_at IS NULL
+        OR dead_letter_alert_locked_at
+           < NOW() - make_interval(secs => p_stale_after_seconds)
+      )
+    ORDER BY updated_at, id
+    FOR UPDATE SKIP LOCKED
+    LIMIT p_batch_size
+  )
+  UPDATE public.file_deletions_outbox f
+  SET dead_letter_alert_locked_at = NOW(),
+      dead_letter_alert_locked_by = p_alerter_id
+  FROM candidates c
+  WHERE f.id = c.id
+  RETURNING f.*;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.mark_file_deletion_dead_letter_alerted(
+  p_deletion_id    UUID,
+  p_alerter_id     TEXT,
+  p_alert_locked_at TIMESTAMPTZ
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+  v_count INTEGER;
+BEGIN
+  UPDATE public.file_deletions_outbox
+  SET dead_letter_alerted_at = NOW(),
+      dead_letter_alert_locked_at = NULL,
+      dead_letter_alert_locked_by = NULL
+  WHERE id = p_deletion_id
+    AND status = 'dead_letter'
+    AND dead_letter_alerted_at IS NULL
+    AND dead_letter_alert_locked_by = p_alerter_id
+    AND dead_letter_alert_locked_at = p_alert_locked_at;
+
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+  RETURN v_count = 1;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.release_file_deletion_dead_letter_alert(
+  p_deletion_id    UUID,
+  p_alerter_id     TEXT,
+  p_alert_locked_at TIMESTAMPTZ
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+  v_count INTEGER;
+BEGIN
+  UPDATE public.file_deletions_outbox
+  SET dead_letter_alert_locked_at = NULL,
+      dead_letter_alert_locked_by = NULL
+  WHERE id = p_deletion_id
+    AND status = 'dead_letter'
+    AND dead_letter_alerted_at IS NULL
+    AND dead_letter_alert_locked_by = p_alerter_id
+    AND dead_letter_alert_locked_at = p_alert_locked_at;
+
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+  RETURN v_count = 1;
+END;
+$$;
+
+COMMENT ON FUNCTION public.claim_file_deletion_dead_letter_alerts(TEXT, INTEGER, INTEGER) IS
+  'Claim concurrent et reclaimable des alertes dead_letter non remises. '
+  'FOR UPDATE SKIP LOCKED; lease stale par defaut apres 300 secondes.';
+
+COMMENT ON FUNCTION public.mark_file_deletion_dead_letter_alerted(UUID, TEXT, TIMESTAMPTZ) IS
+  'Horodate une alerte remise uniquement si (p_alerter_id, '
+  'p_alert_locked_at) identifie encore son lease exact. Le timestamp renvoye '
+  'par le claim doit etre retransmis sans conversion.';
+
+COMMENT ON FUNCTION public.release_file_deletion_dead_letter_alert(UUID, TEXT, TIMESTAMPTZ) IS
+  'Libere le lease apres echec uniquement si (p_alerter_id, '
+  'p_alert_locked_at) identifie encore son lease exact; sinon reclaim par TTL.';
+
+REVOKE ALL ON FUNCTION public.claim_file_deletion_dead_letter_alerts(TEXT, INTEGER, INTEGER) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.claim_file_deletion_dead_letter_alerts(TEXT, INTEGER, INTEGER) FROM anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.claim_file_deletion_dead_letter_alerts(TEXT, INTEGER, INTEGER) TO service_role;
+
+REVOKE ALL ON FUNCTION public.mark_file_deletion_dead_letter_alerted(UUID, TEXT, TIMESTAMPTZ) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.mark_file_deletion_dead_letter_alerted(UUID, TEXT, TIMESTAMPTZ) FROM anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.mark_file_deletion_dead_letter_alerted(UUID, TEXT, TIMESTAMPTZ) TO service_role;
+
+REVOKE ALL ON FUNCTION public.release_file_deletion_dead_letter_alert(UUID, TEXT, TIMESTAMPTZ) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.release_file_deletion_dead_letter_alert(UUID, TEXT, TIMESTAMPTZ) FROM anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.release_file_deletion_dead_letter_alert(UUID, TEXT, TIMESTAMPTZ) TO service_role;
+
+
+-- -----------------------------------------------------------------------------
+-- 5. Retention bornee des preuves de suppression abouties
+-- -----------------------------------------------------------------------------
+-- Le registre des traitements impose de purger la trace avec la donnee
+-- d'origine. Une preuve deleted/not_found avec source_appel_id est donc
+-- supprimee lorsque la ligne appels n'existe plus. Pour les rares ordres sans
+-- source, une borne absolue de 24 mois apres deleted_at evite l'accumulation.
+-- Les dead_letter ne sont jamais purges : le fichier peut encore exister et
+-- l'ordre doit rester visible jusqu'a remediation manuelle.
+
+CREATE OR REPLACE FUNCTION public.purge_terminal_file_deletions(
+  p_retain_without_source INTERVAL DEFAULT INTERVAL '24 months',
+  p_batch_size            INTEGER DEFAULT 1000
+)
+RETURNS INTEGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+  v_purged INTEGER;
+BEGIN
+  IF p_retain_without_source IS NULL
+     OR p_retain_without_source < INTERVAL '1 day'
+     OR p_batch_size IS NULL OR p_batch_size < 1 OR p_batch_size > 1000 THEN
+    RAISE EXCEPTION 'invalid_file_deletion_retention'
+      USING ERRCODE = '22023';
+  END IF;
+
+  WITH candidates AS (
+    SELECT f.id
+    FROM public.file_deletions_outbox f
+    WHERE f.status IN ('deleted', 'not_found')
+      AND f.deleted_at IS NOT NULL
+      AND (
+        (
+          f.source_appel_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM public.appels a WHERE a.id = f.source_appel_id
+          )
+        )
+        OR
+        (
+          f.source_appel_id IS NULL
+          AND f.deleted_at < NOW() - p_retain_without_source
+        )
+      )
+    ORDER BY f.deleted_at, f.id
+    FOR UPDATE SKIP LOCKED
+    LIMIT p_batch_size
+  ), purged AS (
+    DELETE FROM public.file_deletions_outbox f
+    USING candidates c
+    WHERE f.id = c.id
+    RETURNING 1
+  )
+  SELECT COUNT(*)::INTEGER INTO v_purged FROM purged;
+
+  RETURN v_purged;
+END;
+$$;
+
+COMMENT ON FUNCTION public.purge_terminal_file_deletions(INTERVAL, INTEGER) IS
+  'Purge les preuves deleted/not_found avec la ligne appels d''origine; '
+  'sans source, conserve 24 mois par defaut. Batch ordonne, concurrent via '
+  'FOR UPDATE SKIP LOCKED, borne a 1000 lignes. Ne purge jamais dead_letter.';
+
+REVOKE ALL ON FUNCTION public.purge_terminal_file_deletions(INTERVAL, INTEGER) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.purge_terminal_file_deletions(INTERVAL, INTEGER) FROM anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.purge_terminal_file_deletions(INTERVAL, INTEGER) TO service_role;
+
+DO $$
+BEGIN
+  PERFORM cron.unschedule('purge-terminal-file-deletions');
+EXCEPTION WHEN OTHERS THEN
+  NULL;
+END $$;
+
+SELECT cron.schedule(
+  'purge-terminal-file-deletions',
+  '37 4 1 * *',
+  $$ SELECT public.purge_terminal_file_deletions(); $$
+);
+
+
+-- -----------------------------------------------------------------------------
+-- 6. NOTE POUR LE BACKEND (contrat d'utilisation de claim_file_deletions)
 -- -----------------------------------------------------------------------------
 -- 1. Signature d'appel supabase-js :
 --
@@ -239,10 +592,17 @@ GRANT  EXECUTE ON FUNCTION public.claim_file_deletions(TEXT, INTEGER, INTEGER) T
 --
 -- 2. Après suppression physique confirmée :
 --
---      UPDATE public.file_deletions_outbox
---      SET status = 'deleted', deleted_at = NOW(),
---          locked_at = NULL, locked_by = NULL, last_error = NULL
---      WHERE id = $1;
+--      supabase.rpc('complete_file_deletion', {
+--        p_deletion_id: row.id,
+--        p_worker_id: workerId,
+--        p_locked_at: row.locked_at,
+--        p_status: 'deleted',
+--      });
+--
+--    `row.locked_at` est un jeton opaque : transmettre la chaine renvoyee par
+--    le claim sans passage par Date, qui pourrait perdre des microsecondes.
+--    La RPC retourne 'deleted', ou NULL si le worker a perdu son lease.
+--    Un retour NULL interdit toute autre transition ou alerte par ce worker.
 --
 --    Le CHECK `chk_deleted_at_consistency` (20260730130000) impose
 --    `deleted_at IS NOT NULL` pour les statuts terminaux 'deleted' et
@@ -251,10 +611,12 @@ GRANT  EXECUTE ON FUNCTION public.claim_file_deletions(TEXT, INTEGER, INTEGER) T
 -- 3. IDEMPOTENCE — fichier déjà absent côté cible (bucket ou API Retell) :
 --    c'est un succès. Utiliser :
 --
---      UPDATE public.file_deletions_outbox
---      SET status = 'not_found', deleted_at = NOW(),
---          locked_at = NULL, locked_by = NULL
---      WHERE id = $1;
+--      supabase.rpc('complete_file_deletion', {
+--        p_deletion_id: row.id,
+--        p_worker_id: workerId,
+--        p_locked_at: row.locked_at,
+--        p_status: 'not_found',
+--      });
 --
 --    Un DELETE Storage sur clé absente ne doit PAS repartir en retry — sinon
 --    on épuise `max_attempts` sur une opération qui n'a rien à faire.
@@ -268,11 +630,18 @@ GRANT  EXECUTE ON FUNCTION public.claim_file_deletions(TEXT, INTEGER, INTEGER) T
 --    contenant PII — ce n'est pas le cas ici puisque `object_path` est
 --    `{uuid}/{yyyy-mm}/{uuid}.pdf`, mais règle générale à respecter).
 --
--- 5. Alerting dead_letter : la table n'a PAS de colonne
---    `dead_letter_alerted_at` (contrairement à `jobs`, cf. 20260801000000).
---    Le poller backend devra soit l'ajouter dans une migration ultérieure,
---    soit tenir un registre côté API. À arbitrer au moment du branchement
---    du consommateur — pas dans le scope de cette migration.
+-- 5. Echec : appeler `fail_file_deletion` avec p_deletion_id, p_worker_id,
+--    p_locked_at recu du claim sans conversion, p_error deja redacte et
+--    p_backoff_seconds. La RPC retourne pending, dead_letter, ou NULL si le
+--    lease a ete perdu.
+--
+-- 6. Alerting persistant : un poller API appelle
+--    `claim_file_deletion_dead_letter_alerts`, remet l'alerte, puis appelle
+--    `mark_file_deletion_dead_letter_alerted` avec p_alerter_id ET le
+--    dead_letter_alert_locked_at renvoye par le claim, sans conversion. Si la
+--    remise echoue, appeler `release_file_deletion_dead_letter_alert` avec le
+--    meme couple de lease; un crash est repris apres le TTL. Cela couvre aussi
+--    les dead_letter crees par le cron SQL.
 
 
 -- =============================================================================

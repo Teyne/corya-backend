@@ -206,6 +206,32 @@ GRANT  EXECUTE ON FUNCTION public.worker_heartbeat_deletion_poll(TEXT, BIGINT) T
 -- ou l'alive-tick indépendant). Aucun changement requis.
 
 
+-- -----------------------------------------------------------------------------
+-- 5. Marqueur de contrat vague 7
+-- -----------------------------------------------------------------------------
+-- Cette RPC n'existe qu'apres application ordonnee de 20260802000000 a
+-- 20260802000003. Le backend peut donc refuser de demarrer la nouvelle boucle
+-- tant que la valeur 7 n'est pas disponible.
+
+CREATE OR REPLACE FUNCTION public.get_wave7_contract_version()
+RETURNS INTEGER
+LANGUAGE sql
+IMMUTABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+  SELECT 7::INTEGER;
+$$;
+
+COMMENT ON FUNCTION public.get_wave7_contract_version() IS
+  'Retourne 7. Sa presence prouve l''application ordonnee complete des '
+  'migrations vague 7 20260802000000 a 20260802000003.';
+
+REVOKE ALL ON FUNCTION public.get_wave7_contract_version() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.get_wave7_contract_version() FROM anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.get_wave7_contract_version() TO service_role;
+
+
 -- =============================================================================
 -- Fin de migration.
 -- =============================================================================

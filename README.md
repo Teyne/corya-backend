@@ -18,11 +18,43 @@ npm ci
 npm run dev
 npm run worker:dev
 npm test -- --run
+npm run test:e2e
 npm run type-check
 npm run lint
+npm run build
 ```
 
 Copier `.env.example` vers `.env.local`, sans versionner les secrets. L'API et le worker sont des processus distincts en production. Aucun déploiement Jelastic ni application de migration distante n'est automatique depuis ce dépôt.
+
+## Vague 7 : prérequis de mise en service
+
+La vague 7 rend effective la suppression physique issue de
+`file_deletions_outbox`, avec deux protections : les finalisations sont
+fencées par le lease exact `(worker_id, locked_at)`, et les alertes
+`dead_letter` sont réclamées et acquittées durablement par le poller API.
+Les preuves terminales `deleted` / `not_found` sont purgées avec l'appel
+source ; sans appel source, elles sont conservées au plus 24 mois. Les
+`dead_letter` restent visibles jusqu'à remédiation manuelle.
+
+Avant toute publication, vérifier avec `supabase migration list` que les
+quatre migrations `20260802000000` à `20260802000003` ne sont réellement pas
+appliquées à la cible. Elles sont append-only : si l'une est déjà appliquée,
+ne jamais la réécrire ; créer une migration correctrice. Après autorisation,
+les appliquer strictement dans cet ordre, puis déployer l'API et le worker.
+Les deux processus refusent de démarrer si le marqueur SQL de contrat vague 7
+n'est pas exactement `7`.
+
+Pour le contrat SQL, uniquement sur une base Supabase locale jetable après
+application des migrations :
+
+```bash
+supabase start
+supabase db reset
+psql "postgresql://postgres:postgres@127.0.0.1:54322/postgres" -v ON_ERROR_STOP=1 -f supabase/tests/wave7_invariants.sql
+```
+
+Le script utilise uniquement des identifiants synthétiques et annule ses
+mutations. Il ne doit jamais viser une base distante.
 
 ## Documentation de référence
 

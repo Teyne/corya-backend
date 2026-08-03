@@ -41,6 +41,7 @@ import type { Transporter } from 'nodemailer';
 import type {
   AppelProcessingRow,
   CabinetProcessingRow,
+  FileDeletion,
   Job,
   JobInsertRow,
   JobType,
@@ -56,6 +57,7 @@ export interface E2eStore {
   cabinets: Map<string, CabinetProcessingRow & { numero_corya: string }>;
   appels: Map<string, AppelProcessingRow>;
   jobs: Map<string, Job>;
+  deletions: Map<string, FileDeletion>;
   heartbeats: Map<string, WorkerHeartbeatRow>;
   cronRows: CronHealthRow[];
 }
@@ -64,6 +66,7 @@ export const store: E2eStore = {
   cabinets: new Map(),
   appels: new Map(),
   jobs: new Map(),
+  deletions: new Map(),
   heartbeats: new Map(),
   cronRows: [],
 };
@@ -72,13 +75,19 @@ export function resetStore(): void {
   store.cabinets.clear();
   store.appels.clear();
   store.jobs.clear();
+  store.deletions.clear();
   store.heartbeats.clear();
   store.cronRows = [];
 }
 
 let jobSeq = 1;
+let deletionSeq = 1;
 function nextJobId(): string {
   return `job-${jobSeq++}`;
+}
+
+function nextDeletionId(): string {
+  return `deletion-${deletionSeq++}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +334,65 @@ export function installQueryMocks(): void {
         if (j) j.payload = payload;
         return Promise.resolve();
       },
+      // ---------- physical deletion outbox ----------
+      claimFileDeletions: (
+        workerId: string,
+        batchSize: number,
+        staleAfterSeconds: number,
+      ): Promise<FileDeletion[]> => {
+        const now = Date.now();
+        const claimed: FileDeletion[] = [];
+        for (const row of store.deletions.values()) {
+          if (claimed.length >= batchSize) break;
+          if (row.attempts >= row.max_attempts) continue;
+          const pending = row.status === 'pending' && new Date(row.run_after).getTime() <= now;
+          const zombie = row.status === 'processing' && row.locked_at !== null &&
+            now - new Date(row.locked_at).getTime() > staleAfterSeconds * 1_000;
+          if (!pending && !zombie) continue;
+          row.status = 'processing';
+          row.locked_at = new Date().toISOString();
+          row.locked_by = workerId;
+          row.attempts += 1;
+          claimed.push({ ...row });
+        }
+        return Promise.resolve(claimed);
+      },
+      completeFileDeletion: (
+        claimed: FileDeletion,
+        workerId: string,
+        status: 'deleted' | 'not_found',
+      ): Promise<'deleted' | 'not_found' | null> => {
+        const row = store.deletions.get(claimed.id);
+        if (!row || row.status !== 'processing' || row.locked_by !== workerId ||
+            row.locked_at !== claimed.locked_at) return Promise.resolve(null);
+        row.status = status;
+        row.deleted_at = new Date().toISOString();
+        row.locked_at = null;
+        row.locked_by = null;
+        row.last_error = null;
+        return Promise.resolve(status);
+      },
+      failFileDeletion: (
+        claimed: FileDeletion,
+        workerId: string,
+        errorMessage: string,
+        backoffSeconds: number,
+      ): Promise<'pending' | 'dead_letter' | null> => {
+        const row = store.deletions.get(claimed.id);
+        if (!row || row.status !== 'processing' || row.locked_by !== workerId ||
+            row.locked_at !== claimed.locked_at) return Promise.resolve(null);
+        row.status = row.attempts >= row.max_attempts ? 'dead_letter' : 'pending';
+        row.run_after = row.status === 'pending'
+          ? new Date(Date.now() + backoffSeconds * 1_000).toISOString()
+          : row.run_after;
+        row.locked_at = null;
+        row.locked_by = null;
+        row.last_error = errorMessage.slice(0, 500);
+        row.dead_letter_alert_locked_at = null;
+        row.dead_letter_alert_locked_by = null;
+        return Promise.resolve(row.status);
+      },
+      workerHeartbeatDeletionPoll: (): Promise<void> => Promise.resolve(),
       // ---------- heartbeats ----------
       workerHeartbeatAlive: (
         workerId: string,
@@ -395,6 +463,50 @@ export function installQueryMocks(): void {
         if (j) j.dead_letter_alerted_at = new Date().toISOString();
         return Promise.resolve();
       },
+      claimFileDeletionDeadLetterAlerts: (
+        alerterId: string,
+        batchSize: number,
+        staleAfterSeconds: number,
+      ): Promise<FileDeletion[]> => {
+        const now = Date.now();
+        const claimed: FileDeletion[] = [];
+        for (const row of store.deletions.values()) {
+          if (claimed.length >= batchSize) break;
+          const lockStale = row.dead_letter_alert_locked_at !== null &&
+            now - new Date(row.dead_letter_alert_locked_at).getTime() > staleAfterSeconds * 1_000;
+          if (row.status !== 'dead_letter' || row.dead_letter_alerted_at !== null ||
+              (row.dead_letter_alert_locked_at !== null && !lockStale)) continue;
+          row.dead_letter_alert_locked_at = new Date().toISOString();
+          row.dead_letter_alert_locked_by = alerterId;
+          claimed.push({ ...row });
+        }
+        return Promise.resolve(claimed);
+      },
+      markFileDeletionDeadLetterAlerted: (
+        deletionId: string,
+        alerterId: string,
+        lockedAt: string,
+      ): Promise<boolean> => {
+        const row = store.deletions.get(deletionId);
+        if (!row || row.dead_letter_alert_locked_by !== alerterId ||
+            row.dead_letter_alert_locked_at !== lockedAt) return Promise.resolve(false);
+        row.dead_letter_alerted_at = new Date().toISOString();
+        row.dead_letter_alert_locked_at = null;
+        row.dead_letter_alert_locked_by = null;
+        return Promise.resolve(true);
+      },
+      releaseFileDeletionDeadLetterAlert: (
+        deletionId: string,
+        alerterId: string,
+        lockedAt: string,
+      ): Promise<boolean> => {
+        const row = store.deletions.get(deletionId);
+        if (!row || row.dead_letter_alert_locked_by !== alerterId ||
+            row.dead_letter_alert_locked_at !== lockedAt) return Promise.resolve(false);
+        row.dead_letter_alert_locked_at = null;
+        row.dead_letter_alert_locked_by = null;
+        return Promise.resolve(true);
+      },
       // ---------- health ----------
       pingDb: (_timeoutMs: number): Promise<void> => Promise.resolve(),
       getMostRecentHeartbeat: (): Promise<{ last_seen_at: string } | null> => {
@@ -403,6 +515,16 @@ export function installQueryMocks(): void {
           if (latest === null || h.last_seen_at > latest) latest = h.last_seen_at;
         }
         return Promise.resolve(latest ? { last_seen_at: latest } : null);
+      },
+      getMostRecentDeletionPoll: (): Promise<{ last_deletion_poll_at: string } | null> => {
+        let latest: string | null = null;
+        for (const h of store.heartbeats.values()) {
+          if (h.last_deletion_poll_at !== null &&
+              (latest === null || h.last_deletion_poll_at > latest)) {
+            latest = h.last_deletion_poll_at;
+          }
+        }
+        return Promise.resolve(latest ? { last_deletion_poll_at: latest } : null);
       },
       getCronHealth: (): Promise<CronHealthRow[]> =>
         Promise.resolve(store.cronRows),
@@ -479,6 +601,37 @@ export function insertJobDirect(overrides?: Partial<Job>): Job {
   };
   store.jobs.set(id, j);
   return j;
+}
+
+/** Insert a physical-deletion order directly for resilience tests. */
+export function insertDeletionDirect(overrides?: Partial<FileDeletion>): FileDeletion {
+  const id = overrides?.id ?? nextDeletionId();
+  const row: FileDeletion = {
+    id,
+    target: overrides?.target ?? 'supabase_storage',
+    bucket: overrides?.bucket ?? 'pdf-recaps',
+    object_path: overrides?.object_path ?? 'cabinet/month/appel.pdf',
+    external_ref: overrides?.external_ref ?? null,
+    reason: overrides?.reason ?? 'appel_purged_24m',
+    status: overrides?.status ?? 'pending',
+    attempts: overrides?.attempts ?? 0,
+    max_attempts: overrides?.max_attempts ?? 3,
+    run_after: overrides?.run_after ?? new Date().toISOString(),
+    locked_at: overrides?.locked_at ?? null,
+    locked_by: overrides?.locked_by ?? null,
+    last_error: overrides?.last_error ?? null,
+    enqueued_by: overrides?.enqueued_by ?? 'e2e',
+    source_appel_id: overrides?.source_appel_id ?? null,
+    source_cabinet_id: overrides?.source_cabinet_id ?? null,
+    created_at: overrides?.created_at ?? new Date().toISOString(),
+    updated_at: overrides?.updated_at ?? new Date().toISOString(),
+    deleted_at: overrides?.deleted_at ?? null,
+    dead_letter_alerted_at: overrides?.dead_letter_alerted_at ?? null,
+    dead_letter_alert_locked_at: overrides?.dead_letter_alert_locked_at ?? null,
+    dead_letter_alert_locked_by: overrides?.dead_letter_alert_locked_by ?? null,
+  };
+  store.deletions.set(id, row);
+  return row;
 }
 
 /** Insert an appel directly (used when seeding a worker test scenario). */
