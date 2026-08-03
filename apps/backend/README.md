@@ -43,7 +43,7 @@ s'exécute, après le build, avec npm run preflight:jelastic -- --role api ou
 --role worker.
 
 La documentation d'architecture et les opérations de déploiement sont à la
-racine du dépôt. Les migrations `20260802000000` à `20260802000003` doivent
-précéder le déploiement de ce worker, dans cet ordre. Avant publication,
-confirmer qu'elles ne sont pas déjà appliquées ; une migration appliquée ne se
-réécrit jamais, elle se corrige par une nouvelle migration.
+racine du dépôt. Les migrations `20260802000000` à `20260802000003` sont
+appliquées à distance depuis le 3 août 2026. Elles ne se réécrivent jamais :
+le correctif runtime de `get_cron_health()` est donc livré dans la migration
+append-only `20260803000000`, à appliquer avant l'activation des processus.

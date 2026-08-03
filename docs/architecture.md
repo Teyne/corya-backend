@@ -1,13 +1,15 @@
 # Architecture technique Corya
 
-État local vérifié le 3 août 2026. Les changements vague 7 restent à publier.
+État vérifié le 3 août 2026. Le schéma vague 7 est appliqué à distance ;
+les environnements Jelastic d'essai sont préparés mais restent inactifs tant
+que la migration corrective runtime `20260803000000` n'est pas appliquée.
 
 ## Composants
 
 | Composant | Technologie | État |
 |---|---|---|
-| API `api.corya.ch` | Node.js, Express, TypeScript | implémentée, non déployée sur Jelastic dans ce dépôt |
-| Worker | même paquet npm, processus séparé | implémenté |
+| API `api.corya.ch` | Node.js, Express, TypeScript | archive d'essai déployée sur Jelastic, processus arrêté |
+| Worker | même paquet npm, processus séparé | archive d'essai déployée, Chromium validé, processus arrêté |
 | Données | Supabase Postgres + Storage privé | schéma versionné par migrations |
 | Téléphonie | Retell AI + SDK officiel | webhook et suppression d'appel implémentés |
 | PDF | Puppeteer | implémenté |
@@ -56,18 +58,19 @@ aboutie et reste remédiable.
 
 ## Déploiement restant
 
-Les migrations `20260802000000` à `20260802000003` doivent être appliquées
-dans l'ordre avant l'API et le nouveau worker. Elles sont append-only : avant
-publication, confirmer avec `supabase migration list` que les quatre versions
-sont réellement absentes de la cible. Si l'une existe déjà, ne pas modifier le
-fichier historique ; créer une migration correctrice.
+Les migrations `20260802000000` à `20260802000003` sont appliquées à distance
+depuis le 3 août 2026. Le premier boot API a exposé le conflit PL/pgSQL de
+`get_cron_health()` ; les fichiers historiques restent immuables et la
+correction est append-only dans `20260803000000`. L'API et le worker restent
+arrêtés jusqu'à son application et au traitement du heartbeat de développement
+historique qui a déclenché une alerte `worker_stale`.
 
 Le marqueur SQL `get_wave7_contract_version() = 7` est vérifié au démarrage de
 l'API et du worker. Un schéma incomplet provoque donc un échec de démarrage,
 avant trafic HTTP ou consommation de l'outbox. Après autorisation, renseigner
-`FILE_DELETION_*`, vérifier Retell/SMTP/Storage, appliquer les migrations,
-déployer API puis worker, et contrôler `/health/deep`, les deux heartbeats et
-les dix crons. Le test SQL local est :
+`FILE_DELETION_*`, vérifier Retell/SMTP/Storage, appliquer la correction,
+activer l'API puis le worker, et contrôler `/health/deep`, les deux heartbeats
+et les dix crons. Le test SQL local est :
 
 ```bash
 supabase start

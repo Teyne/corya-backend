@@ -8,14 +8,16 @@ et n'autorise aucune opération Supabase, Retell, Storage ou SMTP.
 Utiliser deux environnements Jelastic Node.js natifs distincts, sans addon de
 base de données. Supabase Postgres et Storage restent externes.
 
-| Environnement | Rôle | Runtime | Essai initial | Exposition |
+| Environnement | Rôle | Runtime | Ressources d'essai | Exposition |
 |---|---|---|---:|---|
-| corya-api | API Express et pollers d'alertes | Node.js 24.18.0 | 2 Cloudlets | HTTPS public |
-| corya-worker | jobs, PDF et outbox de suppressions | Node.js 24.18.0 | 6 Cloudlets | aucune |
+| corya-api | API Express et pollers d'alertes | Node.js 24.18.0 | 1 réservé / max 4 dynamiques | HTTPS public |
+| corya-worker | jobs, PDF et outbox de suppressions | Node.js 24.18.0 | 1 réservé / max 8 dynamiques | aucune |
 
-L'essai consomme ainsi ses 8 Cloudlets. Garder exactement un nœud et une
-instance PM2 par environnement. Le worker d'essai doit utiliser
-JOB_BATCH_SIZE=1 pour borner le nombre de pages Chromium simultanées.
+Garder exactement un nœud et une instance PM2 par environnement. Le worker
+d'essai doit utiliser JOB_BATCH_SIZE=1 pour borner le nombre de pages Chromium
+simultanées. Quatre Cloudlets (512 Mio) ont saturé pendant le smoke-test ; dix
+rendus séquentiels ont réussi avec huit Cloudlets (1 Gio), pour un pic total
+mesuré à 689,4 Mio et sans processus Chromium résiduel.
 
 Ne pas démarrer corya-api et corya-worker dans le même environnement.
 N'ajouter ni PostgreSQL, ni autre base, ni bucket dans Jelastic.
@@ -143,7 +145,8 @@ avant d'avoir mesuré la mémoire du worker sur plusieurs rendus.
 
 ### PORT et santé API
 
-1. Laisser Jelastic injecter un port non standard.
+1. Vérifier `PORT` dans le shell. Sur l'environnement natif testé, Jelastic
+   ne l'injectait pas ; `PORT=8080` a donc été configuré explicitement.
 2. Exécuter le préflight API, puis démarrer uniquement corya-api.
 3. Confirmer que le log de démarrage annonce le port attendu, sans secret.
 4. Vérifier GET /health sur le routage Jelastic.
@@ -188,7 +191,8 @@ contrôlée sur un compte payant.
 
 Cet ordre nécessite des autorisations séparées :
 
-1. appliquer les migrations 20260802000000 à 20260802000003 dans l'ordre ;
+1. confirmer les migrations 20260802000000 à 20260802000003 puis appliquer
+   la corrective append-only 20260803000000 ;
 2. vérifier get_wave7_contract_version() = 7 ;
 3. déployer et valider l'API ;
 4. déployer et valider le worker.

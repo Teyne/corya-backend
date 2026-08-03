@@ -1,9 +1,10 @@
 # Registre des activités de traitement — Corya
 
-> **Note d'état — 2 août 2026.** BetterStack est envisagé, pas actif confirmé.
-> Les suppressions physiques et la purge `logs_actions` sont livrées dans le
-> code et les migrations locales, mais ne deviennent effectives qu'après
-> migration et déploiement. Les droits sont actuellement traités manuellement.
+> **Note d'état — 3 août 2026.** BetterStack est envisagé, pas actif confirmé.
+> Les migrations des suppressions physiques et de la purge `logs_actions`
+> sont appliquées à distance, mais les traitements ne deviennent effectifs
+> qu'après la correction runtime `20260803000000` et l'activation contrôlée du
+> worker. Les droits sont actuellement traités manuellement.
 >
 > Le site public séparé utilise Lovable, Cloudflare et, lorsque ses secrets
 > runtime sont configurés, Resend pour le formulaire de contact. Une mesure

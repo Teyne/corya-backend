@@ -572,6 +572,14 @@ BEGIN
   WHERE active = true;
   PERFORM pg_temp.assert_true(v_count = 10, 'active cron count is not 10');
 
+  -- Exercise the runtime RPC itself. The previous harness inspected the cron
+  -- inventory but missed a PL/pgSQL name conflict in its auto-registration
+  -- INSERT, which only appeared on the first deployed API boot.
+  SELECT COUNT(*)::INTEGER
+  INTO v_count
+  FROM public.get_cron_health();
+  PERFORM pg_temp.assert_true(v_count = 10, 'get_cron_health did not return all active crons');
+
   WITH expected(jobname) AS (
     VALUES
       ('purge-expired-audio'::TEXT),

@@ -36,13 +36,13 @@ Les preuves terminales `deleted` / `not_found` sont purgées avec l'appel
 source ; sans appel source, elles sont conservées au plus 24 mois. Les
 `dead_letter` restent visibles jusqu'à remédiation manuelle.
 
-Avant toute publication, vérifier avec `supabase migration list` que les
-quatre migrations `20260802000000` à `20260802000003` ne sont réellement pas
-appliquées à la cible. Elles sont append-only : si l'une est déjà appliquée,
-ne jamais la réécrire ; créer une migration correctrice. Après autorisation,
-les appliquer strictement dans cet ordre, puis déployer l'API et le worker.
-Les deux processus refusent de démarrer si le marqueur SQL de contrat vague 7
-n'est pas exactement `7`.
+Les quatre migrations `20260802000000` à `20260802000003` ont été appliquées
+à la cible le 3 août 2026 et le contrat distant retourne `7`. Elles restent
+append-only et ne doivent jamais être réécrites. Le premier smoke API distant
+a exposé une ambiguïté PL/pgSQL dans `get_cron_health()` ; la migration
+correctrice `20260803000000` doit être appliquée avant l'activation de l'API et
+du worker. Les deux processus refusent de démarrer si le marqueur SQL de
+contrat vague 7 n'est pas exactement `7`.
 
 Pour le contrat SQL, uniquement sur une base Supabase locale jetable après
 application des migrations :

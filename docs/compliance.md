@@ -4,9 +4,9 @@
 > endpoints automatisés d'exercice des droits ne sont pas actifs/confirmés.
 > Les demandes passent actuellement par le contact publié et un traitement
 > manuel sous 30 jours. La suppression physique Storage/Retell et la purge
-> des logs à 24 mois sont implémentées localement, mais dépendent de
-> l'application des migrations `20260802000000` à `20260802000003` et du
-> déploiement du nouveau worker.
+> des logs à 24 mois sont migrées à distance depuis le 3 août 2026, mais ne
+> deviennent opérationnelles qu'après la migration corrective
+> `20260803000000` et l'activation contrôlée du nouveau worker.
 
 **Ce document est la bible compliance de Corya. Tous les agents s'y réfèrent.**
 
