@@ -1,6 +1,7 @@
 # @corya/backend
 
-API Express et worker TypeScript de Corya. Prérequis : Node 20+ et npm 10+.
+API Express et worker TypeScript de Corya. Prérequis : Node.js 24 LTS
+(24.18.0 ciblé sur Jelastic) et npm 10+.
 
 ## Installation et validation
 
@@ -13,6 +14,8 @@ npm test -- --run
 npm run test:e2e
 npm run type-check
 npm run lint
+npm run build
+npm run smoke:puppeteer -- --renders 3 --timeout-ms 15000
 ```
 
 La configuration est lue depuis `apps/backend/.env.local`, puis depuis le `.env.local` à la racine du dépôt. Copier la racine `.env.example`; Supabase et Retell sont obligatoires. SMTP, token de health et alertes deviennent obligatoires en production selon la validation Zod.
@@ -34,6 +37,10 @@ résultat `degraded`. `?full=1` ajoute un vrai `verify()` SMTP. Sans
 `HEALTH_DEEP_CACHE_MS`.
 
 Les tests unitaires et e2e sont hermétiques : pas de DB, SMTP, Retell ou Chromium réel. Les scripts de diagnostic ne partagent pas tous cette garantie ; lire `scripts/README.md` avant usage.
+
+Le préflight Jelastic est documenté dans docs/jelastic-deployment.md et
+s'exécute, après le build, avec npm run preflight:jelastic -- --role api ou
+--role worker.
 
 La documentation d'architecture et les opérations de déploiement sont à la
 racine du dépôt. Les migrations `20260802000000` à `20260802000003` doivent

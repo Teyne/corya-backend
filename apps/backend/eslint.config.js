@@ -10,7 +10,13 @@ export default tseslint.config(
     // scripts/copy-templates.mjs is a plain post-build helper (no TS
     // parsing needed) — excluded so the typed lint stack doesn't complain
     // about it living outside the TS project graph.
-    ignores: ['dist/**', 'node_modules/**', 'coverage/**', 'scripts/**/*.mjs'],
+    ignores: [
+      'dist/**',
+      'node_modules/**',
+      'coverage/**',
+      'scripts/copy-templates.mjs',
+      'ecosystem.config.cjs',
+    ],
   },
   ...tseslint.configs.recommendedTypeChecked,
   {
@@ -34,7 +40,13 @@ export default tseslint.config(
   },
   {
     // Config/build files sit outside the TS project graph.
-    files: ['vitest.config.ts', 'vitest.e2e.config.ts', 'eslint.config.js'],
+    files: [
+      'vitest.config.ts',
+      'vitest.e2e.config.ts',
+      'eslint.config.js',
+      'scripts/preflight-jelastic.mjs',
+      'scripts/smoke-puppeteer.mjs',
+    ],
     ...tseslint.configs.disableTypeChecked,
     languageOptions: {
       parserOptions: {
