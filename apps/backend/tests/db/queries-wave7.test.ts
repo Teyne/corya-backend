@@ -29,6 +29,7 @@ const {
   getMostRecentDeletionPoll,
   getWave7ContractVersion,
   markFileDeletionDeadLetterAlerted,
+  persistCallAnalyzed,
   releaseFileDeletionDeadLetterAlert,
 } = await import('../../src/db/queries.js');
 
@@ -90,6 +91,37 @@ describe('Wave 7 deletion-loop health query', () => {
     expect(selectMock).toHaveBeenCalledWith('last_deletion_poll_at');
     expect(notMock).toHaveBeenCalledWith('last_deletion_poll_at', 'is', null);
     expect(orderMock).toHaveBeenCalledWith('last_deletion_poll_at', { ascending: false });
+  });
+});
+
+describe('call_analyzed atomic intake RPC wrapper', () => {
+  it('passes the complete durable intent in one bounded RPC', async () => {
+    queueRpcResult([{ appel_id: 'appel-atomic', duplicate: false }]);
+    const appel = {
+      cabinet_id: 'cabinet-1', retell_call_id: 'call-1',
+      date_appel: '2026-08-04T00:00:00.000Z', duree_secondes: 12,
+      numero_appelant_hash: null, numero_appelant_masque: null,
+      resultat: null, motif_appel: null, patient_nom: null,
+      patient_prenom: null, patient_telephone: null, rdv_date: null,
+      rdv_praticien: null, transcript: null, transcript_anonymise: null,
+      audio_url: null, audio_expires_at: null,
+    };
+
+    await expect(persistCallAnalyzed({
+      appel,
+      processAppelPayload: { version: 1, to: 'synthetic@example.invalid', cc: null, steps: {} },
+      purgeAudioPayload: { retell_call_id: 'call-1' },
+      purgeRunAfter: '2026-08-05T00:00:00.000Z',
+      correlationId: 'correlation-1',
+    })).resolves.toEqual({ appelId: 'appel-atomic', duplicate: false });
+
+    expect(rpcMock).toHaveBeenCalledWith('persist_call_analyzed', {
+      p_appel: appel,
+      p_process_payload: { version: 1, to: 'synthetic@example.invalid', cc: null, steps: {} },
+      p_purge_payload: { retell_call_id: 'call-1' },
+      p_purge_run_after: '2026-08-05T00:00:00.000Z',
+      p_correlation_id: 'correlation-1',
+    });
   });
 });
 

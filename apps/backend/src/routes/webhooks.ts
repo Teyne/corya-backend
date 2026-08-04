@@ -18,7 +18,8 @@
  *     un rejeu HTTP côté Retell. En particulier :
  *       * `call_started` / `call_ended` (connus, notification-only) → 200
  *         + log info, zéro accès DB.
- *       * `call_analyzed` (connu, valide) → 200 immédiat + traitement async.
+ *       * `call_analyzed` (connu, valide) → 200 après persistance atomique
+ *         de l'appel et de ses deux jobs.
  *       * Événement AUTHENTIFIÉ mais TYPE INCONNU (ex: `agent_created`,
  *         `phone_number_updated`, ou n'importe quel event que le fondateur
  *         activerait un jour dans le dashboard sans qu'on l'ait câblé ici)
@@ -58,6 +59,7 @@ import {
   verifyRetellSignature,
 } from '../services/retell.js';
 import { RetellSignatureError, toLogFields, WebhookValidationError } from '../utils/errors.js';
+import { consumeAuthenticatedWebhookRateLimit } from '../middleware/rate-limit.js';
 
 /**
  * Extend Express' Request type locally: the raw body Buffer captured by the
@@ -99,6 +101,10 @@ webhooksRouter.post(
       res.status(err.httpStatus).json({ error: err.message });
       return;
     }
+
+    // The outer ingress budget bounds arbitrary traffic. Only an accepted
+    // Retell signature consumes the separate business quota below.
+    if (!consumeAuthenticatedWebhookRateLimit(req, res)) return;
 
     // 2. Payload validation.
     //
@@ -188,11 +194,8 @@ webhooksRouter.post(
     }
 
     // event.event === 'call_analyzed' — the only path that touches the DB.
-    // Respond 200 immediately, then process in background.
-    res.status(200).json({ received: true, event: event.event });
-
-    // Fire-and-forget: we own retries via the jobs table. Any thrown error
-    // is caught here and logged; Retell must NEVER see it.
+    // Acknowledge only after the appel and both jobs are committed atomically.
+    // A bounded DB failure becomes a 5xx so Retell can safely replay it.
     //
     // nLPD guardrail (session 3.1, database-compliance audit): we log ONLY
     // the error CLASS NAME, never `err.message`. Downstream DB helpers
@@ -207,19 +210,22 @@ webhooksRouter.post(
     // correlation.ts) so it flows into jobs.correlation_id and every
     // downstream log. Fallback to null when for some reason the middleware
     // did not run — retell_call_id stays available as a distinct log field.
-    const payload = event;
     const correlationId = req.correlationId ?? null;
-    void processCallAnalyzed(payload, correlationId).catch((err: unknown) => {
+    try {
+      await processCallAnalyzed(event, correlationId);
+      res.status(200).json({ received: true, event: event.event });
+    } catch (err: unknown) {
       // `toLogFields` scrubs any patient phone number that could appear in
       // a raw PG or SDK error message before it reaches the log stream.
       logger.error(
         {
-          retell_call_id: payload.call.call_id,
+          retell_call_id: event.call.call_id,
           correlation_id: correlationId,
           ...toLogFields(err),
         },
-        'webhook_async_processing_failed',
+        'webhook_persistence_failed',
       );
-    });
+      throw err;
+    }
   },
 );

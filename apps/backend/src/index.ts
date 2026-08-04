@@ -68,6 +68,23 @@ const allowedOrigins = env.CORS_ORIGIN.split(',')
   .map((o) => o.trim())
   .filter((o) => o.length > 0);
 
+// Install request identity and safe logging before any middleware that can
+// reject attacker-controlled input (notably CORS and JSON parsing). This
+// guarantees that even early pipeline failures have a correlation id and a
+// redacted request-scoped logger.
+app.use(
+  pinoHttp(buildHttpLoggerOptions(logger)),
+);
+app.use(correlationMiddleware);
+// Expose the correlation header for CORS-mode reads by the browser.
+app.use((_req, res, next) => {
+  const existing = res.getHeader('Access-Control-Expose-Headers');
+  const list = typeof existing === 'string' ? existing.split(',').map((s) => s.trim()) : [];
+  if (!list.includes(CORRELATION_HEADER)) list.push(CORRELATION_HEADER);
+  res.setHeader('Access-Control-Expose-Headers', list.join(', '));
+  next();
+});
+
 app.use(
   cors({
     origin: (origin, cb) => {
@@ -77,7 +94,9 @@ app.use(
         cb(null, true);
         return;
       }
-      cb(new Error(`CORS: origin ${origin} not allowed`));
+      // Keep attacker-controlled Origin values out of error messages: the
+      // pipeline logs only bounded diagnostics and never needs the value.
+      cb(new Error('cors_origin_not_allowed'));
     },
     credentials: true,
   }),
@@ -94,23 +113,6 @@ app.use(
     },
   }),
 );
-
-app.use(
-  pinoHttp(buildHttpLoggerOptions(logger)),
-);
-
-// Middleware order matters: pino-http first (stamps req.id via genReqId),
-// then our correlation middleware (writes req.correlationId + response
-// header). Both derive from the same regex so the values match.
-app.use(correlationMiddleware);
-// Expose the correlation header for CORS-mode reads by the browser.
-app.use((_req, res, next) => {
-  const existing = res.getHeader('Access-Control-Expose-Headers');
-  const list = typeof existing === 'string' ? existing.split(',').map((s) => s.trim()) : [];
-  if (!list.includes(CORRELATION_HEADER)) list.push(CORRELATION_HEADER);
-  res.setHeader('Access-Control-Expose-Headers', list.join(', '));
-  next();
-});
 
 // ---------------------------------------------------------------------------
 // Routes
@@ -133,17 +135,45 @@ app.use('/health', healthRouter);
 // Never leaks stack traces in production.
 // ---------------------------------------------------------------------------
 const errorHandler: ErrorRequestHandler = (err, req, res, _next) => {
-  // pino-http attached a request-scoped logger to req.log.
-  req.log.error({ ...toLogFields(err) }, 'unhandled error in request pipeline');
+  let errorName = 'Error';
+  try {
+    if (err instanceof Error && err.name.length > 0) errorName = err.name;
+  } catch {
+    // Hostile throwable objects (for example getters that throw) must not be
+    // able to break either logging or the generic error response.
+  }
+
+  // Logging an error must never replace the original request failure with a
+  // second exception. pino-http normally supplies req.log, while the base
+  // logger remains a defensive fallback for unusual middleware/test paths.
+  try {
+    const requestLogger = req.log ?? logger;
+    requestLogger.error(
+      { err_name: errorName },
+      'unhandled error in request pipeline',
+    );
+  } catch {
+    // Deliberately swallow logger failures: returning a bounded generic HTTP
+    // error is safer than recursively invoking Express' default handler.
+  }
   if (res.headersSent) return;
   const body =
     env.NODE_ENV === 'production'
       ? { error: 'internal_server_error' }
       : {
           error: 'internal_server_error',
-          error_name: toLogFields(err).err_name,
+          error_name: errorName,
         };
-  res.status(500).json(body);
+  try {
+    res.status(500).json(body);
+  } catch {
+    // Last-resort response path if JSON serialization or a response shim
+    // fails. Never include the original error or attacker-controlled input.
+    if (!res.headersSent) {
+      res.statusCode = 500;
+      res.end('{"error":"internal_server_error"}');
+    }
+  }
 };
 app.use(errorHandler);
 

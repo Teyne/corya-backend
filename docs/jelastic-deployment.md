@@ -22,7 +22,29 @@ mesuré à 689,4 Mio et sans processus Chromium résiduel.
 Ne pas démarrer corya-api et corya-worker dans le même environnement.
 N'ajouter ni PostgreSQL, ni autre base, ni bucket dans Jelastic.
 
-## Build et processus
+## Essai actuel et exigence de production
+
+L'essai du 4 août 2026 utilise une archive de sources déployée dans
+`/home/jelastic/ROOT`, suivie de `npm ci` et `npm run build` sur chaque nœud.
+Cette procédure a permis de valider Node.js, PM2, Chromium, la mémoire, les
+signaux et les endpoints de santé. Elle n'est pas reproductible au niveau
+attendu pour la production : après un redéploiement, Jelastic peut tenter de
+démarrer PM2 avant que `dist/server.js` ou `dist/worker.js` existe.
+
+La production doit utiliser une archive précompilée et immuable, construite
+hors Jelastic depuis un SHA Git exact. Elle contient au minimum `dist/` (y
+compris les templates copiés), `package.json`, `package-lock.json` et
+`ecosystem.config.cjs`. Elle ne contient jamais `.env`, `.env.local`, secret,
+log, dump, fixture métier ni `node_modules`. Le SHA et le condensat de
+l'archive doivent être consignés, et la même archive doit être déployée dans
+les environnements API et worker.
+
+Ne pas ajouter de commande `prestart` qui compile l'application au redémarrage :
+elle rendrait chaque boot dépendant des devDependencies et produirait un
+binaire différent de l'artefact validé. Le build appartient exclusivement à
+la fabrication de l'archive.
+
+## Build et processus dans l'essai
 
 Le dépôt n'est pas un workspace npm. Toutes les commandes npm partent de
 apps/backend/.
@@ -32,6 +54,9 @@ cd apps/backend
 npm ci
 npm run build
 ~~~
+
+Ces commandes décrivent l'essai actuel et le pipeline de fabrication externe,
+pas une étape automatique de démarrage en production.
 
 Avant le démarrage, exécuter le préflight du rôle. Il lit uniquement
 process.env, ne charge aucun fichier dotenv et n'affiche jamais les valeurs.
@@ -187,29 +212,36 @@ contrôlée sur un compte payant.
    rapides bornés, confirmer que PM2 s'arrête et documenter l'intervention.
 7. Confirmer que le worker ne possède aucun endpoint public.
 
-## Ordre de mise en service futur
+## Ordre de mise en service
 
 Cet ordre nécessite des autorisations séparées :
 
-1. confirmer les migrations 20260802000000 à 20260802000003 puis appliquer
-   la corrective append-only 20260803000000 ;
-2. vérifier get_wave7_contract_version() = 7 ;
-3. déployer et valider l'API ;
-4. déployer et valider le worker.
+1. confirmer l'alignement des migrations, dont `20260803000000` ;
+2. vérifier `get_wave7_contract_version() = 7` ;
+3. fabriquer et valider l'archive immuable depuis le SHA retenu ;
+4. déployer et valider l'API ;
+5. déployer et valider le worker.
+
+Les étapes 1, 2, 4 et 5 sont validées dans l'essai au 4 août 2026. La
+fabrication et le rollback d'une archive production immuable restent à
+industrialiser.
 
 L'API et le worker échouent volontairement avant toute activité si le contrat
 Wave 7 n'est pas exactement à la version 7.
 
 ## Déploiement et rollback
 
-Déployer le même SHA Git dans les deux environnements et conserver le dernier
-SHA sain. Ne jamais utiliser une branche flottante comme preuve de version.
+Déployer exactement la même archive précompilée, identifiée par SHA Git et
+condensat, dans les deux environnements. Conserver localement l'archive saine
+précédente et ses métadonnées. Ne jamais reconstruire un ancien SHA au moment
+de l'incident et ne jamais utiliser une branche flottante comme preuve de
+version.
 
 En cas d'incident :
 
-1. arrêter ou revenir d'abord au worker sain pour interrompre les nouvelles
-   suppressions physiques ;
-2. revenir ensuite à l'API saine ;
+1. arrêter le worker ou redéployer sur celui-ci l'archive saine précédente afin
+   d'interrompre les nouvelles suppressions physiques ;
+2. redéployer ensuite la même archive saine précédente sur l'API ;
 3. contrôler /health, puis /health/deep avec son header protégé ;
 4. vérifier les heartbeats jobs et suppressions avant de réactiver le worker.
 

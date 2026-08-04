@@ -17,6 +17,7 @@ import type {
   FileDeletion,
   Job,
   JobInsertRow,
+  PersistCallAnalyzedInput,
   ProcessAppelPayload,
 } from '../types/index.js';
 import { withTimeout } from '../utils/timeout.js';
@@ -714,6 +715,43 @@ export async function getMostRecentHeartbeat(): Promise<{ last_seen_at: string }
     throw new Error(`db_get_most_recent_heartbeat_failed: ${error.message}`);
   }
   return data ?? null;
+}
+
+/** Atomically persist one call_analyzed event and its two required jobs. */
+export async function persistCallAnalyzed(
+  input: PersistCallAnalyzedInput,
+): Promise<{ appelId: string; duplicate: boolean }> {
+  const supabase = getServiceClient();
+  const rpcResult = (await withDbTimeout(
+    (signal) =>
+      supabase
+        .rpc('persist_call_analyzed', {
+          p_appel: input.appel,
+          p_process_payload: input.processAppelPayload,
+          p_purge_payload: input.purgeAudioPayload,
+          p_purge_run_after: input.purgeRunAfter,
+          p_correlation_id: input.correlationId,
+        })
+        .abortSignal(signal),
+    'db:persistCallAnalyzed',
+  )) as { data: unknown; error: { message: string } | null };
+
+  if (rpcResult.error) {
+    throw new Error(`db_persist_call_analyzed_failed: ${rpcResult.error.message}`);
+  }
+  const rows = Array.isArray(rpcResult.data)
+    ? (rpcResult.data as unknown[])
+    : [rpcResult.data];
+  const row: unknown = rows[0];
+  if (!row || typeof row !== 'object' ||
+      typeof (row as { appel_id?: unknown }).appel_id !== 'string' ||
+      typeof (row as { duplicate?: unknown }).duplicate !== 'boolean') {
+    throw new Error('db_persist_call_analyzed_failed: invalid_result');
+  }
+  return {
+    appelId: (row as { appel_id: string }).appel_id,
+    duplicate: (row as { duplicate: boolean }).duplicate,
+  };
 }
 
 /**

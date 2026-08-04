@@ -96,8 +96,16 @@ export type RetellWebhookEvent =
  */
 export type WebhookProcessResult =
   | { kind: 'inserted'; appelId: string; cabinetId: string }
-  | { kind: 'duplicate'; retellCallId: string }
+  | { kind: 'duplicate'; retellCallId: string; appelId: string }
   | { kind: 'cabinet_not_found'; toNumber: string };
+
+export interface PersistCallAnalyzedInput {
+  appel: AppelInsertRow;
+  processAppelPayload: ProcessAppelPayload;
+  purgeAudioPayload: { retell_call_id: string };
+  purgeRunAfter: string;
+  correlationId: string | null;
+}
 
 /**
  * Shape of the row inserted into `public.appels`. Kept close to the SQL

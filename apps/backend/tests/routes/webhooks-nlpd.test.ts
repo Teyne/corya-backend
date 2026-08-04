@@ -48,7 +48,7 @@ vi.mock('../../src/db/queries.js', () => ({
       email_notification_cc: null,
     }),
   ),
-  insertAppelIdempotent: vi.fn(() =>
+  persistCallAnalyzed: vi.fn(() =>
     Promise.reject(
       new Error(`db_insert_appel_failed: ${PII_SENTINEL}`),
     ),
@@ -101,13 +101,13 @@ describe('POST /webhooks/retell/call-ended — nLPD log leakage regression', () 
       .set('Content-Type', 'application/json')
       .set('x-retell-signature', placeholderSignature())
       .send(fixtureAnalyzed);
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(500);
 
     // Wait for the fire-and-forget async path to actually log its failure.
     await vi.waitFor(
       () => {
         const raw = capture.chunks.join('');
-        if (!raw.includes('webhook_async_processing_failed')) {
+        if (!raw.includes('webhook_persistence_failed')) {
           throw new Error('waiting');
         }
       },
@@ -116,7 +116,7 @@ describe('POST /webhooks/retell/call-ended — nLPD log leakage regression', () 
 
     const raw = capture.chunks.join('');
     // Positive: the intended log event fired.
-    expect(raw).toContain('webhook_async_processing_failed');
+    expect(raw).toContain('webhook_persistence_failed');
     // Positive: the error CLASS NAME survived so debugging remains possible.
     expect(raw).toContain('"err_name":"Error"');
     // Negative: the PII fragment carried by err.message was suppressed.

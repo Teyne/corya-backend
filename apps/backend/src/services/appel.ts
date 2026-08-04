@@ -1,9 +1,9 @@
 /**
  * End-to-end orchestration for a validated Retell `call_analyzed` payload.
  *
- * Runs entirely asynchronously — the HTTP layer has already returned 200 by
- * the time this is invoked. Any thrown error MUST be caught and logged by
- * the caller so Retell never sees a 5xx and never retries.
+ * The HTTP route waits for this orchestration before acknowledging Retell.
+ * Its database RPC is bounded and atomic; a failure intentionally becomes
+ * a 5xx so Retell can replay without leaving partial durable state.
  *
  * Steps:
  *   1. Resolve cabinet from `to_number`
@@ -24,11 +24,7 @@
  */
 import { logger } from '../config/logger.js';
 import { env } from '../config/env.js';
-import {
-  enqueueJobIdempotent,
-  findCabinetByCoryaNumber,
-  insertAppelIdempotent,
-} from '../db/queries.js';
+import { findCabinetByCoryaNumber, persistCallAnalyzed } from '../db/queries.js';
 import type {
   AppelInsertRow,
   AppelResultat,
@@ -156,18 +152,7 @@ export async function processCallAnalyzed(
     audio_expires_at: audioExpiresAt,
   };
 
-  // 3. Idempotent insert -------------------------------------------------
-  const { appelId, duplicate } = await insertAppelIdempotent(row);
-
-  if (duplicate) {
-    logger.info(
-      { ...logCtx, appel_id: appelId },
-      'webhook_replay_ignored',
-    );
-    return { kind: 'duplicate', retellCallId: retellCallId };
-  }
-
-  // 4. Enqueue post-processing jobs -------------------------------------
+  // 3. Persist the appel and both post-processing jobs atomically --------
   // Session 3 change: the historical `generate_pdf` + `send_email` split
   // was collapsed into ONE monolithic `process_appel` job. The worker
   // (src/workers/job-worker.ts) walks the pipeline PDF -> upload -> email
@@ -193,21 +178,18 @@ export async function processCallAnalyzed(
   //
   // Réconcilie l'écart n°1 de la vague 2 : on n'utilise plus retell_call_id
   // comme correlation id (choix par défaut faute de middleware à l'époque).
-  await enqueueJobIdempotent({
-    type: 'process_appel',
-    appel_id: appelId,
-    payload: processAppelPayload,
-    correlation_id: correlationId,
+  const { appelId, duplicate } = await persistCallAnalyzed({
+    appel: row,
+    processAppelPayload,
+    purgeAudioPayload: { retell_call_id: call.call_id },
+    purgeRunAfter: computeAudioExpiresAt(dateAppelIso),
+    correlationId,
   });
 
-  // Retell audio purge at date_appel + AUDIO_RETENTION_HOURS (unchanged).
-  await enqueueJobIdempotent({
-    type: 'purge_audio_retell',
-    appel_id: appelId,
-    payload: { retell_call_id: call.call_id },
-    run_after: computeAudioExpiresAt(dateAppelIso),
-    correlation_id: correlationId,
-  });
+  if (duplicate) {
+    logger.info({ ...logCtx, appel_id: appelId }, 'webhook_replay_reconciled');
+    return { kind: 'duplicate', retellCallId, appelId };
+  }
 
   logger.info(
     { ...logCtx, appel_id: appelId, cabinet_id: cabinet.id },

@@ -64,6 +64,20 @@ vi.mock('../../src/db/queries.js', () => {
       enqueuedJobs.push({ type: row.type, appelId: row.appel_id });
       return Promise.resolve(!already);
     }),
+    persistCallAnalyzed: vi.fn((input: {
+      appel: { retell_call_id: string };
+      correlationId: string | null;
+    }) => {
+      const existing = insertedAppels.get(input.appel.retell_call_id);
+      const appelId = existing ?? `appel-${insertedAppels.size + 1}`;
+      insertedAppels.set(input.appel.retell_call_id, appelId);
+      for (const type of ['process_appel', 'purge_audio_retell']) {
+        if (!enqueuedJobs.some((job) => job.type === type && job.appelId === appelId)) {
+          enqueuedJobs.push({ type, appelId });
+        }
+      }
+      return Promise.resolve({ appelId, duplicate: Boolean(existing) });
+    }),
   };
 });
 
@@ -72,6 +86,8 @@ const { app } = await import('../../src/index.js');
 const queries = await import('../../src/db/queries.js');
 const { verify: sdkVerify } = await import('retell-sdk');
 const mockSdkVerify = vi.mocked(sdkVerify);
+const { __resetRateLimitForTests } = await import('../../src/middleware/rate-limit.js');
+const { env } = await import('../../src/config/env.js');
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixturesDir = resolve(__dirname, '..', 'fixtures');
@@ -112,7 +128,7 @@ async function postWebhook(bodyRaw: string, signature?: string) {
 async function waitForAsyncProcessing(): Promise<void> {
   await vi.waitFor(
     () => {
-      const called = (queries.enqueueJobIdempotent as unknown as {
+      const called = (queries.persistCallAnalyzed as unknown as {
         mock: { calls: unknown[][] };
       }).mock.calls.length;
       if (called === 0) throw new Error('not yet');
@@ -122,11 +138,13 @@ async function waitForAsyncProcessing(): Promise<void> {
 }
 
 beforeEach(() => {
+  __resetRateLimitForTests();
   insertedAppels.clear();
   enqueuedJobs.length = 0;
   vi.mocked(queries.findCabinetByCoryaNumber).mockClear();
   vi.mocked(queries.insertAppelIdempotent).mockClear();
   vi.mocked(queries.enqueueJobIdempotent).mockClear();
+  vi.mocked(queries.persistCallAnalyzed).mockClear();
   mockSdkVerify.mockReset();
 });
 
@@ -138,6 +156,20 @@ afterEach(() => {
 // Signature layer
 // ---------------------------------------------------------------------------
 describe('POST /webhooks/retell/call-ended — signature layer', () => {
+  it('does not let unsigned traffic consume the authenticated Retell quota', async () => {
+    mockSdkVerify.mockResolvedValue(false);
+
+    for (let i = 0; i <= env.RATE_LIMIT_WEBHOOK_MAX; i += 1) {
+      const unsigned = await postWebhook(fixtureStarted);
+      expect(unsigned.status).toBe(401);
+    }
+
+    mockSdkVerify.mockResolvedValueOnce(true);
+    const signed = await postWebhook(fixtureStarted, placeholderSignature());
+    expect(signed.status).toBe(200);
+    expect(signed.body).toEqual({ received: true, event: 'call_started' });
+  });
+
   it('rejects a request without signature header (401)', async () => {
     // No signature → verifyRetellSignature delegates to SDK with empty
     // signature; SDK returns false; route returns 401.
@@ -265,6 +297,41 @@ describe('POST /webhooks/retell/call-ended — authenticated but unusable', () =
 // call_analyzed happy path
 // ---------------------------------------------------------------------------
 describe('POST /webhooks/retell/call-ended — call_analyzed', () => {
+  it('returns 500 and does not acknowledge when persistence fails before insert', async () => {
+    mockSdkVerify.mockResolvedValue(true);
+    vi.mocked(queries.persistCallAnalyzed).mockRejectedValueOnce(
+      new Error('synthetic_db_unavailable'),
+    );
+    const res = await postWebhook(fixtureAnalyzed, placeholderSignature());
+    expect(res.status).toBe(500);
+    expect(insertedAppels.size).toBe(0);
+    expect(enqueuedJobs).toHaveLength(0);
+  });
+
+  it('returns 500 with no partial state when the atomic RPC fails between job inserts', async () => {
+    mockSdkVerify.mockResolvedValue(true);
+    vi.mocked(queries.persistCallAnalyzed).mockRejectedValueOnce(
+      new Error('synthetic_transaction_rolled_back'),
+    );
+    const res = await postWebhook(fixtureAnalyzed, placeholderSignature());
+    expect(res.status).toBe(500);
+    expect(insertedAppels.size).toBe(0);
+    expect(enqueuedJobs).toHaveLength(0);
+  });
+
+  it('replay repairs a historically missing purge job without duplicating process_appel', async () => {
+    mockSdkVerify.mockResolvedValue(true);
+    const raw = JSON.parse(fixtureAnalyzed) as { call: { call_id: string } };
+    insertedAppels.set(raw.call.call_id, 'appel-existing');
+    enqueuedJobs.push({ type: 'process_appel', appelId: 'appel-existing' });
+    const res = await postWebhook(fixtureAnalyzed, placeholderSignature());
+    expect(res.status).toBe(200);
+    expect(enqueuedJobs).toEqual([
+      { type: 'process_appel', appelId: 'appel-existing' },
+      { type: 'purge_audio_retell', appelId: 'appel-existing' },
+    ]);
+  });
+
   it('accepts a valid signed payload and enqueues 2 jobs (process_appel + purge_audio_retell)', async () => {
     // Session 3 change: the historical 3-job split (generate_pdf +
     // send_email + purge_audio_retell) was collapsed into ONE monolithic
@@ -315,7 +382,7 @@ describe('POST /webhooks/retell/call-ended — call_analyzed', () => {
     // Give the async path a chance to run (or short-circuit).
     await vi.waitFor(
       () => {
-        const calls = vi.mocked(queries.insertAppelIdempotent).mock.calls.length;
+        const calls = vi.mocked(queries.persistCallAnalyzed).mock.calls.length;
         if (calls < 2) throw new Error('waiting');
       },
       { timeout: 2000, interval: 10 },
@@ -349,12 +416,8 @@ describe('POST /webhooks/retell/call-ended — call_analyzed', () => {
     );
 
     // Inspect the actual enqueue calls — the row must carry the CID.
-    const enqueueCalls = vi.mocked(queries.enqueueJobIdempotent).mock.calls;
-    // Every enqueued job for this webhook must carry the incoming CID.
-    for (const call of enqueueCalls) {
-      const row = call[0] as { correlation_id?: string | null };
-      expect(row.correlation_id).toBe(CORRELATION);
-    }
+    const persistCall = vi.mocked(queries.persistCallAnalyzed).mock.calls[0];
+    expect(persistCall?.[0].correlationId).toBe(CORRELATION);
   });
 
   it('answers 200 (no crash) when to_number does not match any cabinet', async () => {

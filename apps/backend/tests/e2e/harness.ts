@@ -45,6 +45,7 @@ import type {
   Job,
   JobInsertRow,
   JobType,
+  PersistCallAnalyzedInput,
   ProcessAppelPayload,
 } from '../../src/types/index.js';
 import type { CabinetRow, CronHealthRow, WorkerHeartbeatRow } from '../../src/db/queries.js';
@@ -215,6 +216,55 @@ export function installQueryMocks(): void {
         };
         store.appels.set(id, appel);
         return Promise.resolve({ appelId: id, duplicate: false });
+      },
+      persistCallAnalyzed: (input: PersistCallAnalyzedInput): Promise<{
+        appelId: string;
+        duplicate: boolean;
+      }> => {
+        const row = input.appel;
+        let appelId: string | undefined;
+        for (const [id, existing] of store.appels) {
+          if (existing.retell_call_id === row.retell_call_id) appelId = id;
+        }
+        const duplicate = appelId !== undefined;
+        if (!appelId) {
+          appelId = `appel-${store.appels.size + 1}`;
+          store.appels.set(appelId, {
+            id: appelId, cabinet_id: row.cabinet_id,
+            retell_call_id: row.retell_call_id, date_appel: row.date_appel,
+            duree_secondes: row.duree_secondes, resultat: row.resultat,
+            motif_appel: row.motif_appel, patient_nom: row.patient_nom,
+            patient_prenom: row.patient_prenom,
+            patient_telephone: row.patient_telephone, rdv_date: row.rdv_date,
+            rdv_praticien: row.rdv_praticien, transcript: row.transcript,
+            pdf_url: null, email_status: 'pending',
+          });
+        }
+        const intents: JobInsertRow[] = [
+          { type: 'process_appel', appel_id: appelId, payload: input.processAppelPayload,
+            correlation_id: input.correlationId },
+          { type: 'purge_audio_retell', appel_id: appelId,
+            payload: input.purgeAudioPayload, run_after: input.purgeRunAfter,
+            correlation_id: input.correlationId },
+        ];
+        for (const intent of intents) {
+          const exists = Array.from(store.jobs.values()).some(
+            (job) => job.type === intent.type && job.appel_id === appelId,
+          );
+          if (!exists) {
+            const now = new Date().toISOString();
+            const id = nextJobId();
+            store.jobs.set(id, {
+              id, type: intent.type, appel_id: appelId, payload: intent.payload,
+              status: 'pending', attempts: 0, max_attempts: 5,
+              run_after: intent.run_after ?? now, locked_at: null, locked_by: null,
+              last_error: null, created_at: now, updated_at: now,
+              correlation_id: intent.correlation_id ?? null,
+              dead_letter_alerted_at: null,
+            });
+          }
+        }
+        return Promise.resolve({ appelId, duplicate });
       },
       setAppelPdfPath: (appelId: string, path: string): Promise<void> => {
         const a = store.appels.get(appelId);
