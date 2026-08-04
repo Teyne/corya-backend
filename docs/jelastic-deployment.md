@@ -22,29 +22,39 @@ mesuré à 689,4 Mio et sans processus Chromium résiduel.
 Ne pas démarrer corya-api et corya-worker dans le même environnement.
 N'ajouter ni PostgreSQL, ni autre base, ni bucket dans Jelastic.
 
-## Essai actuel et exigence de production
+## Déploiement immuable validé
 
-L'essai du 4 août 2026 utilise une archive de sources déployée dans
-`/home/jelastic/ROOT`, suivie de `npm ci` et `npm run build` sur chaque nœud.
-Cette procédure a permis de valider Node.js, PM2, Chromium, la mémoire, les
-signaux et les endpoints de santé. Elle n'est pas reproductible au niveau
-attendu pour la production : après un redéploiement, Jelastic peut tenter de
-démarrer PM2 avant que `dist/server.js` ou `dist/worker.js` existe.
+Le premier essai du 4 août 2026 utilisait une archive de sources, suivie de
+`npm ci` et `npm run build` sur chaque nœud. Cette procédure a révélé une course
+de démarrage : Jelastic pouvait lancer PM2 avant la création de
+`dist/server.js` ou `dist/worker.js`. Elle a été remplacée par une archive
+précompilée et immuable, construite hors Jelastic depuis un SHA Git exact.
 
-La production doit utiliser une archive précompilée et immuable, construite
-hors Jelastic depuis un SHA Git exact. Elle contient au minimum `dist/` (y
+L'archive contient au minimum `dist/` (y
 compris les templates copiés), `package.json`, `package-lock.json` et
 `ecosystem.config.cjs`. Elle ne contient jamais `.env`, `.env.local`, secret,
 log, dump, fixture métier ni `node_modules`. Le SHA et le condensat de
 l'archive doivent être consignés, et la même archive doit être déployée dans
 les environnements API et worker.
 
+Publication validée le 4 août 2026 :
+
+- archive : `corya-backend-550d9a13-prod.zip` ;
+- Git : `550d9a13406a191d097b76fa96521bc3644facc7` ;
+- SHA-256 :
+  `AA345BDDE19026B38BDF2B386B085056724814710FD2FC4D502D24475CF1D878` ;
+- mêmes condensats pour `dist/server.js`, `dist/worker.js`,
+  `package-lock.json` et `ecosystem.config.cjs` sur les deux nœuds ;
+- API et worker `online`, zéro restart, preflights et santé profonde verts ;
+- smoke Chromium de trois rendus vert, sans processus résiduel ;
+- aucun token ni header sensible trouvé dans les logs API.
+
 Ne pas ajouter de commande `prestart` qui compile l'application au redémarrage :
 elle rendrait chaque boot dépendant des devDependencies et produirait un
 binaire différent de l'artefact validé. Le build appartient exclusivement à
 la fabrication de l'archive.
 
-## Build et processus dans l'essai
+## Fabrication externe et processus
 
 Le dépôt n'est pas un workspace npm. Toutes les commandes npm partent de
 apps/backend/.
@@ -55,8 +65,9 @@ npm ci
 npm run build
 ~~~
 
-Ces commandes décrivent l'essai actuel et le pipeline de fabrication externe,
-pas une étape automatique de démarrage en production.
+Ces commandes décrivent uniquement le pipeline de fabrication externe. Aucun
+build TypeScript ne doit être lancé au démarrage ou après le déploiement de
+l'archive précompilée.
 
 Avant le démarrage, exécuter le préflight du rôle. Il lit uniquement
 process.env, ne charge aucun fichier dotenv et n'affiche jamais les valeurs.
@@ -216,15 +227,16 @@ contrôlée sur un compte payant.
 
 Cet ordre nécessite des autorisations séparées :
 
-1. confirmer l'alignement des migrations, dont `20260803000000` ;
+1. confirmer l'alignement des migrations, dont `20260803000000` et
+   `20260804010000` ;
 2. vérifier `get_wave7_contract_version() = 7` ;
 3. fabriquer et valider l'archive immuable depuis le SHA retenu ;
-4. déployer et valider l'API ;
-5. déployer et valider le worker.
+4. déployer et valider le worker sans exposition publique ;
+5. déployer et valider l'API.
 
-Les étapes 1, 2, 4 et 5 sont validées dans l'essai au 4 août 2026. La
-fabrication et le rollback d'une archive production immuable restent à
-industrialiser.
+Les cinq étapes sont validées au 4 août 2026 avec l'artefact `550d9a13`. Le
+rollback vers l'artefact précédent, les sauvegardes et la rétention des logs
+restent à formaliser avant l'ouverture à de vrais patients.
 
 L'API et le worker échouent volontairement avant toute activité si le contrat
 Wave 7 n'est pas exactement à la version 7.
@@ -258,7 +270,8 @@ exécutée ne sont pas annulées par le retour au binaire précédent.
 - Aucun addon DB n'est sélectionné.
 - L'environnement worker n'a aucun endpoint public.
 - Les 2 + 6 Cloudlets respectent la limite totale de l'essai.
-- Le build npm ci puis npm run build réussit depuis apps/backend.
+- Le build `npm ci` puis `npm run build` réussit hors Jelastic depuis
+  `apps/backend`, et l'archive publiée contient déjà `dist/`.
 - Les préflights API et worker échouent sans variable requise et n'en
   affichent aucune valeur.
 - Le smoke Chromium séquentiel, la RSS Node et le pic RAM total Jelastic sont

@@ -1,10 +1,13 @@
 # Architecture technique Corya
 
 État vérifié le 4 août 2026. Les migrations Wave 7
-`20260802000000` à `20260802000003` et la corrective append-only
-`20260803000000` sont appliquées sur la cible Supabase liée. Les environnements
-Jelastic d'essai API et worker sont actifs et leurs contrôles de santé sont
-verts. Cet état d'essai ne constitue pas encore une mise en production.
+`20260802000000` à `20260802000003`, la corrective append-only
+`20260803000000` et l'intake atomique `20260804010000` sont appliqués sur la
+cible Supabase liée. Les environnements Jelastic API et worker exécutent le
+même artefact précompilé immuable au SHA Git
+`550d9a13406a191d097b76fa96521bc3644facc7` ; leurs contrôles de santé sont
+verts. La configuration Retell et calendrier reste une phase distincte avant
+l'ouverture à de vrais patients.
 
 ## Composants
 
@@ -23,7 +26,10 @@ verts. Cet état d'essai ne constitue pas encore une mise en production.
 ## Chemin d'un appel
 
 1. Express reçoit le webhook Retell et vérifie la signature sur le corps brut.
-2. La route répond rapidement, puis la persistance de l'appel et du job est lancée en arrière-plan. Cette séquence conserve un risque connu : une panne DB après le `200` peut acquitter un webhook sans créer de job.
+2. La route appelle `persist_call_analyzed`, qui insère atomiquement l'appel et
+   les deux jobs `process_appel` et `purge_audio_retell`. Elle ne répond `200`
+   qu'après le commit PostgreSQL. Une panne ou un timeout DB renvoie `500` afin
+   que Retell rejoue ; un rejeu est idempotent et répare un type de job absent.
 3. Le worker réclame atomiquement les jobs, avec récupération des verrous zombies, checkpoints et backoff.
 4. `process_appel` génère le PDF, l'upload dans `pdf-recaps` privé, crée une URL signée courte et envoie l'e-mail.
 5. `purge_audio_retell`, planifié à +48 h, supprime l'appel Retell. Un échec est journalisé et alerté mais ne bloque pas la file ; la rétention Retell configurée à un jour sert de filet indépendant.
@@ -58,15 +64,26 @@ aboutie et reste remédiable.
   24 mois et des preuves terminales de l'outbox.
 - Un cron nouvellement enregistré reste `pending_first_run` pendant au plus sa période normale ; les crons déjà présents sont seedés à la migration et restent surveillés immédiatement.
 
-## État de l'essai et déploiement restant
+## État déployé et travail restant
 
-Les migrations `20260802000000` à `20260802000003` et la corrective
-`20260803000000` sont appliquées à distance depuis le 3 août 2026. La
-corrective résout le conflit PL/pgSQL observé dans `get_cron_health()` sans
-modifier les migrations historiques. Le 4 août 2026, l'API et le worker
-Jelastic d'essai sont actifs dans deux environnements séparés. L'API répond en
-HTTPS et `/health/deep` confirme la DB, le Storage, le worker, la boucle de
-suppression, le backlog et les dix crons. Le worker n'a aucun accès SLB.
+Les migrations `20260802000000` à `20260802000003`, la corrective
+`20260803000000` et l'intake atomique `20260804010000` sont alignés localement
+et à distance. La corrective résout le conflit PL/pgSQL observé dans
+`get_cron_health()` sans modifier les migrations historiques. L'intake
+atomique supprime le risque d'acquitter un `call_analyzed` avant sa persistance
+durable. Le 4 août 2026, l'API et le worker Jelastic sont actifs dans deux
+environnements séparés. L'API répond en HTTPS et `/health/deep` confirme la DB,
+le Storage, le worker, la boucle de suppression, le backlog et les dix crons.
+Le worker n'a aucun accès SLB.
+
+Les deux nœuds exécutent l'archive précompilée
+`corya-backend-550d9a13-prod.zip`, construite depuis le SHA Git complet
+`550d9a13406a191d097b76fa96521bc3644facc7`, avec le SHA-256
+`AA345BDDE19026B38BDF2B386B085056724814710FD2FC4D502D24475CF1D878`.
+Les condensats des entrypoints, du lockfile et de la configuration PM2 ont été
+comparés aux fichiers locaux. Les deux processus sont restés `online` sans
+restart ; les preflights, les endpoints de santé, le smoke Chromium et le
+contrôle de confidentialité des logs sont verts.
 
 Les heartbeats artificiels `dev-worker-local` et ceux des anciens processus
 worker d'essai ont été supprimés de manière ciblée après vérification de leur
@@ -83,17 +100,17 @@ production. Le test SQL local est :
 supabase start
 supabase db reset
 psql "postgresql://postgres:postgres@127.0.0.1:54322/postgres" -v ON_ERROR_STOP=1 -f supabase/tests/wave7_invariants.sql
+psql "postgresql://postgres:postgres@127.0.0.1:54322/postgres" -v ON_ERROR_STOP=1 -f supabase/tests/call_analyzed_intake_invariants.sql
 ```
 
 Il utilise une base locale jetable, des données synthétiques et un
 `ROLLBACK`; il n'est jamais exécuté contre une cible distante.
 
-La production reste conditionnée à un artefact précompilé immuable identifié
-par SHA, à un rollback reproductible vers l'artefact précédent, à la validation
-des sauvegardes/PITR et à la configuration réelle des intégrations Retell,
-SMTP et calendrier. L'essai actuel a été déployé depuis une archive de sources,
-puis compilé sur Jelastic : cette méthode est acceptable pour la validation
-technique en cours, mais ne constitue pas le procédé de livraison production.
+L'artefact précompilé immuable et son déploiement identique sur les deux rôles
+sont validés. L'ouverture à de vrais patients reste conditionnée à un rollback
+rejoué avec l'artefact précédent, à la validation des sauvegardes/PITR et de la
+rétention des logs, puis à la configuration et aux essais réels de Retell, du
+numéro téléphonique, du calendrier et des transferts humains.
 
 En cas d'incident après publication, arrêter ou revenir d'abord le worker pour
 interrompre les suppressions, puis revenir à l'API précédente. Préférer ce
