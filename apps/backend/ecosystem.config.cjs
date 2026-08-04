@@ -17,8 +17,8 @@ module.exports = {
     {
       ...common,
       name: 'corya-api',
-      script: 'dist/index.js',
-      // index.ts force-exits after 10 seconds if graceful shutdown stalls.
+      script: 'dist/server.js',
+      // The API runtime force-exits after 10 seconds if graceful shutdown stalls.
       kill_timeout: 15_000,
     },
     {

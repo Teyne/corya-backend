@@ -129,7 +129,9 @@ describe('Jelastic role preflight', () => {
   });
 
   it('accepts valid API and worker configurations on Node 24', () => {
-    expect(runFor('api').result).toBe(true);
+    const api = runFor('api');
+    expect(api.result).toBe(true);
+    expect(api.lines.join('\n')).toContain('entrypoint=dist/server.js');
     expect(runFor('worker').result).toBe(true);
   });
 
@@ -209,6 +211,15 @@ describe('Jelastic role preflight', () => {
     });
     expect(missingDist.result).toBe(false);
     expect(missingDist.lines.join('\n')).toContain('dist/worker.js');
+
+    const missingApiDist = runFor('api', {
+      fileSystem: {
+        existsSync: () => false,
+        statSync: () => ({ isFile: () => false }),
+      },
+    });
+    expect(missingApiDist.result).toBe(false);
+    expect(missingApiDist.lines.join('\n')).toContain('dist/server.js');
   });
 
   it('keeps invalid CLI diagnostics stable and value-free', () => {

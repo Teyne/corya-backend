@@ -29,6 +29,10 @@ La configuration est lue depuis `apps/backend/.env.local`, puis depuis le `.env.
   les quatre migrations du 2 août ne sont pas toutes présentes, le démarrage
   échoue avant toute écoute HTTP ou prise de travail.
 
+`src/index.ts` expose l'application Express sans démarrage implicite.
+`src/server.ts` est l'entrypoint exécutable de l'API pour `npm run dev`,
+`npm start` et PM2 ; après compilation, il devient `dist/server.js`.
+
 `/health/deep` vérifie DB, Storage, worker, boucle de suppression, backlog et
 dix crons. `last_deletion_poll_at = NULL` signifie que la boucle n'a pas
 encore démarré et reste neutre ; une valeur âgée de plus de 180 s rend le

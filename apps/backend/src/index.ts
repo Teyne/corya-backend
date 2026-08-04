@@ -1,12 +1,13 @@
 /**
- * Corya backend HTTP entry point.
+ * Corya backend HTTP module.
  *
  * Exports:
- *   - `app`     : Express instance (used by supertest, no port bound)
- *   - `version` : from package.json (ESM-safe read, no require)
+ *   - `app`            : Express instance (used by supertest, no port bound)
+ *   - `version`        : from package.json (ESM-safe read, no require)
+ *   - `startApiServer` : gated HTTP bootstrap used by `src/server.ts`
  *
- * When this module is the process entry point, it also binds the port and
- * wires SIGTERM / SIGINT for graceful shutdown.
+ * Importing this module never binds a port. The dedicated `src/server.ts`
+ * entrypoint owns the implicit bootstrap used by Node, tsx and PM2.
  */
 import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
@@ -168,37 +169,42 @@ const errorHandler: ErrorRequestHandler = (err, req, res, _next) => {
 app.use(errorHandler);
 
 // ---------------------------------------------------------------------------
-// Bootstrap — only when this file is the process entry point.
+// Explicit bootstrap. Importing this module never starts the API.
 // ---------------------------------------------------------------------------
-const isEntryPoint =
-  process.argv[1] !== undefined &&
-  resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-
-async function startApiServer(): Promise<void> {
+export async function startApiServer(): Promise<void> {
   await runWave7GatedStartup(startApiRuntime);
 }
 
-function startApiRuntime(): void {
+function startApiRuntime(): Promise<void> {
   const server = createServer(app);
   // Alert pollers live in the API process (a dead worker cannot report its
   // own death). Kept as a mutable ref so shutdown can call stop().
   let pollers: RunningPollers | null = null;
 
-  server.listen(env.PORT, () => {
-    logger.info(
-      { port: env.PORT, env: env.NODE_ENV, version },
-      'corya-backend listening',
-    );
-    // Emit the "which secret are we signing with?" log EXACTLY ONCE per
-    // process (not per request). Placed here so it appears right after the
-    // listening line — easy to spot in Jelastic logs.
-    logRetellSecretSourceOnce();
-    // Session 4: same visibility contract for the alerting mode. WARN when
-    // disabled (founder requirement).
-    logAlertingModeOnce();
-    // Start the periodic alert checks (worker_stale, jobs_backlog,
-    // dead_letter poller). Also runs one pass at startup.
-    pollers = startAlertPollers();
+  const listening = new Promise<void>((resolveListening, rejectListening) => {
+    const onBindError = (err: Error): void => {
+      rejectListening(err);
+    };
+
+    server.once('error', onBindError);
+    server.listen(env.PORT, () => {
+      server.off('error', onBindError);
+      resolveListening();
+      logger.info(
+        { port: env.PORT, env: env.NODE_ENV, version },
+        'corya-backend listening',
+      );
+      // Emit the "which secret are we signing with?" log EXACTLY ONCE per
+      // process (not per request). Placed here so it appears right after the
+      // listening line — easy to spot in Jelastic logs.
+      logRetellSecretSourceOnce();
+      // Session 4: same visibility contract for the alerting mode. WARN when
+      // disabled (founder requirement).
+      logAlertingModeOnce();
+      // Start the periodic alert checks (worker_stale, jobs_backlog,
+      // dead_letter poller). Also runs one pass at startup.
+      pollers = startAlertPollers();
+    });
   });
 
   const shutdown = (signal: NodeJS.Signals): void => {
@@ -239,11 +245,6 @@ function startApiRuntime(): void {
 
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
-}
 
-if (isEntryPoint) {
-  void startApiServer().catch((err: unknown) => {
-    logger.error({ ...toLogFields(err) }, 'api_boot_failed');
-    process.exit(1);
-  });
+  return listening;
 }

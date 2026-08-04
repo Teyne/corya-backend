@@ -23,7 +23,7 @@ const COMMON_REQUIRED_ENV = Object.freeze([
 
 const ROLE_CONFIG = Object.freeze({
   api: Object.freeze({
-    entrypoint: 'dist/index.js',
+    entrypoint: 'dist/server.js',
     requiredEnv: Object.freeze([
       ...COMMON_REQUIRED_ENV,
       'PORT',

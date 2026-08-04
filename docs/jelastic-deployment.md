@@ -46,7 +46,7 @@ npm run preflight:jelastic -- --role worker
 pm2 start ecosystem.config.cjs --only corya-worker
 ~~~
 
-Les entrypoints compilés sont respectivement dist/index.js et
+Les entrypoints compilés sont respectivement dist/server.js et
 dist/worker.js. La configuration PM2 démarre une instance en mode fork,
 redémarre après crash et accorde 15 secondes à l'API et 30 secondes au worker
 pour leurs handlers SIGTERM / SIGINT.
