@@ -161,8 +161,15 @@ Interdiction absolue de faire apparaître dans les logs (Pino, console, fichier,
 - Contenu du transcript
 - Données médicales de quelque nature
 - Motif d'appel textuel (utiliser un ID de catégorie à la place)
+- Headers HTTP de requête ou de réponse, notamment `X-Health-Token`,
+  `Authorization`, `Cookie`, `Set-Cookie`, `X-API-Key` et tout header
+  d'authentification non encore connu
 
-Solution : utiliser `utils/redact.ts` (côté backend) qui remplace ces champs par des placeholders type `[REDACTED]` ou des hashes.
+Les logs HTTP Pino suivent une liste blanche stricte : `correlation_id`,
+méthode, chemin URL sans query string ni fragment, `statusCode` et
+`responseTime`. Aucun objet de headers, adresse réseau ou paramètre de query
+n'est sérialisé. Le sanitizer partagé censure en plus tout objet `headers` et
+les clés d'authentification connues en cas de journalisation manuelle.
 
 ### Sous-traitance (art. 9 nLPD)
 

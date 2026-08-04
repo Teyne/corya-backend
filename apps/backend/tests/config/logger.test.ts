@@ -75,6 +75,10 @@ const SENTINELS = {
   publicLogUrl: 'https://retell.example/log-SENTINEL.html',
   authHeader: 'Bearer super-secret-token-SENTINEL',
   retellSig: 'sig-header-SENTINEL',
+  genericErrorMessage: 'GENERIC-ERROR-MESSAGE-SENTINEL',
+  genericErrorHeader: 'GENERIC-ERROR-HEADER-SENTINEL',
+  genericErrorCustom: 'GENERIC-ERROR-CUSTOM-SENTINEL',
+  genericErrorCause: 'GENERIC-ERROR-CAUSE-SENTINEL',
 } as const;
 
 function buildRetellPayload(): Record<string, unknown> {
@@ -154,7 +158,7 @@ describe('logger — nLPD compliance redaction', () => {
     assertNoSentinelLeaked(raw);
   });
 
-  it('redacts auth headers under req.headers and top-level', () => {
+  it('redacts the complete headers object and top-level auth material', () => {
     const { logger: testLogger, logs } = makeTestLogger();
 
     testLogger.warn(
@@ -179,8 +183,11 @@ describe('logger — nLPD compliance redaction', () => {
     expect(raw).not.toContain(SENTINELS.authHeader);
     expect(raw).not.toContain(SENTINELS.retellSig);
     expect(raw).not.toContain('SENTINEL-COOKIE');
-    // Non-sensitive header preserved.
-    expect(raw).toContain('retell-webhook/1.0');
+    // Header objects are deliberately all-or-nothing: an unknown auth header
+    // must not bypass a finite blacklist.
+    expect(raw).not.toContain('retell-webhook/1.0');
+    const req = captured[0].parsed.req as Record<string, unknown>;
+    expect(req.headers).toBe('[REDACTED]');
   });
 
   it('redacts even when the sensitive key is deeply nested', () => {
@@ -205,5 +212,66 @@ describe('logger — nLPD compliance redaction', () => {
     const raw = logs().map((l) => l.raw).join('\n');
     expect(raw).not.toContain(SENTINELS.transcriptContent1);
     expect(raw).not.toContain(SENTINELS.recordingUrl);
+  });
+
+  it('serializes a generic Error as an allowlisted type only', () => {
+    const { logger: testLogger, logs } = makeTestLogger();
+    const err = new TypeError(SENTINELS.genericErrorMessage) as TypeError & {
+      cause: Error;
+      custom_payload: string;
+      headers: Record<string, string>;
+    };
+    err.cause = new Error(SENTINELS.genericErrorCause);
+    err.custom_payload = SENTINELS.genericErrorCustom;
+    err.headers = { authorization: SENTINELS.genericErrorHeader };
+
+    testLogger.error({ err }, 'synthetic_generic_error');
+
+    const captured = logs();
+    expect(captured).toHaveLength(1);
+    assertNoSentinelLeaked(captured[0].raw);
+    expect(captured[0].raw).not.toContain('message');
+    expect(captured[0].raw).not.toContain('stack');
+    expect(captured[0].raw).not.toContain('headers');
+    expect(captured[0].raw).not.toContain('custom_payload');
+    expect(captured[0].parsed).toMatchObject({
+      level: 50,
+      msg: 'synthetic_generic_error',
+      err: { type: 'TypeError' },
+    });
+    expect(captured[0].parsed.err).toEqual({ type: 'TypeError' });
+  });
+
+  it.each([null, 'synthetic primitive'])(
+    'safely serializes a non-object err value: %s',
+    (err) => {
+      const { logger: testLogger, logs } = makeTestLogger();
+
+      expect(() =>
+        testLogger.error({ err }, 'synthetic_invalid_error'),
+      ).not.toThrow();
+
+      const captured = logs();
+      expect(captured).toHaveLength(1);
+      expect(captured[0].raw).not.toContain('synthetic primitive');
+      expect(captured[0].parsed.err).toEqual({ type: 'Error' });
+    },
+  );
+
+  it('safely serializes an err object with a hostile type getter', () => {
+    const { logger: testLogger, logs } = makeTestLogger();
+    const err = Object.defineProperty({}, 'type', {
+      get: () => {
+        throw new Error('synthetic hostile getter');
+      },
+    });
+
+    expect(() =>
+      testLogger.error({ err }, 'synthetic_hostile_error'),
+    ).not.toThrow();
+
+    const captured = logs();
+    expect(captured).toHaveLength(1);
+    expect(captured[0].parsed.err).toEqual({ type: 'Error' });
   });
 });

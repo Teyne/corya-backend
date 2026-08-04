@@ -18,6 +18,7 @@ import express, { type ErrorRequestHandler } from 'express';
 import { pinoHttp } from 'pino-http';
 import { env } from './config/env.js';
 import { logger } from './config/logger.js';
+import { buildHttpLoggerOptions } from './config/http-logging.js';
 import { webhooksRouter } from './routes/webhooks.js';
 import { healthRouter, setHealthPackageVersion } from './routes/health.js';
 import { logRetellSecretSourceOnce } from './services/retell.js';
@@ -30,7 +31,6 @@ import {
 import {
   CORRELATION_HEADER,
   correlationMiddleware,
-  genReqId,
 } from './middleware/correlation.js';
 import { buildWebhookRateLimiter } from './middleware/rate-limit.js';
 import { toLogFields } from './utils/errors.js';
@@ -96,28 +96,7 @@ app.use(
 );
 
 app.use(
-  pinoHttp({
-    logger,
-    // Session 4 vague 3 — correlation id. `genReqId` runs BEFORE the
-    // request enters our middleware; the resulting id is what pino
-    // stamps into every log line as `req.id`. The `correlationMiddleware`
-    // below reads the SAME header/regex so `req.correlationId` and
-    // `req.id` are guaranteed equal.
-    genReqId,
-    // Expose the correlation id in the response BEFORE we know if it was
-    // supplied by the client (pino-http runs before our middleware). This
-    // is a safety net — the middleware also sets the header, but if a
-    // downstream error handler short-circuits, the pino-http level here
-    // still emits it.
-    customProps: (req) => ({ correlation_id: req.id }),
-    // Silence 2xx logs at info level to keep signal high; errors still bubble.
-    customLogLevel: (_req, res, err) => {
-      if (err) return 'error';
-      if (res.statusCode >= 500) return 'error';
-      if (res.statusCode >= 400) return 'warn';
-      return 'info';
-    },
-  }),
+  pinoHttp(buildHttpLoggerOptions(logger)),
 );
 
 // Middleware order matters: pino-http first (stamps req.id via genReqId),
@@ -235,7 +214,10 @@ function startApiRuntime(): Promise<void> {
         );
       }
       if (err) {
-        logger.error({ err }, 'error while closing HTTP server');
+        logger.error(
+          { ...toLogFields(err) },
+          'error while closing HTTP server',
+        );
         process.exit(1);
       }
       logger.info('HTTP server closed cleanly');

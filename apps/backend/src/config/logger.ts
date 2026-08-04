@@ -56,15 +56,57 @@ const SENSITIVE_KEYS: ReadonlySet<string> = new Set(
     'from_number',
     'to_number',
 
-    // Auth material
+    // Auth material. Redact a complete headers object so an unknown future
+    // authentication header cannot bypass a finite key blacklist.
+    'headers',
     'authorization',
     'cookie',
+    'set-cookie',
+    'x-api-key',
+    'x-health-token',
+    'proxy-authorization',
+    'www-authenticate',
+    'x-auth-token',
     'x-retell-signature',
   ].map((k) => k.toLowerCase()),
 );
 
 const CENSOR = '[REDACTED]';
 const MAX_DEPTH = 12;
+const SAFE_ERROR_TYPES: ReadonlySet<string> = new Set([
+  'Error',
+  'AggregateError',
+  'TypeError',
+  'RangeError',
+  'ReferenceError',
+  'SyntaxError',
+  'URIError',
+  'EvalError',
+  'AbortError',
+  'TimeoutError',
+  'WebhookValidationError',
+  'RetellSignatureError',
+  'CabinetNotFoundError',
+]);
+
+function serializeError(value: unknown): Record<string, string> {
+  if (typeof value !== 'object' || value === null) {
+    return { type: 'Error' };
+  }
+
+  try {
+    const error = value as { name?: unknown; type?: unknown };
+    const candidate =
+      typeof error.type === 'string'
+        ? error.type
+        : typeof error.name === 'string'
+          ? error.name
+          : '';
+    return { type: SAFE_ERROR_TYPES.has(candidate) ? candidate : 'Error' };
+  } catch {
+    return { type: 'Error' };
+  }
+}
 
 /**
  * Recursively walk `value` and censor any property whose key matches
@@ -82,8 +124,8 @@ function sanitize(value: unknown, depth = 0): unknown {
   }
 
   if (typeof value === 'object') {
-    // Preserve Error instances — pino has its own serializer for them and
-    // sanitizing here would break stack traces.
+    // Preserve Error instances until the strict `err` serializer below
+    // replaces them with an allowlisted type only.
     if (value instanceof Error) return value;
 
     const src = value as Record<string, unknown>;
@@ -123,6 +165,11 @@ const usePrettyTransport = env.NODE_ENV === 'development';
 function buildOptions(): LoggerOptions {
   return {
     level: env.LOG_LEVEL,
+    serializers: {
+      // Never serialize Error.message, stack, cause or enumerable custom
+      // properties. Callers needing scrubbed diagnostics use toLogFields().
+      err: serializeError,
+    },
     redact: {
       paths: redactPaths,
       censor: CENSOR,
@@ -177,4 +224,4 @@ export const logger = createLogger();
 export type Logger = typeof logger;
 
 // Exported for tests only. Do not import from application code.
-export const __internals = { sanitize, SENSITIVE_KEYS };
+export const __internals = { sanitize, serializeError, SENSITIVE_KEYS };
