@@ -35,6 +35,7 @@ import {
 import { buildWebhookRateLimiter } from './middleware/rate-limit.js';
 import { toLogFields } from './utils/errors.js';
 import { runWave7GatedStartup } from './services/startup.js';
+import { adminRouter } from './routes/admin.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -129,6 +130,11 @@ app.use('/webhooks', webhooksRouter);
 // is added to the /health body (bootTimeMs latch inside the module).
 setHealthPackageVersion(version);
 app.use('/health', healthRouter);
+
+// Portal requests arrive only from the same-origin BFF and authenticate with
+// a strict Supabase bearer token. The router independently re-authorizes the
+// active cabinet membership before any service-role query.
+app.use('/admin', adminRouter);
 
 // ---------------------------------------------------------------------------
 // Error handler (must have 4 args to be picked up by Express as an error mw).

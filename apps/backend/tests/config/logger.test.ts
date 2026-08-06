@@ -214,6 +214,24 @@ describe('logger — nLPD compliance redaction', () => {
     expect(raw).not.toContain(SENTINELS.recordingUrl);
   });
 
+  it('redacts portal bearer, masked number and signed PDF URL fields', () => {
+    const { logger: testLogger, logs } = makeTestLogger();
+    const portalToken = 'PORTAL-TOKEN-SENTINEL';
+    const maskedNumber = 'MASKED-NUMBER-SENTINEL';
+    const signedUrl = 'https://storage.example/signed-url-SENTINEL';
+
+    testLogger.info({
+      authorization: portalToken,
+      maskedNumber,
+      signedUrl,
+    }, 'portal response metadata');
+
+    const raw = logs().map((entry) => entry.raw).join('\n');
+    expect(raw).not.toContain(portalToken);
+    expect(raw).not.toContain(maskedNumber);
+    expect(raw).not.toContain(signedUrl);
+  });
+
   it('serializes a generic Error as an allowlisted type only', () => {
     const { logger: testLogger, logs } = makeTestLogger();
     const err = new TypeError(SENTINELS.genericErrorMessage) as TypeError & {

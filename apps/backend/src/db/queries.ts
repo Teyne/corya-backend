@@ -8,7 +8,7 @@
  * All functions return plain JS types or `null` (for "not found"). They
  * throw only on truly unexpected DB errors, never on empty result sets.
  */
-import { getServiceClient } from '../config/supabase.js';
+import { getAuthClient, getServiceClient } from '../config/supabase.js';
 import { env } from '../config/env.js';
 import type {
   AppelInsertRow,
@@ -21,6 +21,17 @@ import type {
   ProcessAppelPayload,
 } from '../types/index.js';
 import { withTimeout } from '../utils/timeout.js';
+import type {
+  PortalAuthUser,
+  PortalCabinetPatch,
+  PortalCabinetRow,
+  PortalCallRow,
+  PortalCallsQuery,
+  PortalDashboardSnapshot,
+  PortalMembership,
+  PortalPractice,
+  PortalTeamRow,
+} from '../admin/types.js';
 
 /**
  * Small helper — every Supabase call in this file goes through here.
@@ -987,4 +998,346 @@ export async function workerHeartbeatDeletionPoll(
     'db:workerHeartbeatDeletionPoll',
   );
   if (error) throw new Error(`db_worker_deletion_poll_failed: ${error.message}`);
+}
+
+// ---------------------------------------------------------------------------
+// Portal administration queries
+// ---------------------------------------------------------------------------
+
+const PORTAL_CALL_COLUMNS = [
+  'id',
+  'cabinet_id',
+  'date_appel',
+  'duree_secondes',
+  'resultat',
+  'motif_appel',
+  'rdv_date',
+  'rdv_praticien',
+  'pdf_url',
+  'pdf_envoye_at',
+  'email_status',
+  'created_at',
+].join(', ');
+
+const PORTAL_CABINET_COLUMNS = [
+  'id',
+  'nom',
+  'type_cabinet',
+  'adresse',
+  'npa',
+  'ville',
+  'email_notification',
+  'email_notification_cc',
+  'statut',
+  'config_agent',
+  'updated_at',
+].join(', ');
+
+/** Validate a bearer token through Supabase Auth before service-role access. */
+export async function authenticatePortalAccessToken(
+  token: string,
+): Promise<PortalAuthUser | null> {
+  const authClient = getAuthClient();
+  if (!authClient) throw new Error('portal_auth_not_configured');
+
+  const { data, error } = await withTimeout(
+    authClient.auth.getUser(token),
+    env.TIMEOUT_AUTH_MS,
+    'auth:getUser',
+  );
+
+  if (error) {
+    const status = typeof error.status === 'number' ? error.status : 0;
+    if (status === 400 || status === 401 || status === 403) return null;
+    throw new Error('portal_auth_unavailable');
+  }
+  if (!data.user) return null;
+
+  const metadata = data.user.user_metadata;
+  const candidate =
+    typeof metadata.full_name === 'string'
+      ? metadata.full_name
+      : typeof metadata.name === 'string'
+        ? metadata.name
+        : '';
+  return {
+    id: data.user.id,
+    email: data.user.email ?? '',
+    displayName: candidate.trim().slice(0, 120),
+  };
+}
+
+/**
+ * Re-read active memberships on every request. When no cabinet is requested,
+ * ordering by cabinet_id makes multi-cabinet selection deterministic.
+ */
+export async function resolvePortalMembership(
+  userId: string,
+  requestedCabinetId?: string,
+): Promise<PortalMembership | null> {
+  const supabase = getServiceClient();
+  let query = supabase
+    .from('cabinet_memberships')
+    .select('cabinet_id, role')
+    .eq('user_id', userId)
+    .eq('actif', true)
+    .order('cabinet_id', { ascending: true })
+    .limit(1);
+  if (requestedCabinetId !== undefined) {
+    query = query.eq('cabinet_id', requestedCabinetId);
+  }
+  const { data, error } = await withDbTimeout(
+    (signal) => query.abortSignal(signal).maybeSingle<{ cabinet_id: string; role: 'admin' | 'viewer' }>(),
+    'db:resolvePortalMembership',
+  );
+  if (error) throw new Error('portal_membership_lookup_failed');
+  return data ? { cabinetId: data.cabinet_id, role: data.role } : null;
+}
+
+/** List only this authenticated user's active cabinet memberships. */
+export async function listPortalPractices(userId: string): Promise<PortalPractice[]> {
+  const { data, error } = await withDbTimeout(
+    (signal) =>
+      getServiceClient()
+        .from('cabinet_memberships')
+        .select('cabinet_id, role, cabinets!inner(id, nom)')
+        .eq('user_id', userId)
+        .eq('actif', true)
+        .order('cabinet_id', { ascending: true })
+        .abortSignal(signal),
+    'db:listPortalPractices',
+  );
+  if (error) throw new Error('portal_practices_list_failed');
+
+  const practices: PortalPractice[] = [];
+  for (const value of (data ?? []) as unknown[]) {
+    if (typeof value !== 'object' || value === null) continue;
+    const row = value as Record<string, unknown>;
+    const joined = row.cabinets;
+    if (typeof joined !== 'object' || joined === null || Array.isArray(joined)) continue;
+    const cabinet = joined as Record<string, unknown>;
+    if (
+      typeof cabinet.id === 'string'
+      && typeof cabinet.nom === 'string'
+      && (row.role === 'admin' || row.role === 'viewer')
+    ) {
+      practices.push({ id: cabinet.id, name: cabinet.nom, role: row.role });
+    }
+  }
+  return practices;
+}
+
+export async function getPortalCabinet(cabinetId: string): Promise<PortalCabinetRow | null> {
+  const { data, error } = await withDbTimeout(
+    (signal) =>
+      getServiceClient()
+        .from('cabinets')
+        .select(PORTAL_CABINET_COLUMNS)
+        .eq('id', cabinetId)
+        .abortSignal(signal)
+        .maybeSingle<PortalCabinetRow>(),
+    'db:getPortalCabinet',
+  );
+  if (error) throw new Error('portal_cabinet_lookup_failed');
+  return data ?? null;
+}
+
+function portalPeriodStart(period: PortalCallsQuery['period']): string {
+  const days = period === '7d' ? 7 : period === '90d' ? 90 : 30;
+  return new Date(Date.now() - days * 86_400_000).toISOString();
+}
+
+function applyPortalCallFilters<T extends {
+  gte(column: string, value: string): T;
+  eq(column: string, value: string): T;
+  not(column: string, operator: string, value: null): T;
+  or(filters: string): T;
+}>(query: T, filters: PortalCallsQuery): T {
+  let filtered = query.gte('date_appel', portalPeriodStart(filters.period));
+  if (filters.outcome) filtered = filtered.eq('resultat', filters.outcome);
+  if (filters.practitionerId) filtered = filtered.eq('rdv_praticien', filters.practitionerId);
+  if (filters.summaryStatus === 'complete') {
+    filtered = filtered.not('pdf_url', 'is', null).eq('email_status', 'sent');
+  } else if (filters.summaryStatus === 'pending') {
+    filtered = filtered.eq('email_status', 'pending');
+  } else if (filters.summaryStatus === 'failed') {
+    filtered = filtered.or('email_status.eq.failed,email_status.eq.bounced');
+  }
+  return filtered;
+}
+
+export async function listPortalCalls(
+  cabinetId: string,
+  filters: PortalCallsQuery,
+): Promise<{ rows: PortalCallRow[]; total: number }> {
+  const supabase = getServiceClient();
+  const start = (filters.page - 1) * filters.pageSize;
+  let query = supabase
+    .from('appels')
+    .select(PORTAL_CALL_COLUMNS, { count: 'exact' })
+    .eq('cabinet_id', cabinetId);
+  query = applyPortalCallFilters(query, filters);
+  const sortDuration = filters.sort.startsWith('duration_');
+  const ascending = filters.sort.endsWith('_asc');
+  query = query.order(sortDuration ? 'duree_secondes' : 'date_appel', {
+    ascending,
+    nullsFirst: false,
+  });
+  if (sortDuration) {
+    query = query.order('date_appel', { ascending, nullsFirst: false });
+  }
+  query = query.order('id', { ascending });
+  const { data, error, count } = await withDbTimeout(
+    (signal) => query.range(start, start + filters.pageSize - 1).abortSignal(signal),
+    'db:listPortalCalls',
+  );
+  if (error) throw new Error('portal_calls_list_failed');
+  return { rows: (data ?? []) as unknown as PortalCallRow[], total: count ?? 0 };
+}
+
+function portalDashboardNumber(value: unknown): number | null {
+  const parsed = typeof value === 'number'
+    ? value
+    : typeof value === 'string' && /^\d+$/u.test(value)
+      ? Number(value)
+      : Number.NaN;
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+/** Read exact dashboard aggregates and recent calls from one SQL snapshot. */
+export async function getPortalDashboardSnapshot(
+  cabinetId: string,
+  period: PortalCallsQuery['period'],
+): Promise<PortalDashboardSnapshot> {
+  const result = await withDbTimeout(
+    (signal) => getServiceClient()
+      .rpc('get_portal_dashboard_snapshot', {
+        p_cabinet_id: cabinetId,
+        p_period: period,
+      })
+      .abortSignal(signal),
+    'db:getPortalDashboardSnapshot',
+  ) as unknown as { data: unknown; error: unknown };
+  if (typeof result.error === 'object' && result.error !== null) {
+    const rpcError = result.error as Record<string, unknown>;
+    if (rpcError.code === 'P0002') throw new Error('portal_cabinet_not_found');
+  }
+  if (result.error) throw new Error('portal_dashboard_snapshot_failed');
+
+  const values = Array.isArray(result.data) ? result.data as unknown[] : [];
+  const value: unknown = values[0] ?? null;
+  if (typeof value !== 'object' || value === null) {
+    throw new Error('portal_dashboard_snapshot_failed');
+  }
+  const row = value as Record<string, unknown>;
+  const totalCalls = portalDashboardNumber(row.total_calls);
+  const totalDurationSeconds = portalDashboardNumber(row.total_duration_seconds);
+  const appointments = portalDashboardNumber(row.appointments);
+  if (
+    typeof row.period_start !== 'string'
+    || totalCalls === null
+    || totalDurationSeconds === null
+    || appointments === null
+    || !Array.isArray(row.volume_by_date)
+    || !Array.isArray(row.outcomes)
+    || !Array.isArray(row.recent_calls)
+  ) {
+    throw new Error('portal_dashboard_snapshot_failed');
+  }
+
+  return {
+    periodStart: row.period_start,
+    totalCalls,
+    totalDurationSeconds,
+    appointments,
+    volume: row.volume_by_date as PortalDashboardSnapshot['volume'],
+    outcomes: row.outcomes as PortalDashboardSnapshot['outcomes'],
+    recentCalls: row.recent_calls as PortalDashboardSnapshot['recentCalls'],
+  };
+}
+
+export async function getPortalCall(
+  cabinetId: string,
+  callId: string,
+): Promise<PortalCallRow | null> {
+  const { data, error } = await withDbTimeout(
+    (signal) =>
+      getServiceClient()
+        .from('appels')
+        .select(PORTAL_CALL_COLUMNS)
+        .eq('cabinet_id', cabinetId)
+        .eq('id', callId)
+        .abortSignal(signal)
+        .maybeSingle<PortalCallRow>(),
+    'db:getPortalCall',
+  );
+  if (error) throw new Error('portal_call_lookup_failed');
+  return data ?? null;
+}
+
+export async function listPortalTeam(cabinetId: string): Promise<PortalTeamRow[]> {
+  const { data, error } = await withDbTimeout(
+    (signal) =>
+      getServiceClient()
+        .from('cabinet_memberships')
+        .select('user_id, role, actif, created_at')
+        .eq('cabinet_id', cabinetId)
+        .order('created_at', { ascending: true })
+        .abortSignal(signal),
+    'db:listPortalTeam',
+  );
+  if (error) throw new Error('portal_team_list_failed');
+  return data ?? [];
+}
+
+/**
+ * Apply the allowlisted cabinet delta and its technical audit event in the
+ * same PostgreSQL transaction. The RPC performs the config merge while
+ * holding the cabinet row lock. Only serialization conflicts are retried.
+ */
+export async function applyPortalCabinetPatchWithAudit(
+  cabinetId: string,
+  actorUserId: string,
+  action: 'settings_updated' | 'assistant_updated',
+  patch: PortalCabinetPatch,
+  changedFields: string[],
+  initialExpectedUpdatedAt: string,
+): Promise<PortalCabinetRow> {
+  let expectedUpdatedAt = initialExpectedUpdatedAt;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const result = (await withDbTimeout(
+      (signal) =>
+        getServiceClient()
+          .rpc('apply_portal_cabinet_patch_with_audit', {
+            p_cabinet_id: cabinetId,
+            p_actor_user_id: actorUserId,
+            p_action: action,
+            p_expected_updated_at: expectedUpdatedAt,
+            p_patch: patch,
+            p_changed_fields: changedFields,
+          })
+          .abortSignal(signal),
+      'db:applyPortalCabinetPatchWithAudit',
+    )) as {
+      data: unknown;
+      error: { code?: string; message: string } | null;
+    };
+
+    if (!result.error) {
+      const row: unknown = Array.isArray(result.data) ? result.data[0] : null;
+      if (typeof row !== 'object' || row === null) {
+        throw new Error('portal_cabinet_atomic_update_invalid_result');
+      }
+      return row as PortalCabinetRow;
+    }
+    if (result.error.code === 'P0002') throw new Error('portal_cabinet_not_found');
+    if (result.error.code === '42501') throw new Error('portal_admin_membership_required');
+    if (result.error.code !== '40001') throw new Error('portal_cabinet_atomic_update_failed');
+    if (attempt === 2) break;
+
+    const current = await getPortalCabinet(cabinetId);
+    if (!current) throw new Error('portal_cabinet_not_found');
+    expectedUpdatedAt = current.updated_at;
+  }
+  throw new Error('portal_cabinet_concurrent_update');
 }

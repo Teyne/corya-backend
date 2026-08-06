@@ -47,6 +47,9 @@ const SENSITIVE_KEYS: ReadonlySet<string> = new Set(
     'patient_nom',
     'patient_prenom',
     'patient_telephone',
+    'numero_appelant_masque',
+    'maskednumber',
+    'maskedtransfernumber',
 
     // Retell call payload — verbatim / audio / phone identifiers
     'transcript',
@@ -55,6 +58,8 @@ const SENSITIVE_KEYS: ReadonlySet<string> = new Set(
     'public_log_url',
     'from_number',
     'to_number',
+    'signedurl',
+    'pdf_url',
 
     // Auth material. Redact a complete headers object so an unknown future
     // authentication header cannot bypass a finite key blacklist.

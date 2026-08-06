@@ -51,7 +51,21 @@ function safeUrl(value: unknown): string {
       if (!value.startsWith('/')) return '/';
       parsed = new URL(value, 'http://http-log.invalid');
     }
-    return parsed.pathname.length > 0 ? parsed.pathname : '/';
+    const pathname = parsed.pathname.length > 0 ? parsed.pathname : '/';
+    return pathname
+      .split('/')
+      .map((segment) => {
+        let decoded = segment;
+        try {
+          decoded = decodeURIComponent(segment);
+        } catch {
+          // Malformed percent-encoding stays opaque and bounded to pathname.
+        }
+        return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(decoded)
+          ? ':id'
+          : segment;
+      })
+      .join('/');
   } catch {
     return '/';
   }
@@ -120,4 +134,4 @@ export function buildHttpLoggerOptions(logger: Logger): Options {
 }
 
 // Exported for tests only. Do not import from application code.
-export const __internals = { serializeError };
+export const __internals = { safeUrl, serializeError };

@@ -211,6 +211,7 @@ const envSchema = z.object({
   // hung Supabase request pin a worker slot indefinitely — see
   // src/utils/timeout.ts and the audit trail in each service file.
   TIMEOUT_DB_MS: z.coerce.number().int().min(200).max(60_000).default(5_000),
+  TIMEOUT_AUTH_MS: z.coerce.number().int().min(200).max(30_000).default(3_000),
   TIMEOUT_STORAGE_MS: z.coerce.number().int().min(1_000).max(120_000).default(30_000),
   TIMEOUT_PDF_MS: z.coerce.number().int().min(1_000).max(60_000).default(15_000),
   TIMEOUT_SMTP_MS: z.coerce.number().int().min(1_000).max(120_000).default(30_000),

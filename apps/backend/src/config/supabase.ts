@@ -20,6 +20,7 @@ import { env } from './env.js';
  * to require real Supabase env vars just to load the module.
  */
 let cached: SupabaseClient | null = null;
+let cachedAuth: SupabaseClient | null = null;
 
 export function getServiceClient(): SupabaseClient {
   if (cached) return cached;
@@ -38,7 +39,41 @@ export function getServiceClient(): SupabaseClient {
   return cached;
 }
 
+/**
+ * Auth-only Supabase client used to validate portal access tokens with the
+ * official Auth API. It never persists or refreshes a session and is absent
+ * when the optional portal configuration has not been provisioned.
+ */
+export function getAuthClient(): SupabaseClient | null {
+  if (cachedAuth) return cachedAuth;
+  if (!env.SUPABASE_ANON_KEY) return null;
+  cachedAuth = createClient(env.SUPABASE_URL, env.SUPABASE_ANON_KEY, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+    },
+    global: {
+      fetch: async (input, init) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), env.TIMEOUT_AUTH_MS);
+        try {
+          const incomingSignal = init?.signal;
+          const signal = incomingSignal
+            ? AbortSignal.any([incomingSignal, controller.signal])
+            : controller.signal;
+          return await fetch(input, { ...init, signal });
+        } finally {
+          clearTimeout(timer);
+        }
+      },
+    },
+  });
+  return cachedAuth;
+}
+
 /** Test-only: drop the cached client so tests can rebuild it. */
 export function __resetForTests(): void {
   cached = null;
+  cachedAuth = null;
 }

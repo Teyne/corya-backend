@@ -66,6 +66,7 @@ process.env.ALERT_ENABLED ??= 'true';
 // Session 4 vague 3 — timeouts + SMTP retry policy. Short values keep
 // the test suite fast; per-test overrides are done inline where needed.
 process.env.TIMEOUT_DB_MS ??= '5000';
+process.env.TIMEOUT_AUTH_MS ??= '3000';
 process.env.TIMEOUT_STORAGE_MS ??= '30000';
 process.env.TIMEOUT_PDF_MS ??= '15000';
 process.env.TIMEOUT_SMTP_MS ??= '30000';

@@ -12,7 +12,9 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import express, { type Request, type Response } from 'express';
 import request from 'supertest';
 import {
+  __getRateLimitBucketCountForTests,
   __resetRateLimitForTests,
+  consumeRateLimit,
   createRateLimiter,
 } from '../../src/middleware/rate-limit.js';
 
@@ -92,6 +94,46 @@ describe('createRateLimiter', () => {
     // B is still free.
     const bOk = await request(app).get('/b');
     expect(bOk.status).toBe(200);
+  });
+
+  it('logs only a constant route and never a dynamic path or limiter identity', async () => {
+    const warnings: Array<Record<string, unknown>> = [];
+    const app = express();
+    app.use((req, _res, next) => {
+      (req as unknown as { log: { warn: (fields: Record<string, unknown>) => void } }).log = {
+        warn: (fields): void => { warnings.push(fields); },
+      };
+      next();
+    });
+    app.use(createRateLimiter(
+      { scope: 'admin_log_test', max: 0, windowMs: 10_000, route: '/admin/*' },
+      (req) => req.get('x-synthetic-source') ?? 'unknown',
+    ));
+
+    await request(app)
+      .get('/admin/calls/44444444-4444-4444-8444-444444444444?secret=hidden')
+      .set('X-Synthetic-Source', 'SYNTHETIC_LIMITER_IDENTITY')
+      .expect(429);
+
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({ route: '/admin/*' });
+    expect(warnings[0]).not.toHaveProperty('path');
+    expect(JSON.stringify(warnings)).not.toContain('44444444-4444-4444-8444-444444444444');
+    expect(JSON.stringify(warnings)).not.toContain('SYNTHETIC_LIMITER_IDENTITY');
+  });
+
+  it('keeps the in-memory identity store bounded under source churn', () => {
+    const fakeRequest = { log: { warn: (): void => {} } } as unknown as Request;
+    const fakeResponse = {} as Response;
+    for (let index = 0; index < 10_050; index += 1) {
+      expect(consumeRateLimit(
+        { scope: 'bounded_store_test', max: 1, windowMs: 60_000 },
+        fakeRequest,
+        fakeResponse,
+        `SYNTHETIC_SOURCE_${index}`,
+      )).toBe(true);
+    }
+    expect(__getRateLimitBucketCountForTests()).toBeLessThanOrEqual(10_000);
   });
 });
 

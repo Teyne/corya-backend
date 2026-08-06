@@ -101,6 +101,23 @@ function parsedLogs(): Record<string, unknown>[] {
 
 describe('pino-http safe HTTP allowlist', () => {
   it.each([
+    {
+      value: '/admin/calls/44444444-4444-4444-8444-444444444444?token=hidden',
+      expected: '/admin/calls/:id',
+    },
+    {
+      value: 'https://logs.invalid/admin/calls/44444444-4444-4444-8444-444444444444/pdf-url?token=hidden',
+      expected: '/admin/calls/:id/pdf-url',
+    },
+    {
+      value: '/admin/calls/not-a-uuid?token=hidden',
+      expected: '/admin/calls/not-a-uuid',
+    },
+  ])('removes queries and normalizes UUID route segments', ({ value, expected }) => {
+    expect(__internals.safeUrl(value)).toBe(expected);
+  });
+
+  it.each([
     { value: null, expectedType: 'Error' },
     { value: 'synthetic primitive', expectedType: 'Error' },
     {
