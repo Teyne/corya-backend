@@ -96,6 +96,13 @@ afterEach(() => {
 });
 
 describe('renderRecapHtml', () => {
+  it('pins every displayed PDF date to Europe/Zurich in the real template', () => {
+    __setTemplateForTests(null);
+    const html = renderRecapHtml(APPEL, CABINET);
+
+    expect(html).toContain("timeZone: 'Europe/Zurich'");
+  });
+
   it('injects a JSON payload into the corya-data script tag', () => {
     const html = renderRecapHtml(APPEL, CABINET);
     expect(html).toMatch(/<script type="application\/json" id="corya-data">.+<\/script>/);

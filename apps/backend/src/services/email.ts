@@ -217,6 +217,8 @@ const RESULTAT_LABELS: Record<string, string> = {
   refus: 'Refus / annulation',
 };
 
+const DISPLAY_TIME_ZONE = 'Europe/Zurich';
+
 function actionText(resultat: string | null): string {
   switch (resultat) {
     case 'rdv_pris':
@@ -242,6 +244,7 @@ function formatDate(iso: string): string {
   // (Alpine builds may not — safeguard with a fallback).
   try {
     return d.toLocaleString('fr-CH', {
+      timeZone: DISPLAY_TIME_ZONE,
       day: '2-digit',
       month: 'long',
       year: 'numeric',
@@ -310,7 +313,7 @@ export function renderEmailBodies(
     action,
     '',
     `PDF récap (lien valable 30 min) : ${ctx.pdfUrl}`,
-    `Consulter dans Corya : ${ctx.adminUrl}`,
+    `Portail Corya : ${ctx.adminUrl}`,
     '',
     'Le récapitulatif est également joint à cet email.',
     '',
@@ -323,6 +326,7 @@ export function renderEmailBodies(
     if (Number.isNaN(d.getTime())) return '';
     try {
       return d.toLocaleTimeString('fr-CH', {
+        timeZone: DISPLAY_TIME_ZONE,
         hour: '2-digit',
         minute: '2-digit',
       });

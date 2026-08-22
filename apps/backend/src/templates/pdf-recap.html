@@ -305,6 +305,7 @@
           // Swiss French locale, includes time.
           try {
             return d.toLocaleString('fr-CH', {
+              timeZone: 'Europe/Zurich',
               day: '2-digit',
               month: 'long',
               year: 'numeric',

@@ -108,7 +108,30 @@ describe('renderEmailBodies', () => {
       pdfUrl: 'https://sig/x',
       adminUrl: 'https://admin/x',
     });
-    expect(subject).toMatch(/^Nouvel appel reçu — Cabinet Corya Test — \d{2}:\d{2}$/);
+    // 09:42 UTC is 11:42 in Europe/Zurich on 31 July (CEST).
+    expect(subject).toBe('Nouvel appel reçu — Cabinet Corya Test — 11:42');
+  });
+
+  it('renders call times in Europe/Zurich independently of the server timezone', () => {
+    const { html, text } = renderEmailBodies(APPEL, CABINET, {
+      pdfUrl: 'https://sig/x',
+      adminUrl: 'https://portail.corya.ch',
+    });
+
+    expect(html).toContain('11:42');
+    expect(text).toContain('11:42');
+    expect(text).toContain('Portail Corya : https://portail.corya.ch');
+  });
+
+  it('labels the application link as Portail Corya in the real template', () => {
+    __setTemplateForTests(null);
+    const { html } = renderEmailBodies(APPEL, CABINET, {
+      pdfUrl: 'https://sig/x',
+      adminUrl: 'https://portail.corya.ch',
+    });
+
+    expect(html).toContain('Ouvrir le Portail Corya');
+    expect(html).toContain('https://portail.corya.ch');
   });
 
   it('emits both an HTML and a plaintext body', () => {
