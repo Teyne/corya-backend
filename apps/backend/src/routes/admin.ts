@@ -41,6 +41,16 @@ const practitionerSchema = z.object({
   defaultDurationMin: z.number().int().min(5).max(240),
   active: z.boolean(),
 }).strict();
+const calendarIntegrationSchema = z.object({
+  provider: z.literal('cal.com'),
+  calendarName: z.string().trim().min(1).max(120),
+  status: z.literal('connected'),
+  slotDurationMin: z.number().int().min(5).max(240),
+  minimumNoticeHours: z.number().int().min(0).max(8_760),
+  allowBooking: z.boolean(),
+  allowReschedule: z.boolean(),
+  allowCancellation: z.boolean(),
+}).strict();
 const settingsPatchSchema = z.object({
   practiceName: z.string().trim().min(2).max(160).optional(),
   specialty: z.enum([
@@ -160,6 +170,13 @@ function portalConfig(cabinet: PortalCabinetRow): Record<string, unknown> {
   return asRecord(asRecord(cabinet.config_agent).portal);
 }
 
+function calendarIntegration(cabinet: PortalCabinetRow): z.infer<typeof calendarIntegrationSchema> | null {
+  const parsed = calendarIntegrationSchema.safeParse(
+    asRecord(cabinet.config_agent).calendar,
+  );
+  return parsed.success ? parsed.data : null;
+}
+
 function safeReason(value: string | null): string {
   if (!value) return 'Autre demande';
   const normalized = value.normalize('NFKD').replace(/[\u0300-\u036f]/gu, '').toLowerCase();
@@ -191,7 +208,7 @@ function dashboardCallSummary(row: PortalDashboardRecentCall): Record<string, un
   return {
     id: row.id,
     startedAt: row.date_appel,
-    maskedNumber: 'NumÃ©ro non exposÃ©',
+    maskedNumber: 'Numéro non exposé',
     durationSec: Math.max(0, row.duree_secondes ?? 0),
     reason: safeReason(row.motif_appel),
     outcome: row.resultat ? DB_TO_OUTCOME[row.resultat] : 'failed',
@@ -265,23 +282,31 @@ function assistantDto(cabinet: PortalCabinetRow): Record<string, unknown> {
 
 function integrationsDto(cabinet: PortalCabinetRow): Record<string, unknown> {
   const settings = settingsDto(cabinet);
+  const calendar = calendarIntegration(cabinet);
   return {
     integrations: [
-      { id: 'calendar', category: 'calendar', name: 'Agenda', description: 'Agenda du cabinet', status: 'not_configured', detail: 'Configuration requise' },
+      {
+        id: 'calendar',
+        category: 'calendar',
+        name: 'Agenda',
+        description: 'Agenda du cabinet',
+        status: calendar ? 'connected' : 'not_configured',
+        detail: calendar ? 'Cal.com actif' : 'Configuration requise',
+      },
       { id: 'telephony', category: 'telephony', name: 'Téléphonie', description: 'Ligne téléphonique Corya', status: cabinet.statut === 'actif' ? 'connected' : 'degraded', detail: cabinet.statut === 'actif' ? 'Service actif' : 'Service suspendu' },
       { id: 'email', category: 'email', name: 'E-mail', description: 'Envoi des récapitulatifs', status: cabinet.email_notification ? 'connected' : 'needs_config', detail: cabinet.email_notification ? 'Destinataire configuré' : 'Configuration requise' },
     ],
     calendar: {
-      provider: '',
-      calendarName: '',
+      provider: calendar?.provider ?? '',
+      calendarName: calendar?.calendarName ?? '',
       practitionerIds: (settings.practitioners as Array<{ id: string }>).map((item) => item.id),
-      slotDurationMin: 30,
+      slotDurationMin: calendar?.slotDurationMin ?? 30,
       openingHours: settings.openingHours,
       closedDays: [],
-      minimumNoticeHours: 24,
-      allowBooking: false,
-      allowReschedule: false,
-      allowCancellation: false,
+      minimumNoticeHours: calendar?.minimumNoticeHours ?? 24,
+      allowBooking: calendar?.allowBooking ?? false,
+      allowReschedule: calendar?.allowReschedule ?? false,
+      allowCancellation: calendar?.allowCancellation ?? false,
     },
   };
 }
@@ -425,7 +450,7 @@ export function buildAdminRouter(
       outcomes,
       recentCalls: snapshot.recentCalls.map(dashboardCallSummary),
       assistantState: row.statut === 'actif' ? 'operational' : 'offline',
-      calendarState: 'not_configured',
+      calendarState: calendarIntegration(row) ? 'operational' : 'not_configured',
       alerts: [],
       coverage: settings.openingHours,
     });

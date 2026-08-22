@@ -413,6 +413,75 @@ describe('portal admin read and mutation contracts', () => {
     expect(response.body.volume).toEqual([{ date: '2026-08-06', calls: 1 }]);
     expect(response.body.recentCalls[0]).not.toHaveProperty('pdf_url');
     expect(response.body.recentCalls[0]).not.toHaveProperty('has_pdf');
+    expect(response.body.recentCalls[0].maskedNumber).toBe('Numéro non exposé');
+  });
+
+  it('exposes only an allowlisted Cal.com state when the cabinet config is valid', async () => {
+    const deps = dependencies();
+    vi.mocked(deps.getCabinet).mockResolvedValue({
+      ...cabinet,
+      config_agent: {
+        calendar: {
+          provider: 'cal.com',
+          calendarName: 'Agenda de démonstration',
+          status: 'connected',
+          slotDurationMin: 30,
+          minimumNoticeHours: 24,
+          allowBooking: true,
+          allowReschedule: false,
+          allowCancellation: false,
+        },
+      },
+    });
+    const app = appFor(deps);
+
+    const integrations = await request(app).get('/admin/integrations').set(bearer());
+    const dashboard = await request(app).get('/admin/dashboard?period=30d').set(bearer());
+
+    expect(integrations.status).toBe(200);
+    expect(integrations.body.integrations[0]).toMatchObject({
+      id: 'calendar',
+      status: 'connected',
+      detail: 'Cal.com actif',
+    });
+    expect(integrations.body.calendar).toMatchObject({
+      provider: 'cal.com',
+      calendarName: 'Agenda de démonstration',
+      slotDurationMin: 30,
+      minimumNoticeHours: 24,
+      allowBooking: true,
+      allowReschedule: false,
+      allowCancellation: false,
+    });
+    expect(JSON.stringify(integrations.body)).not.toContain('apiKey');
+    expect(dashboard.body.calendarState).toBe('operational');
+  });
+
+  it('fails closed when the stored calendar integration is malformed', async () => {
+    const deps = dependencies();
+    vi.mocked(deps.getCabinet).mockResolvedValue({
+      ...cabinet,
+      config_agent: {
+        calendar: {
+          provider: 'cal.com',
+          calendarName: 'Agenda invalide',
+          status: 'connected',
+          slotDurationMin: 30,
+          minimumNoticeHours: 24,
+          allowBooking: true,
+          allowReschedule: false,
+          allowCancellation: false,
+          apiKey: 'synthetic-forbidden-value',
+        },
+      },
+    });
+
+    const response = await request(appFor(deps)).get('/admin/integrations').set(bearer());
+
+    expect(response.status).toBe(200);
+    expect(response.body.integrations[0].status).toBe('not_configured');
+    expect(response.body.calendar.allowBooking).toBe(false);
+    expect(JSON.stringify(response.body)).not.toContain('synthetic-forbidden-value');
   });
 
   it.each([
