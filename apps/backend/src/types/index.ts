@@ -136,6 +136,31 @@ export interface AppelInsertRow {
   // would break the 24-month Storage purge which parses this field.
 }
 
+export type CalcomBookingTrigger =
+  | 'BOOKING_CREATED'
+  | 'BOOKING_RESCHEDULED'
+  | 'BOOKING_CANCELLED'
+  | 'BOOKING_REJECTED';
+
+/** PII-free projection accepted from an authenticated Cal.com webhook. */
+export interface CalcomBookingEventInput {
+  eventKey: string;
+  triggerEvent: CalcomBookingTrigger;
+  providerCreatedAt: string;
+  providerBookingUid: string;
+  rescheduleUid: string | null;
+  eventTypeId: string;
+  startAt: string;
+  endAt: string;
+}
+
+export interface CalcomBookingEventResult {
+  bookingId: string | null;
+  cabinetId: string;
+  sourceAppelId: string | null;
+  outcome: 'applied' | 'duplicate';
+}
+
 export type AppelResultat =
   | 'rdv_pris'
   | 'message'

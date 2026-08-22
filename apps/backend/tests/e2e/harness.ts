@@ -266,6 +266,7 @@ export function installQueryMocks(): void {
         }
         return Promise.resolve({ appelId, duplicate });
       },
+      reconcileCalendarBookingForAppel: (): Promise<null> => Promise.resolve(null),
       setAppelPdfPath: (appelId: string, path: string): Promise<void> => {
         const a = store.appels.get(appelId);
         if (a) a.pdf_url = path;

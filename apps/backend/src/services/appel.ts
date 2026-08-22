@@ -24,7 +24,11 @@
  */
 import { logger } from '../config/logger.js';
 import { env } from '../config/env.js';
-import { findCabinetByCoryaNumber, persistCallAnalyzed } from '../db/queries.js';
+import {
+  findCabinetByCoryaNumber,
+  persistCallAnalyzed,
+  reconcileCalendarBookingForAppel,
+} from '../db/queries.js';
 import type {
   AppelInsertRow,
   AppelResultat,
@@ -118,6 +122,10 @@ export async function processCallAnalyzed(
   const custom = call.call_analysis?.custom_analysis_data;
 
   const dateAppelIso = new Date(call.start_timestamp).toISOString();
+  const callEndedAtIso = new Date(
+    call.end_timestamp
+      ?? call.start_timestamp + (call.duration_ms ?? 0),
+  ).toISOString();
   const dureeSecondes =
     typeof call.duration_ms === 'number'
       ? Math.round(call.duration_ms / 1000)
@@ -185,6 +193,23 @@ export async function processCallAnalyzed(
     purgeRunAfter: computeAudioExpiresAt(dateAppelIso),
     correlationId,
   });
+
+  // Cal.com and Retell webhooks are independent and may arrive in either
+  // order. Reconcile only a confirmed rdv_pris with an exact cabinet/start
+  // match; the SQL function deliberately refuses ambiguous candidates.
+  if (row.resultat === 'rdv_pris') {
+    const bookingId = await reconcileCalendarBookingForAppel(
+      appelId,
+      cabinet.id,
+      dateAppelIso,
+      callEndedAtIso,
+      row.rdv_date,
+    );
+    logger.info(
+      { ...logCtx, appel_id: appelId, booking_id: bookingId },
+      bookingId ? 'calendar_booking_reconciled' : 'calendar_booking_not_yet_reconciled',
+    );
+  }
 
   if (duplicate) {
     logger.info({ ...logCtx, appel_id: appelId }, 'webhook_replay_reconciled');

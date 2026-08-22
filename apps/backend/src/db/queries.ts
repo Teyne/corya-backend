@@ -14,6 +14,8 @@ import type {
   AppelInsertRow,
   AppelProcessingRow,
   CabinetProcessingRow,
+  CalcomBookingEventInput,
+  CalcomBookingEventResult,
   FileDeletion,
   Job,
   JobInsertRow,
@@ -998,6 +1000,83 @@ export async function workerHeartbeatDeletionPoll(
     'db:workerHeartbeatDeletionPoll',
   );
   if (error) throw new Error(`db_worker_deletion_poll_failed: ${error.message}`);
+}
+
+/** Persist one authenticated, PII-free Cal.com lifecycle event atomically. */
+export async function persistCalcomBookingEvent(
+  input: CalcomBookingEventInput,
+): Promise<CalcomBookingEventResult> {
+  const supabase = getServiceClient();
+  const result = await withDbTimeout(
+    (signal) =>
+      supabase
+        .rpc('persist_calcom_booking_event', {
+          p_event_key: input.eventKey,
+          p_trigger_event: input.triggerEvent,
+          p_provider_created_at: input.providerCreatedAt,
+          p_provider_booking_uid: input.providerBookingUid,
+          p_reschedule_uid: input.rescheduleUid,
+          p_event_type_id: input.eventTypeId,
+          p_start_at: input.startAt,
+          p_end_at: input.endAt,
+        })
+        .abortSignal(signal),
+    'db:persistCalcomBookingEvent',
+  ) as {
+    data: unknown;
+    error: { message: string } | null;
+  };
+
+  if (result.error) throw new Error('db_persist_calcom_booking_event_failed');
+  const rows: unknown[] = Array.isArray(result.data) ? result.data : [];
+  const row: unknown = rows[0] ?? null;
+  if (!row || typeof row !== 'object') {
+    throw new Error('db_persist_calcom_booking_event_invalid_result');
+  }
+  const value = row as Record<string, unknown>;
+  if (
+    (typeof value.booking_id !== 'string' && value.booking_id !== null) ||
+    typeof value.cabinet_id !== 'string' ||
+    (typeof value.source_appel_id !== 'string' && value.source_appel_id !== null) ||
+    (value.outcome !== 'applied' && value.outcome !== 'duplicate')
+  ) {
+    throw new Error('db_persist_calcom_booking_event_invalid_result');
+  }
+
+  return {
+    bookingId: value.booking_id,
+    cabinetId: value.cabinet_id,
+    sourceAppelId: value.source_appel_id,
+    outcome: value.outcome,
+  };
+}
+
+/** Reconcile the opposite delivery order: Retell call after Cal.com event. */
+export async function reconcileCalendarBookingForAppel(
+  appelId: string,
+  cabinetId: string,
+  callStartedAt: string,
+  callEndedAt: string,
+  bookingStartAt: string | null,
+): Promise<string | null> {
+  const supabase = getServiceClient();
+  const result = await withDbTimeout(
+    (signal) =>
+      supabase
+        .rpc('reconcile_calendar_booking_for_appel', {
+          p_appel_id: appelId,
+          p_cabinet_id: cabinetId,
+          p_call_started_at: callStartedAt,
+          p_call_ended_at: callEndedAt,
+          p_booking_start_at: bookingStartAt,
+        })
+        .abortSignal(signal),
+    'db:reconcileCalendarBookingForAppel',
+  ) as { data: unknown; error: { message: string } | null };
+
+  if (result.error) throw new Error('db_reconcile_calendar_booking_failed');
+  if (result.data === null || typeof result.data === 'string') return result.data;
+  throw new Error('db_reconcile_calendar_booking_invalid_result');
 }
 
 // ---------------------------------------------------------------------------

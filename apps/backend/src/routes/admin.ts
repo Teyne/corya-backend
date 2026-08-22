@@ -43,6 +43,7 @@ const practitionerSchema = z.object({
 }).strict();
 const calendarIntegrationSchema = z.object({
   provider: z.literal('cal.com'),
+  eventTypeId: z.coerce.string().regex(/^\d{1,20}$/u),
   calendarName: z.string().trim().min(1).max(120),
   status: z.literal('connected'),
   slotDurationMin: z.number().int().min(5).max(240),

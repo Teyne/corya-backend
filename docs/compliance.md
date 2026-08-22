@@ -108,6 +108,7 @@ Aucune configuration d'agent Retell ne peut désactiver cette annonce. C'est un 
 | PDF récap | **30 jours max après création de l'appel** (voir détail ci-dessous) | Purge quotidienne à 03:30 UTC (`purge_old_pdfs`) |
 | Logs applicatifs (sans données perso) | 12 mois | Rotation d'hébergeur à confirmer ; BetterStack non actif |
 | Logs audit (`logs_actions`) | 24 mois | Purge mensuelle |
+| Registre technique Cal.com (sans identité ni contenu) | 24 mois | Purge mensuelle |
 
 ### PDF récap — précisions sur la rétention 30 jours
 
@@ -178,6 +179,8 @@ Corya utilise des sous-traitants pour le traitement. **Un DPA (Data Processing A
 | Sous-traitant | Rôle | Localisation | DPA à signer |
 |---|---|---|---|
 | Retell AI | Traitement voice/LLM | US (mais offre EU processing) | Obligatoire |
+| Cal.com | Agenda et réservation | À confirmer contractuellement | Obligatoire |
+| Twilio | Téléphonie SIP | International | Obligatoire |
 | Peoplefone | Téléphonie SIP | Suisse | Obligatoire |
 | Supabase | DB + Storage + Auth | Zurich (CH) | Obligatoire |
 | Infomaniak | Hébergement + email | Suisse | Obligatoire |

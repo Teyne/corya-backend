@@ -29,7 +29,9 @@ const {
   getMostRecentDeletionPoll,
   getWave7ContractVersion,
   markFileDeletionDeadLetterAlerted,
+  persistCalcomBookingEvent,
   persistCallAnalyzed,
+  reconcileCalendarBookingForAppel,
   releaseFileDeletionDeadLetterAlert,
 } = await import('../../src/db/queries.js');
 
@@ -121,6 +123,63 @@ describe('call_analyzed atomic intake RPC wrapper', () => {
       p_purge_payload: { retell_call_id: 'call-1' },
       p_purge_run_after: '2026-08-05T00:00:00.000Z',
       p_correlation_id: 'correlation-1',
+    });
+  });
+});
+
+describe('Cal.com booking registry RPC wrappers', () => {
+  it('passes only the PII-free event allowlist to the persistence RPC', async () => {
+    queueRpcResult([{
+      booking_id: 'booking-1',
+      cabinet_id: 'cabinet-1',
+      source_appel_id: null,
+      outcome: 'applied',
+    }]);
+
+    await expect(persistCalcomBookingEvent({
+      eventKey: 'a'.repeat(64),
+      triggerEvent: 'BOOKING_CREATED',
+      providerCreatedAt: '2026-08-22T17:00:00.000Z',
+      providerBookingUid: 'booking-uid',
+      rescheduleUid: null,
+      eventTypeId: '6723841',
+      startAt: '2026-08-24T08:00:00.000Z',
+      endAt: '2026-08-24T08:30:00.000Z',
+    })).resolves.toEqual({
+      bookingId: 'booking-1',
+      cabinetId: 'cabinet-1',
+      sourceAppelId: null,
+      outcome: 'applied',
+    });
+
+    expect(rpcMock).toHaveBeenLastCalledWith('persist_calcom_booking_event', {
+      p_event_key: 'a'.repeat(64),
+      p_trigger_event: 'BOOKING_CREATED',
+      p_provider_created_at: '2026-08-22T17:00:00.000Z',
+      p_provider_booking_uid: 'booking-uid',
+      p_reschedule_uid: null,
+      p_event_type_id: '6723841',
+      p_start_at: '2026-08-24T08:00:00.000Z',
+      p_end_at: '2026-08-24T08:30:00.000Z',
+    });
+  });
+
+  it('reconciles the opposite delivery order with exact technical keys', async () => {
+    queueRpcResult('booking-1');
+    await expect(reconcileCalendarBookingForAppel(
+      'appel-1',
+      'cabinet-1',
+      '2026-08-22T17:00:00.000Z',
+      '2026-08-22T17:02:00.000Z',
+      '2026-08-24T08:00:00.000Z',
+    )).resolves.toBe('booking-1');
+
+    expect(rpcMock).toHaveBeenLastCalledWith('reconcile_calendar_booking_for_appel', {
+      p_appel_id: 'appel-1',
+      p_cabinet_id: 'cabinet-1',
+      p_call_started_at: '2026-08-22T17:00:00.000Z',
+      p_call_ended_at: '2026-08-22T17:02:00.000Z',
+      p_booking_start_at: '2026-08-24T08:00:00.000Z',
     });
   });
 });

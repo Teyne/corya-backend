@@ -60,6 +60,12 @@ import {
 } from '../services/retell.js';
 import { RetellSignatureError, toLogFields, WebhookValidationError } from '../utils/errors.js';
 import { consumeAuthenticatedWebhookRateLimit } from '../middleware/rate-limit.js';
+import {
+  CALCOM_SIGNATURE_HEADER,
+  parseCalcomBookingEvent,
+  processCalcomBookingEvent,
+  verifyCalcomSignature,
+} from '../services/calcom.js';
 
 /**
  * Extend Express' Request type locally: the raw body Buffer captured by the
@@ -70,6 +76,57 @@ interface RawBodyRequest extends Request {
 }
 
 export const webhooksRouter: Router = Router();
+
+webhooksRouter.post(
+  '/calcom/booking',
+  async (req: RawBodyRequest, res: Response): Promise<void> => {
+    const rawBody = req.rawBody;
+    if (!rawBody || rawBody.length === 0) {
+      res.status(400).json({ error: 'empty_body' });
+      return;
+    }
+    if (!env.CALCOM_WEBHOOK_SECRET) {
+      logger.error('calcom_webhook_not_configured');
+      res.status(503).json({ error: 'service_unavailable' });
+      return;
+    }
+
+    const signature = req.header(CALCOM_SIGNATURE_HEADER);
+    if (!verifyCalcomSignature(rawBody, signature, env.CALCOM_WEBHOOK_SECRET)) {
+      logger.warn({ has_header: Boolean(signature) }, 'calcom_webhook_signature_invalid');
+      res.status(401).json({ error: 'invalid_signature' });
+      return;
+    }
+    if (!consumeAuthenticatedWebhookRateLimit(req, res)) return;
+
+    let event;
+    try {
+      event = parseCalcomBookingEvent(rawBody, req.body as unknown);
+    } catch {
+      logger.error('calcom_webhook_payload_invalid_acked');
+      res.status(200).json({ received: true });
+      return;
+    }
+
+    try {
+      const result = await processCalcomBookingEvent(event);
+      logger.info(
+        {
+          trigger_event: event.triggerEvent,
+          booking_id: result.bookingId,
+          cabinet_id: result.cabinetId,
+          source_appel_id: result.sourceAppelId,
+          outcome: result.outcome,
+        },
+        'calcom_webhook_processed',
+      );
+      res.status(200).json({ received: true, outcome: result.outcome });
+    } catch (error: unknown) {
+      logger.error({ ...toLogFields(error) }, 'calcom_webhook_persistence_failed');
+      throw error;
+    }
+  },
+);
 
 webhooksRouter.post(
   '/retell/call-ended',

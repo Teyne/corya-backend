@@ -29,6 +29,7 @@ const ROLE_CONFIG = Object.freeze({
       'PORT',
       'CORS_ORIGIN',
       'TRUST_PROXY_HOPS',
+      'CALCOM_WEBHOOK_SECRET',
     ]),
   }),
   worker: Object.freeze({
@@ -120,6 +121,7 @@ export function validateEnvironment(role, environment) {
       (value) => isIntegerInRange(value, 0, 10),
     );
     invalidateWhenPresent('CORS_ORIGIN', isProductionCorsAllowList);
+    invalidateWhenPresent('CALCOM_WEBHOOK_SECRET', (value) => value.length >= 32);
   } else {
     invalidateWhenPresent('ADMIN_APP_URL', isHttpsUrl);
     invalidateWhenPresent('JOB_BATCH_SIZE', (value) => value === '1');

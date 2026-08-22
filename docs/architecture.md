@@ -1,13 +1,11 @@
 # Architecture technique Corya
 
-État vérifié le 4 août 2026. Les migrations Wave 7
-`20260802000000` à `20260802000003`, la corrective append-only
-`20260803000000` et l'intake atomique `20260804010000` sont appliqués sur la
-cible Supabase liée. Les environnements Jelastic API et worker exécutent le
-même artefact précompilé immuable au SHA Git
-`550d9a13406a191d097b76fa96521bc3644facc7` ; leurs contrôles de santé sont
-verts. La configuration Retell et calendrier reste une phase distincte avant
-l'ouverture à de vrais patients.
+État revu le 22 août 2026. Le schéma versionné couvre Wave 7, l'intake Retell
+atomique, le portail multi-tenant et le registre/réconciliation Cal.com. Les
+environnements Jelastic API et worker sont déployés depuis le même artefact
+précompilé immuable ; leur provenance exacte et leurs condensats sont relevés
+dans chaque rapport de déploiement. L'environnement reste une démonstration
+contrôlée, sans ouverture à de vrais patients.
 
 ## Composants
 
@@ -17,10 +15,11 @@ l'ouverture à de vrais patients.
 | Worker d'essai Jelastic | même paquet npm, processus et environnement séparés | actif, sans accès SLB, Chromium et heartbeats validés |
 | Données | Supabase Postgres + Storage privé | schéma versionné par migrations |
 | Téléphonie | Retell AI + SDK officiel | webhook et suppression d'appel implémentés |
+| Calendrier | Cal.com + webhook HMAC dédié | réservation pilotée par Retell ; registre technique Corya idempotent |
 | PDF | Puppeteer | implémenté |
 | E-mail métier | SMTP Infomaniak, port 587 STARTTLS | implémenté |
 | Site `corya.ch` | dépôt séparé TanStack Start/React, Lovable, Cloudflare | actif |
-| Back-office `app.corya.ch` | aucun code dans les dépôts vérifiés | projet futur |
+| Portail `portail.corya.ch` | React/Lovable + Supabase Auth, RLS tenant | actif en démonstration |
 | BetterStack/status public | configuration annoncée historiquement | non activée/confirmée |
 
 ## Chemin d'un appel
@@ -33,6 +32,24 @@ l'ouverture à de vrais patients.
 3. Le worker réclame atomiquement les jobs, avec récupération des verrous zombies, checkpoints et backoff.
 4. `process_appel` génère le PDF, l'upload dans `pdf-recaps` privé, crée une URL signée courte et envoie l'e-mail.
 5. `purge_audio_retell`, planifié à +48 h, supprime l'appel Retell. Un échec est journalisé et alerté mais ne bloque pas la file ; la rétention Retell configurée à un jour sert de filet indépendant.
+
+## Registre et réconciliation Cal.com
+
+Cal.com reste la source de vérité de la réservation. Le webhook
+`POST /webhooks/calcom/booking` vérifie `x-cal-signature-256` sur le corps brut,
+accepte uniquement les événements de création, déplacement, annulation et
+rejet, puis réduit immédiatement le payload à une liste blanche technique.
+Le corps brut, le nom, l'e-mail, le téléphone, les réponses de formulaire,
+les notes et les URL de réunion ne sont jamais persistés ni journalisés.
+
+`calendar_booking_events` fournit la clé d'idempotence du webhook et
+`calendar_bookings` conserve uniquement le cabinet, les UID fournisseur,
+l'event type, l'état et les horaires. La réconciliation avec `appels` accepte
+les deux ordres d'arrivée Retell/Cal.com. Elle utilise l'horaire de rendez-vous
+lorsqu'il existe, sinon la fenêtre technique de création pendant l'appel, et
+ne crée un lien que si le candidat est unique. Un cas ambigu reste non lié.
+Les deux tables sont privées (RLS, aucun droit `anon`/`authenticated`) et sont
+purgées après 24 mois par le cron mensuel existant.
 
 ## Suppressions physiques
 
@@ -66,24 +83,13 @@ aboutie et reste remédiable.
 
 ## État déployé et travail restant
 
-Les migrations `20260802000000` à `20260802000003`, la corrective
-`20260803000000` et l'intake atomique `20260804010000` sont alignés localement
-et à distance. La corrective résout le conflit PL/pgSQL observé dans
-`get_cron_health()` sans modifier les migrations historiques. L'intake
-atomique supprime le risque d'acquitter un `call_analyzed` avant sa persistance
-durable. Le 4 août 2026, l'API et le worker Jelastic sont actifs dans deux
-environnements séparés. L'API répond en HTTPS et `/health/deep` confirme la DB,
-le Storage, le worker, la boucle de suppression, le backlog et les dix crons.
-Le worker n'a aucun accès SLB.
-
-Les deux nœuds exécutent l'archive précompilée
-`corya-backend-550d9a13-prod.zip`, construite depuis le SHA Git complet
-`550d9a13406a191d097b76fa96521bc3644facc7`, avec le SHA-256
-`AA345BDDE19026B38BDF2B386B085056724814710FD2FC4D502D24475CF1D878`.
-Les condensats des entrypoints, du lockfile et de la configuration PM2 ont été
-comparés aux fichiers locaux. Les deux processus sont restés `online` sans
-restart ; les preflights, les endpoints de santé, le smoke Chromium et le
-contrôle de confidentialité des logs sont verts.
+L'API et le worker Jelastic utilisent deux environnements séparés ; le worker
+n'a aucun accès SLB. Chaque vague est livrée worker puis API depuis une archive
+précompilée identique et fait l'objet d'un contrôle de condensats, des
+preflights de rôle, de PM2 et de `/health/deep`. Les migrations sont appliquées
+avant le binaire qui les consomme. Les migrations sont append-only : le
+rollback normal revient au binaire précédent et ne tente pas de supprimer les
+tables nouvellement créées.
 
 Les heartbeats artificiels `dev-worker-local` et ceux des anciens processus
 worker d'essai ont été supprimés de manière ciblée après vérification de leur
@@ -101,6 +107,7 @@ supabase start
 supabase db reset
 psql "postgresql://postgres:postgres@127.0.0.1:54322/postgres" -v ON_ERROR_STOP=1 -f supabase/tests/wave7_invariants.sql
 psql "postgresql://postgres:postgres@127.0.0.1:54322/postgres" -v ON_ERROR_STOP=1 -f supabase/tests/call_analyzed_intake_invariants.sql
+psql "postgresql://postgres:postgres@127.0.0.1:54322/postgres" -v ON_ERROR_STOP=1 -f supabase/tests/calcom_booking_registry_invariants.sql
 ```
 
 Il utilise une base locale jetable, des données synthétiques et un

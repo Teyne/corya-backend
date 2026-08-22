@@ -30,6 +30,7 @@ process.env.SUPABASE_JWT_SECRET ??= 'test-jwt-secret-not-real';
 // Session 2.2 : bascule vers `retell-sdk`. Un seul secret désormais,
 // obligatoire au boot (schema env.ts). RETELL_WEBHOOK_SECRET a disparu.
 process.env.RETELL_API_KEY ??= 'test-retell-api-key-not-real';
+process.env.CALCOM_WEBHOOK_SECRET ??= 'test-calcom-webhook-secret-not-real-32chars';
 
 // -- Session 3: worker + SMTP dummies. The SMTP block is entirely OPTIONAL
 // at env boot, but individual tests may exercise `assertSmtpConfigured`

@@ -78,6 +78,7 @@ vi.mock('../../src/db/queries.js', () => {
       }
       return Promise.resolve({ appelId, duplicate: Boolean(existing) });
     }),
+    reconcileCalendarBookingForAppel: vi.fn(() => Promise.resolve(null)),
   };
 });
 
@@ -145,6 +146,7 @@ beforeEach(() => {
   vi.mocked(queries.insertAppelIdempotent).mockClear();
   vi.mocked(queries.enqueueJobIdempotent).mockClear();
   vi.mocked(queries.persistCallAnalyzed).mockClear();
+  vi.mocked(queries.reconcileCalendarBookingForAppel).mockClear();
   mockSdkVerify.mockReset();
 });
 
@@ -356,6 +358,13 @@ describe('POST /webhooks/retell/call-ended — call_analyzed', () => {
       'process_appel',
       'purge_audio_retell',
     ]);
+    expect(vi.mocked(queries.reconcileCalendarBookingForAppel)).toHaveBeenCalledWith(
+      'appel-1',
+      cabinetRow.id,
+      expect.any(String),
+      expect.any(String),
+      '2026-08-14T10:00:00.000Z',
+    );
   });
 
   it('is idempotent: replaying the same webhook creates exactly one appel and one set of jobs', async () => {

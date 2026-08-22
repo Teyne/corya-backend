@@ -423,6 +423,7 @@ describe('portal admin read and mutation contracts', () => {
       config_agent: {
         calendar: {
           provider: 'cal.com',
+          eventTypeId: '6723841',
           calendarName: 'Agenda de démonstration',
           status: 'connected',
           slotDurationMin: 30,

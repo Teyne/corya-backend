@@ -101,6 +101,12 @@ const envSchema = z.object({
     .max(3600)
     .default(300),
 
+  // ---- Cal.com webhook registry ---------------------------------------
+  // Dedicated HMAC secret configured on the Cal.com webhook subscription.
+  // It is deliberately distinct from the Cal.com API key used by Retell.
+  // Optional in dev/test; the production API preflight makes it mandatory.
+  CALCOM_WEBHOOK_SECRET: z.string().min(32).optional(),
+
   // ---- SMTP Infomaniak (optional in session 1, promote when email lands) ----
   SMTP_HOST: z.string().min(1).optional(),
   SMTP_PORT: z.coerce.number().int().positive().max(65_535).optional(),

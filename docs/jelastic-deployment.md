@@ -121,6 +121,7 @@ TRUST_PROXY_HOPS
 SUPABASE_URL
 SUPABASE_SERVICE_KEY
 RETELL_API_KEY
+CALCOM_WEBHOOK_SECRET
 ALERT_EMAIL
 HEALTH_DEEP_TOKEN
 SMTP_HOST
@@ -139,6 +140,11 @@ URL HTTPS valide. Le préflight impose HTTPS aux URL de production, puis valide
 les formats email et les bornes
 de PORT, SMTP_PORT et TRUST_PROXY_HOPS, le booléen SMTP_SECURE et la longueur
 minimale de HEALTH_DEEP_TOKEN, sans afficher les valeurs.
+
+`CALCOM_WEBHOOK_SECRET` est un secret HMAC dédié d'au moins 32 caractères,
+identique à celui configuré sur l'abonnement webhook Cal.com. Il ne s'agit ni
+de la clé API Cal.com utilisée par Retell ni d'un paramètre d'URL. Il est
+présent uniquement sur le rôle API ; le worker n'en a pas besoin.
 
 Les réglages non secrets de timeouts, alerting, health et rate limiting de
 .env.example doivent aussi être revus avant mise en service, même lorsqu'ils

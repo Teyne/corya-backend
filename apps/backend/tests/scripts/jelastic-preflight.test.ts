@@ -74,6 +74,7 @@ function validEnvironment(role: 'api' | 'worker'): Record<string, string> {
       PORT: '3123',
       CORS_ORIGIN: 'https://admin.corya.test,https://www.corya.test',
       TRUST_PROXY_HOPS: '1',
+      CALCOM_WEBHOOK_SECRET: 'synthetic-calcom-webhook-secret-32-chars',
     };
   }
   return {
@@ -159,6 +160,7 @@ describe('Jelastic role preflight', () => {
       PORT: '0',
       CORS_ORIGIN: '*',
       TRUST_PROXY_HOPS: '11',
+      CALCOM_WEBHOOK_SECRET: 'short',
     };
 
     const { result, lines } = runFor('api', { environment });
@@ -177,6 +179,7 @@ describe('Jelastic role preflight', () => {
       'PORT',
       'CORS_ORIGIN',
       'TRUST_PROXY_HOPS',
+      'CALCOM_WEBHOOK_SECRET',
     ]) {
       expect(report).toContain(name);
     }

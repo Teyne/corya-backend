@@ -63,6 +63,7 @@ vi.mock('../src/db/queries.js', () => {
       }
       return Promise.resolve({ appelId, duplicate: Boolean(existing) });
     }),
+    reconcileCalendarBookingForAppel: vi.fn(() => Promise.resolve(null)),
   };
 });
 
@@ -135,6 +136,7 @@ beforeEach(() => {
   vi.mocked(queries.insertAppelIdempotent).mockClear();
   vi.mocked(queries.enqueueJobIdempotent).mockClear();
   vi.mocked(queries.persistCallAnalyzed).mockClear();
+  vi.mocked(queries.reconcileCalendarBookingForAppel).mockClear();
   mockSdkVerify.mockReset();
 });
 
