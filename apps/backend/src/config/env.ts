@@ -106,6 +106,15 @@ const envSchema = z.object({
   // It is deliberately distinct from the Cal.com API key used by Retell.
   // Optional in dev/test; the production API preflight makes it mandatory.
   CALCOM_WEBHOOK_SECRET: z.string().min(32).optional(),
+  // Temporary bridge credential for the controlled demonstration cabinet.
+  // Production cabinet connections will use OAuth tokens stored through
+  // Supabase Vault; this value must never be used as a multi-tenant registry.
+  CALCOM_DEMO_API_KEY: z.string().min(1).optional(),
+  CALCOM_DEMO_CABINET_ID: z.string().uuid().optional(),
+  CALCOM_DEMO_FALLBACK_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
 
   // ---- SMTP Infomaniak (optional in session 1, promote when email lands) ----
   SMTP_HOST: z.string().min(1).optional(),
@@ -222,6 +231,7 @@ const envSchema = z.object({
   TIMEOUT_PDF_MS: z.coerce.number().int().min(1_000).max(60_000).default(15_000),
   TIMEOUT_SMTP_MS: z.coerce.number().int().min(1_000).max(120_000).default(30_000),
   TIMEOUT_RETELL_MS: z.coerce.number().int().min(1_000).max(60_000).default(10_000),
+  TIMEOUT_CALCOM_MS: z.coerce.number().int().min(1_000).max(60_000).default(10_000),
 
   // ---- Session 4 vague 3 — SMTP internal retry policy ----
   // Number of internal attempts INSIDE a single email job. Once exhausted

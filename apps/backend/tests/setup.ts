@@ -31,6 +31,9 @@ process.env.SUPABASE_JWT_SECRET ??= 'test-jwt-secret-not-real';
 // obligatoire au boot (schema env.ts). RETELL_WEBHOOK_SECRET a disparu.
 process.env.RETELL_API_KEY ??= 'test-retell-api-key-not-real';
 process.env.CALCOM_WEBHOOK_SECRET ??= 'test-calcom-webhook-secret-not-real-32chars';
+process.env.CALCOM_DEMO_API_KEY ??= 'test-calcom-api-key-not-real';
+process.env.CALCOM_DEMO_CABINET_ID ??= '11111111-1111-4111-8111-111111111111';
+process.env.CALCOM_DEMO_FALLBACK_ENABLED ??= 'false';
 
 // -- Session 3: worker + SMTP dummies. The SMTP block is entirely OPTIONAL
 // at env boot, but individual tests may exercise `assertSmtpConfigured`
@@ -72,6 +75,7 @@ process.env.TIMEOUT_STORAGE_MS ??= '30000';
 process.env.TIMEOUT_PDF_MS ??= '15000';
 process.env.TIMEOUT_SMTP_MS ??= '30000';
 process.env.TIMEOUT_RETELL_MS ??= '10000';
+process.env.TIMEOUT_CALCOM_MS ??= '10000';
 process.env.SMTP_RETRY_ATTEMPTS ??= '3';
 // Zero-delay retries so the retry test doesn't sleep in real time.
 process.env.SMTP_RETRY_DELAYS_MS ??= '0,0,0';

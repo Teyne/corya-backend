@@ -10,6 +10,7 @@
  */
 import { getAuthClient, getServiceClient } from '../config/supabase.js';
 import { env } from '../config/env.js';
+import { z } from 'zod';
 import type {
   AppelInsertRow,
   AppelProcessingRow,
@@ -71,6 +72,70 @@ export interface CabinetRow {
   numero_corya: string;
   email_notification: string;
   email_notification_cc: string | null;
+}
+
+const calcomConnectionCredentialsSchema = z.object({
+  connection_id: z.string().uuid().nullable(),
+  status: z.enum(['connected', 'expired', 'error', 'revoked']).nullable(),
+  access_token: z.string().min(1).max(16_384).nullable(),
+  refresh_token: z.string().min(1).max(16_384).nullable(),
+  access_token_expires_at: z.string().datetime({ offset: true }).nullable(),
+  granted_scopes: z.array(z.string().min(1).max(200)).max(100).nullable(),
+  provider_account_id: z.string().min(1).max(200).nullable(),
+  demonstration_mode: z.boolean(),
+}).strict();
+
+export interface CalcomConnectionCredentials {
+  connectionId: string | null;
+  status: 'connected' | 'expired' | 'error' | 'revoked' | null;
+  accessToken: string | null;
+  refreshToken: string | null;
+  accessTokenExpiresAt: string | null;
+  grantedScopes: string[] | null;
+  providerAccountId: string | null;
+  demonstrationMode: boolean;
+}
+
+/**
+ * Resolve one cabinet's decrypted Cal.com credential through the dedicated
+ * SECURITY DEFINER RPC. The function is service-role only and always scoped
+ * by the exact cabinet UUID. Tokens are returned only to the internal service
+ * layer and are never included in errors or logs here.
+ */
+export async function getCalcomConnectionCredentials(
+  cabinetId: string,
+): Promise<CalcomConnectionCredentials> {
+  const supabase = getServiceClient();
+  const result = await withDbTimeout(
+    (signal) =>
+      supabase
+        .rpc('get_calcom_connection_credentials', {
+          p_cabinet_id: cabinetId,
+        })
+        .abortSignal(signal),
+    'db:getCalcomConnectionCredentials',
+  ) as { data: unknown; error: { message: string } | null };
+
+  if (result.error) throw new Error('db_get_calcom_credentials_failed');
+  if (!Array.isArray(result.data) || result.data.length !== 1) {
+    throw new Error('db_get_calcom_credentials_invalid_result');
+  }
+
+  const parsed = calcomConnectionCredentialsSchema.safeParse(result.data[0]);
+  if (!parsed.success) {
+    throw new Error('db_get_calcom_credentials_invalid_result');
+  }
+
+  return {
+    connectionId: parsed.data.connection_id,
+    status: parsed.data.status,
+    accessToken: parsed.data.access_token,
+    refreshToken: parsed.data.refresh_token,
+    accessTokenExpiresAt: parsed.data.access_token_expires_at,
+    grantedScopes: parsed.data.granted_scopes,
+    providerAccountId: parsed.data.provider_account_id,
+    demonstrationMode: parsed.data.demonstration_mode,
+  };
 }
 
 /**
