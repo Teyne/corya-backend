@@ -4,6 +4,19 @@ import * as portalQueries from '../db/queries.js';
 import { buildPdfObjectPath, createSignedPdfUrl } from '../services/storage.js';
 import { TimeoutError } from '../utils/timeout.js';
 import {
+  dbCalcomOAuthFlowStore,
+  startCalcomOAuth,
+} from '../services/calcom-oauth.js';
+import {
+  disconnectTenantCalcom,
+  listTenantCalcomEventTypes,
+  selectTenantCalcomEventType,
+  CalcomRuntimeUnavailableError,
+} from '../services/calcom-runtime.js';
+import { CalcomOAuthError } from '../services/calcom-oauth.js';
+import type { CalcomEventType } from '../services/calcom-api.js';
+import type { CalcomConnectionStatus } from '../db/queries.js';
+import {
   buildAdminPreAuthRateLimiter,
   consumeAuthenticatedAdminRateLimit,
 } from '../middleware/rate-limit.js';
@@ -22,6 +35,10 @@ import type {
 } from '../admin/types.js';
 
 const UUID = z.string().uuid();
+const eventTypeSelectionSchema = z.object({
+  eventTypeId: z.string().regex(/^[1-9]\d{0,19}$/u).refine((value) =>
+    BigInt(value) <= BigInt(Number.MAX_SAFE_INTEGER)),
+}).strict();
 const periodSchema = z.enum(['7d', '30d', '90d']);
 const outcomeInputSchema = z.enum([
   'appointment',
@@ -120,6 +137,15 @@ export interface AdminRouterDependencies {
     expectedUpdatedAt: string,
   ): Promise<PortalCabinetRow>;
   signPdf(path: string, ttlSeconds: number): Promise<string>;
+  getCalcomStatus(cabinetId: string): Promise<CalcomConnectionStatus | null>;
+  connectCalcom(cabinetId: string, actorUserId: string): Promise<{ authorizationUrl: string }>;
+  disconnectCalcom(cabinetId: string, actorUserId: string): Promise<void>;
+  listCalcomEventTypes(cabinetId: string): Promise<CalcomEventType[]>;
+  selectCalcomEventType(
+    cabinetId: string,
+    actorUserId: string,
+    eventTypeId: string,
+  ): Promise<CalcomConnectionStatus>;
 }
 
 const defaultDependencies: AdminRouterDependencies = {
@@ -141,6 +167,18 @@ const defaultDependencies: AdminRouterDependencies = {
       expectedUpdatedAt,
     ),
   signPdf: createSignedPdfUrl,
+  getCalcomStatus: portalQueries.getCalcomConnectionStatus,
+  connectCalcom: async (cabinetId, actorUserId) => {
+    const started = await startCalcomOAuth(
+      cabinetId,
+      actorUserId,
+      dbCalcomOAuthFlowStore,
+    );
+    return { authorizationUrl: started.authorizationUrl };
+  },
+  disconnectCalcom: disconnectTenantCalcom,
+  listCalcomEventTypes: listTenantCalcomEventTypes,
+  selectCalcomEventType: selectTenantCalcomEventType,
 };
 
 const OUTCOME_TO_DB: Readonly<Record<z.infer<typeof outcomeInputSchema>, PortalCallResult>> = {
@@ -281,9 +319,15 @@ function assistantDto(cabinet: PortalCabinetRow): Record<string, unknown> {
   return parsed.success ? { ...defaults, ...parsed.data } : defaults;
 }
 
-function integrationsDto(cabinet: PortalCabinetRow): Record<string, unknown> {
+function integrationsDto(
+  cabinet: PortalCabinetRow,
+  connection: CalcomConnectionStatus | null,
+  role: PortalMembership['role'],
+): Record<string, unknown> {
   const settings = settingsDto(cabinet);
   const calendar = calendarIntegration(cabinet);
+  const calcom = calcomConnectionDto(connection, role);
+  const connected = calcom.status === 'connected';
   return {
     integrations: [
       {
@@ -291,8 +335,8 @@ function integrationsDto(cabinet: PortalCabinetRow): Record<string, unknown> {
         category: 'calendar',
         name: 'Agenda',
         description: 'Agenda du cabinet',
-        status: calendar ? 'connected' : 'not_configured',
-        detail: calendar ? 'Cal.com actif' : 'Configuration requise',
+        status: connected ? 'connected' : 'not_configured',
+        detail: connected ? 'Cal.com actif' : 'Configuration requise',
       },
       { id: 'telephony', category: 'telephony', name: 'Téléphonie', description: 'Ligne téléphonique Corya', status: cabinet.statut === 'actif' ? 'connected' : 'degraded', detail: cabinet.statut === 'actif' ? 'Service actif' : 'Service suspendu' },
       { id: 'email', category: 'email', name: 'E-mail', description: 'Envoi des récapitulatifs', status: cabinet.email_notification ? 'connected' : 'needs_config', detail: cabinet.email_notification ? 'Destinataire configuré' : 'Configuration requise' },
@@ -309,6 +353,42 @@ function integrationsDto(cabinet: PortalCabinetRow): Record<string, unknown> {
       allowReschedule: calendar?.allowReschedule ?? false,
       allowCancellation: calendar?.allowCancellation ?? false,
     },
+    calcom,
+  };
+}
+
+function calcomConnectionDto(
+  connection: CalcomConnectionStatus | null,
+  role: PortalMembership['role'],
+): {
+  status: 'not_configured' | 'needs_event_type' | 'connected' | 'expired' | 'error' | 'revoked';
+  adminCanManage: boolean;
+  connectedAt: string | null;
+  scopes: string[];
+  eventType: { id: string; title: string; lengthMinutes: number } | null;
+} {
+  const connectionStatus = connection?.connectionId === null || !connection
+    ? 'not_configured'
+    : connection.status === 'connected' && !connection.runtimeReady
+      ? 'needs_event_type'
+      : connection.status ?? 'not_configured';
+  const hasEventType = Boolean(
+    connection?.eventTypeId
+    && connection.eventTypeTitle
+    && connection.eventTypeLengthMinutes,
+  );
+  return {
+    status: connectionStatus,
+    adminCanManage: role === 'admin',
+    connectedAt: connection?.connectedAt ?? null,
+    scopes: connection?.grantedScopes ?? [],
+    eventType: hasEventType && connection
+      ? {
+        id: connection.eventTypeId as string,
+        title: connection.eventTypeTitle as string,
+        lengthMinutes: connection.eventTypeLengthMinutes as number,
+      }
+      : null,
   };
 }
 
@@ -506,7 +586,66 @@ export function buildAdminRouter(
 
   router.get('/integrations', async (req, res): Promise<void> => {
     const row = await cabinet(req, res);
-    if (row) res.json(integrationsDto(row));
+    if (!row) return;
+    const ctx = context(req);
+    const connection = await dependencies.getCalcomStatus(ctx.membership.cabinetId);
+    res.json(integrationsDto(row, connection, ctx.membership.role));
+  });
+
+  router.post('/integrations/calcom/connect', async (req, res): Promise<void> => {
+    const ctx = context(req);
+    if (ctx.membership.role !== 'admin') {
+      res.status(403).json({ error: 'forbidden' });
+      return;
+    }
+    const started = await dependencies.connectCalcom(
+      ctx.membership.cabinetId,
+      ctx.user.id,
+    );
+    res.json({ authorizationUrl: started.authorizationUrl });
+  });
+
+  router.post('/integrations/calcom/disconnect', async (req, res): Promise<void> => {
+    const ctx = context(req);
+    if (ctx.membership.role !== 'admin') {
+      res.status(403).json({ error: 'forbidden' });
+      return;
+    }
+    await dependencies.disconnectCalcom(ctx.membership.cabinetId, ctx.user.id);
+    const status = await dependencies.getCalcomStatus(ctx.membership.cabinetId);
+    res.json(calcomConnectionDto(status, ctx.membership.role));
+  });
+
+  router.get('/integrations/calcom/event-types', async (req, res): Promise<void> => {
+    const ctx = context(req);
+    if (ctx.membership.role !== 'admin') {
+      res.status(403).json({ error: 'forbidden' });
+      return;
+    }
+    const items = await dependencies.listCalcomEventTypes(ctx.membership.cabinetId);
+    res.json({
+      items: items.map((item) => ({
+        id: item.id,
+        title: item.title,
+        lengthMinutes: item.lengthMinutes,
+      })),
+    });
+  });
+
+  router.patch('/integrations/calcom/event-type', async (req, res): Promise<void> => {
+    const ctx = context(req);
+    if (ctx.membership.role !== 'admin') {
+      res.status(403).json({ error: 'forbidden' });
+      return;
+    }
+    const parsed = eventTypeSelectionSchema.safeParse(req.body);
+    if (!parsed.success) return sendInvalid(res);
+    const status = await dependencies.selectCalcomEventType(
+      ctx.membership.cabinetId,
+      ctx.user.id,
+      parsed.data.eventTypeId,
+    );
+    res.json(calcomConnectionDto(status, ctx.membership.role));
   });
 
   router.get('/settings', async (req, res): Promise<void> => {
@@ -676,6 +815,14 @@ export function buildAdminRouter(
       return;
     }
     if (error instanceof Error) {
+      if (error instanceof CalcomRuntimeUnavailableError) {
+        res.status(409).json({ error: 'integration_not_ready' });
+        return;
+      }
+      if (error instanceof CalcomOAuthError || error.message.startsWith('db_')) {
+        res.status(503).json({ error: 'service_unavailable' });
+        return;
+      }
       if (isPortalNotFound(error)) {
         res.status(404).json({ error: 'not_found' });
         return;

@@ -1,8 +1,13 @@
+/* eslint-disable @typescript-eslint/no-base-to-string -- Fetch BodyInit/URL test assertions narrow provider inputs immediately. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   __setCalcomFetchForTests,
   createCalcomBooking,
+  exchangeCalcomAuthorizationCode,
+  getCalcomProfileId,
   getCalcomAvailability,
+  listCalcomEventTypes,
+  refreshCalcomOAuthToken,
 } from '../../src/services/calcom-api.js';
 
 afterEach(() => {
@@ -132,5 +137,102 @@ describe('Cal.com API boundary', () => {
 
     await expect(promise).rejects.toMatchObject({ transient: false });
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('exchanges a public-client PKCE code without sending a client secret', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-01T12:00:00.000Z'));
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
+      access_token: 'synthetic-access-token',
+      token_type: 'Bearer',
+      refresh_token: 'synthetic-refresh-token',
+      expires_in: 1800,
+      scope: 'PROFILE_READ BOOKING_WRITE EVENT_TYPE_READ BOOKING_READ',
+    }), { status: 200 }));
+    __setCalcomFetchForTests(fetchMock);
+
+    try {
+      const result = await exchangeCalcomAuthorizationCode({
+        clientId: 'synthetic-client',
+        code: 'synthetic-code',
+        redirectUri: 'https://api.example.test/oauth/calcom/callback',
+        codeVerifier: 'v'.repeat(64),
+      });
+
+      expect(result).toEqual({
+        accessToken: 'synthetic-access-token',
+        refreshToken: 'synthetic-refresh-token',
+        expiresAt: '2026-09-01T12:30:00.000Z',
+        scopes: ['BOOKING_READ', 'BOOKING_WRITE', 'EVENT_TYPE_READ', 'PROFILE_READ'],
+      });
+      const [url, init] = fetchMock.mock.calls[0];
+      expect(String(url)).toBe('https://api.cal.com/v2/auth/oauth2/token');
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      expect(body).toMatchObject({
+        client_id: 'synthetic-client',
+        grant_type: 'authorization_code',
+        code_verifier: 'v'.repeat(64),
+      });
+      expect(body).not.toHaveProperty('client_secret');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('refreshes a public-client token without sending a client secret', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
+      access_token: 'rotated-access-token',
+      token_type: 'bearer',
+      refresh_token: 'rotated-refresh-token',
+      expires_in: 1800,
+      scope: 'EVENT_TYPE_READ BOOKING_READ BOOKING_WRITE PROFILE_READ',
+    }), { status: 200 }));
+    __setCalcomFetchForTests(fetchMock);
+
+    await refreshCalcomOAuthToken({
+      clientId: 'synthetic-client',
+      refreshToken: 'synthetic-refresh-token',
+    });
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as Record<string, unknown>;
+    expect(body).toEqual({
+      client_id: 'synthetic-client',
+      grant_type: 'refresh_token',
+      refresh_token: 'synthetic-refresh-token',
+    });
+    expect(body).not.toHaveProperty('client_secret');
+  });
+
+  it('returns only the profile technical identifier', async () => {
+    __setCalcomFetchForTests(vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
+      status: 'success',
+      data: {
+        id: 123,
+        email: 'PII-SENTINEL@example.invalid',
+        name: 'PII-SENTINEL',
+      },
+    }), { status: 200 })));
+
+    await expect(getCalcomProfileId('synthetic-access-token')).resolves.toBe('123');
+  });
+
+  it('bounds and allowlists event types', async () => {
+    const data = Array.from({ length: 105 }, (_, index) => ({
+      id: index + 1,
+      title: `Type ${index + 1}`,
+      slug: `type-${index + 1}`,
+      lengthInMinutes: 30,
+      bookingFields: [{ label: 'PII-SENTINEL' }],
+    }));
+    __setCalcomFetchForTests(vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
+      status: 'success',
+      data,
+    }), { status: 200 })));
+
+    const result = await listCalcomEventTypes('synthetic-access-token');
+
+    expect(result).toHaveLength(100);
+    expect(result[0]).toEqual({ id: '1', title: 'Type 1', slug: 'type-1', lengthMinutes: 30 });
+    expect(JSON.stringify(result)).not.toContain('PII-SENTINEL');
   });
 });

@@ -153,6 +153,17 @@ export function installQueryMocks(): void {
     // Re-import types so callers can build valid rows; use `unknown` to
     // avoid dragging real query behaviour by accident.
     return {
+      beginCalcomOAuthFlow: () => Promise.reject(new Error('not_configured')),
+      consumeCalcomOAuthFlow: () => Promise.resolve(null),
+      completeCalcomOAuthFlow: () => Promise.resolve(false),
+      failCalcomOAuthFlow: () => Promise.resolve(false),
+      getCalcomConnectionCredentials: () => Promise.resolve(null),
+      claimCalcomOAuthRefresh: () => Promise.resolve(null),
+      completeCalcomOAuthRefresh: () => Promise.resolve(false),
+      failCalcomOAuthRefresh: () => Promise.resolve(false),
+      getCalcomConnectionStatus: () => Promise.resolve(null),
+      setCalcomEventType: () => Promise.resolve(false),
+      disconnectCalcomOAuthConnection: () => Promise.resolve(false),
       // ---------- reads ----------
       findCabinetByCoryaNumber: (toNumber: string): Promise<CabinetRow | null> => {
         for (const c of store.cabinets.values()) {

@@ -36,6 +36,7 @@ import { buildWebhookRateLimiter } from './middleware/rate-limit.js';
 import { toLogFields } from './utils/errors.js';
 import { runWave7GatedStartup } from './services/startup.js';
 import { adminRouter } from './routes/admin.js';
+import { calcomOAuthRouter } from './routes/calcom-oauth.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -130,6 +131,10 @@ app.use('/webhooks', webhooksRouter);
 // is added to the /health body (bootTimeMs latch inside the module).
 setHealthPackageVersion(version);
 app.use('/health', healthRouter);
+
+// Public OAuth callback. PKCE verifier and raw state stay server-side; this
+// route always redirects to one fixed allowlisted portal URL.
+app.use('/oauth/calcom', calcomOAuthRouter);
 
 // Portal requests arrive only from the same-origin BFF and authenticate with
 // a strict Supabase bearer token. The router independently re-authorizes the

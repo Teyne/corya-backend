@@ -1,9 +1,17 @@
 import { z } from 'zod';
+import { randomUUID } from 'node:crypto';
 import { env } from '../config/env.js';
-import { getCalcomConnectionCredentials } from '../db/queries.js';
+import {
+  claimCalcomOAuthRefresh,
+  completeCalcomOAuthRefresh,
+  failCalcomOAuthRefresh,
+  getCalcomConnectionCredentials,
+  type CalcomRefreshClaim,
+} from '../db/queries.js';
+import { CalcomApiError, refreshCalcomOAuthToken } from './calcom-api.js';
 
 const cabinetIdSchema = z.string().uuid();
-const OAUTH_EXPIRY_MARGIN_MS = 60_000;
+const OAUTH_EXPIRY_MARGIN_MS = 120_000;
 
 /**
  * Minimal DB-facing snapshot returned by the provider in `db/queries.ts`.
@@ -36,6 +44,13 @@ export interface CalcomDemoFallbackConfig {
   apiKey: string | undefined;
 }
 
+export interface CalcomRefreshCoordinator {
+  claim(cabinetId: string, leaseOwner: string): Promise<CalcomRefreshClaim | null>;
+  complete(input: Parameters<typeof completeCalcomOAuthRefresh>[0]): Promise<boolean>;
+  fail(input: Parameters<typeof failCalcomOAuthRefresh>[0]): Promise<boolean>;
+  refresh(input: { clientId: string; refreshToken: string }): ReturnType<typeof refreshCalcomOAuthToken>;
+}
+
 export class CalcomCredentialUnavailableError extends Error {
   constructor() {
     super('calcom_credentials_unavailable');
@@ -54,6 +69,13 @@ export const dbCalcomCredentialProvider: CalcomCredentialProvider = {
       demonstrationMode: credentials.demonstrationMode,
     };
   },
+};
+
+export const dbCalcomRefreshCoordinator: CalcomRefreshCoordinator = {
+  claim: (cabinetId, leaseOwner) => claimCalcomOAuthRefresh(cabinetId, leaseOwner),
+  complete: completeCalcomOAuthRefresh,
+  fail: failCalcomOAuthRefresh,
+  refresh: refreshCalcomOAuthToken,
 };
 
 function presentSecret(value: string | null | undefined): value is string {
@@ -121,4 +143,97 @@ export async function resolveCalcomCredential(
   }
 
   throw new CalcomCredentialUnavailableError();
+}
+
+function refreshFailureIsTerminal(error: unknown): boolean {
+  return error instanceof CalcomApiError
+    && !error.transient
+    && (error.statusCode === 400 || error.statusCode === 401);
+}
+
+async function loadUsableOAuth(
+  cabinetId: string,
+  provider: CalcomCredentialProvider,
+): Promise<ResolvedCalcomCredential | null> {
+  const snapshot = await provider.loadForCabinet(cabinetId);
+  return snapshot && oauthCredentialIsUsable(snapshot)
+    ? { accessToken: snapshot.oauthAccessToken, source: 'oauth_vault' }
+    : null;
+}
+
+/**
+ * Resolve a tenant credential and refresh OAuth under the database lease when
+ * necessary. A losing concurrent caller never writes tokens: it only reloads
+ * the authoritative Vault-backed snapshot after a short bounded wait.
+ */
+export async function resolveFreshCalcomCredential(
+  cabinetId: string,
+  provider: CalcomCredentialProvider = dbCalcomCredentialProvider,
+  coordinator: CalcomRefreshCoordinator = dbCalcomRefreshCoordinator,
+): Promise<ResolvedCalcomCredential> {
+  if (!cabinetIdSchema.safeParse(cabinetId).success) {
+    throw new CalcomCredentialUnavailableError();
+  }
+  try {
+    return await resolveCalcomCredential(cabinetId, provider);
+  } catch (error: unknown) {
+    if (!(error instanceof CalcomCredentialUnavailableError)) throw error;
+  }
+
+  const leaseOwner = randomUUID();
+  const claim = await coordinator.claim(cabinetId, leaseOwner);
+  if (!claim) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const reloaded = await loadUsableOAuth(cabinetId, provider);
+      if (reloaded) return reloaded;
+    }
+    throw new CalcomCredentialUnavailableError();
+  }
+  if (env.CALCOM_OAUTH_CLIENT_ID === undefined) {
+    await coordinator.fail({
+      connectionId: claim.connectionId,
+      leaseOwner,
+      expectedGeneration: claim.tokenGeneration,
+      reason: 'refresh_transient',
+      terminal: false,
+    });
+    throw new CalcomCredentialUnavailableError();
+  }
+
+  try {
+    const refreshed = await coordinator.refresh({
+      clientId: env.CALCOM_OAUTH_CLIENT_ID,
+      refreshToken: claim.refreshToken,
+    });
+    const completed = await coordinator.complete({
+      connectionId: claim.connectionId,
+      leaseOwner,
+      expectedGeneration: claim.tokenGeneration,
+      accessToken: refreshed.accessToken,
+      refreshToken: refreshed.refreshToken,
+      accessTokenExpiresAt: refreshed.expiresAt,
+      grantedScopes: refreshed.scopes,
+    });
+    if (!completed) throw new CalcomCredentialUnavailableError();
+    const reloaded = await loadUsableOAuth(cabinetId, provider);
+    if (reloaded) return reloaded;
+    throw new CalcomCredentialUnavailableError();
+  } catch (error: unknown) {
+    if (!(error instanceof CalcomCredentialUnavailableError)) {
+      const terminal = refreshFailureIsTerminal(error);
+      try {
+        await coordinator.fail({
+          connectionId: claim.connectionId,
+          leaseOwner,
+          expectedGeneration: claim.tokenGeneration,
+          reason: terminal ? 'refresh_invalid_grant' : 'refresh_transient',
+          terminal,
+        });
+      } catch {
+        // Preserve a constant, secret-free public failure.
+      }
+    }
+    throw new CalcomCredentialUnavailableError();
+  }
 }

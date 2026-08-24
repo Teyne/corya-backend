@@ -14,7 +14,7 @@ process.env.NODE_ENV ??= 'test';
 process.env.PORT ??= '3000'; // tests use supertest without listen(), value unused
 process.env.APP_BASE_URL ??= 'http://localhost:3000';
 process.env.LOG_LEVEL ??= 'silent';
-process.env.CORS_ORIGIN ??= 'http://localhost:3001';
+process.env.CORS_ORIGIN ??= 'http://localhost:3001,https://portal.example.test';
 
 // -- Session 2 promotions: these are required at boot, dummy values suffice
 // because tests either mock the DB layer or the SDK verifier. NEVER put
@@ -34,6 +34,9 @@ process.env.CALCOM_WEBHOOK_SECRET ??= 'test-calcom-webhook-secret-not-real-32cha
 process.env.CALCOM_DEMO_API_KEY ??= 'test-calcom-api-key-not-real';
 process.env.CALCOM_DEMO_CABINET_ID ??= '11111111-1111-4111-8111-111111111111';
 process.env.CALCOM_DEMO_FALLBACK_ENABLED ??= 'false';
+process.env.CALCOM_OAUTH_CLIENT_ID ??= 'test-public-client-id';
+process.env.CALCOM_OAUTH_REDIRECT_URI ??= 'https://api.example.test/oauth/calcom/callback';
+process.env.CALCOM_PORTAL_RETURN_URL ??= 'https://portal.example.test/integrations';
 
 // -- Session 3: worker + SMTP dummies. The SMTP block is entirely OPTIONAL
 // at env boot, but individual tests may exercise `assertSmtpConfigured`

@@ -1,11 +1,15 @@
+/* eslint-disable @typescript-eslint/require-await, @typescript-eslint/unbound-method -- test doubles are intentionally immediate. */
 import { describe, expect, it, vi } from 'vitest';
 import {
   CalcomCredentialUnavailableError,
   resolveCalcomCredential,
+  resolveFreshCalcomCredential,
   type CalcomCredentialProvider,
+  type CalcomRefreshCoordinator,
   type CalcomCredentialSnapshot,
   type CalcomDemoFallbackConfig,
 } from '../../src/services/calcom-credentials.js';
+import { CalcomApiError } from '../../src/services/calcom-api.js';
 
 const CABINET_A = '11111111-1111-4111-8111-111111111111';
 const CABINET_B = '22222222-2222-4222-8222-222222222222';
@@ -245,5 +249,107 @@ describe('resolveCalcomCredential', () => {
       provider,
       demoFallback({ cabinetId: CABINET_B }),
     )).rejects.toThrow('calcom_credentials_unavailable');
+  });
+});
+
+describe('resolveFreshCalcomCredential', () => {
+  function refreshCoordinator(): CalcomRefreshCoordinator {
+    return {
+      claim: vi.fn(async () => ({
+        connectionId: '33333333-3333-4333-8333-333333333333',
+        tokenGeneration: 2,
+        refreshToken: 'synthetic-refresh-token-not-real',
+        configuredScopes: ['BOOKING_READ', 'BOOKING_WRITE', 'EVENT_TYPE_READ', 'PROFILE_READ'],
+        eventTypeId: '6723841',
+        leaseUntil: '2026-09-01T12:00:30.000Z',
+      })),
+      complete: vi.fn(async () => true),
+      fail: vi.fn(async () => true),
+      refresh: vi.fn(async () => ({
+        accessToken: 'rotated-access-token-not-real',
+        refreshToken: 'rotated-refresh-token-not-real',
+        expiresAt: '2026-09-01T12:30:00.000Z',
+        scopes: ['BOOKING_READ', 'BOOKING_WRITE', 'EVENT_TYPE_READ', 'PROFILE_READ'],
+      })),
+    };
+  }
+
+  it('refreshes under a lease and reloads the authoritative Vault token', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-01T12:00:00.000Z'));
+    const loadForCabinet = vi.fn()
+      .mockResolvedValueOnce(snapshot({
+        status: 'expired',
+        oauthAccessToken: null,
+        accessTokenExpiresAt: '2026-09-01T11:59:00.000Z',
+      }))
+      .mockResolvedValueOnce(snapshot({
+        oauthAccessToken: 'authoritative-rotated-token-not-real',
+        accessTokenExpiresAt: '2026-09-01T12:30:00.000Z',
+      }));
+    const provider: CalcomCredentialProvider = { loadForCabinet };
+    const coordinator = refreshCoordinator();
+    try {
+      await expect(resolveFreshCalcomCredential(CABINET_A, provider, coordinator))
+        .resolves.toEqual({
+          accessToken: 'authoritative-rotated-token-not-real',
+          source: 'oauth_vault',
+        });
+      expect(coordinator.claim).toHaveBeenCalledWith(CABINET_A, expect.any(String));
+      expect(coordinator.complete).toHaveBeenCalledWith(expect.objectContaining({
+        connectionId: '33333333-3333-4333-8333-333333333333',
+        expectedGeneration: 2,
+        accessToken: 'rotated-access-token-not-real',
+      }));
+      expect(coordinator.fail).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('waits boundedly for a concurrent refresh winner and never refreshes twice', async () => {
+    const loadForCabinet = vi.fn()
+      .mockResolvedValueOnce(snapshot({ status: 'expired', oauthAccessToken: null }))
+      .mockResolvedValueOnce(snapshot({
+        oauthAccessToken: 'winner-token-not-real',
+        accessTokenExpiresAt: new Date(Date.now() + 300_000).toISOString(),
+      }));
+    const coordinator = refreshCoordinator();
+    vi.mocked(coordinator.claim).mockResolvedValue(null);
+
+    await expect(resolveFreshCalcomCredential(
+      CABINET_A,
+      { loadForCabinet },
+      coordinator,
+    )).resolves.toEqual({ accessToken: 'winner-token-not-real', source: 'oauth_vault' });
+    expect(coordinator.refresh).not.toHaveBeenCalled();
+    expect(coordinator.complete).not.toHaveBeenCalled();
+  });
+
+  it('marks invalid_grant terminally without exposing the refresh token', async () => {
+    const secret = 'SECRET-REFRESH-SENTINEL';
+    const provider = providerFor({
+      [CABINET_A]: snapshot({ status: 'expired', oauthAccessToken: null }),
+    });
+    const coordinator = refreshCoordinator();
+    vi.mocked(coordinator.claim).mockResolvedValue({
+      connectionId: '33333333-3333-4333-8333-333333333333',
+      tokenGeneration: 2,
+      refreshToken: secret,
+      configuredScopes: ['BOOKING_READ', 'BOOKING_WRITE', 'EVENT_TYPE_READ', 'PROFILE_READ'],
+      eventTypeId: '6723841',
+      leaseUntil: '2026-09-01T12:00:30.000Z',
+    });
+    vi.mocked(coordinator.refresh).mockRejectedValue(
+      new CalcomApiError('oauth_refresh', 400, false),
+    );
+
+    const promise = resolveFreshCalcomCredential(CABINET_A, provider, coordinator);
+    await expect(promise).rejects.toThrow('calcom_credentials_unavailable');
+    await expect(promise).rejects.not.toThrow(secret);
+    expect(coordinator.fail).toHaveBeenCalledWith(expect.objectContaining({
+      reason: 'refresh_invalid_grant',
+      terminal: true,
+    }));
   });
 });

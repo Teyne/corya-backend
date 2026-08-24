@@ -3,6 +3,8 @@ import { env } from '../config/env.js';
 import { withTimeout } from '../utils/timeout.js';
 
 const CALCOM_API_BASE_URL = 'https://api.cal.com';
+const CALCOM_TOKEN_URL = 'https://api.cal.com/v2/auth/oauth2/token';
+const EVENT_TYPES_API_VERSION = '2024-06-14';
 const SLOTS_API_VERSION = '2024-09-04';
 const BOOKINGS_API_VERSION = '2026-02-25';
 
@@ -35,6 +37,46 @@ const bookingResponseSchema = z.object({
     eventTypeId: z.number().int().positive(),
   }).passthrough(),
 }).passthrough();
+
+const oauthTokenResponseSchema = z.object({
+  access_token: z.string().min(1).max(16_384),
+  token_type: z.string().toLowerCase().pipe(z.literal('bearer')),
+  refresh_token: z.string().min(1).max(16_384),
+  expires_in: z.number().int().min(60).max(31_536_000),
+  scope: z.string().min(1).max(2_000),
+}).passthrough();
+
+const profileResponseSchema = z.object({
+  status: z.literal('success'),
+  data: z.object({
+    id: z.union([z.number().int().nonnegative(), z.string().min(1).max(200)]),
+  }).passthrough(),
+}).passthrough();
+
+const eventTypesResponseSchema = z.object({
+  status: z.literal('success'),
+  data: z.array(z.object({
+    id: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    title: z.string().trim().min(1).max(200),
+    slug: z.string().trim().min(1).max(200),
+    lengthInMinutes: z.number().int().min(5).max(1_440),
+  }).passthrough()).max(1_000),
+}).passthrough();
+
+export const CALCOM_OAUTH_SCOPES = [
+  'BOOKING_READ',
+  'BOOKING_WRITE',
+  'EVENT_TYPE_READ',
+  'PROFILE_READ',
+] as const;
+
+type CalcomOperation =
+  | 'availability'
+  | 'booking'
+  | 'oauth_exchange'
+  | 'oauth_refresh'
+  | 'profile'
+  | 'event_types';
 
 export interface CalcomSlot {
   start: string;
@@ -69,13 +111,27 @@ export interface CalcomBookingResult {
   eventTypeId: string;
 }
 
+export interface CalcomOAuthTokenResult {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: string;
+  scopes: string[];
+}
+
+export interface CalcomEventType {
+  id: string;
+  title: string;
+  slug: string;
+  lengthMinutes: number;
+}
+
 export class CalcomApiError extends Error {
-  public readonly operation: 'availability' | 'booking';
+  public readonly operation: CalcomOperation;
   public readonly statusCode: number | null;
   public readonly transient: boolean;
 
   constructor(
-    operation: 'availability' | 'booking',
+    operation: CalcomOperation,
     statusCode: number | null,
     transient: boolean,
   ) {
@@ -116,7 +172,7 @@ function validateWindow(start: string, end: string): void {
 }
 
 async function fetchJson(
-  operation: 'availability' | 'booking',
+  operation: CalcomOperation,
   url: URL,
   init: RequestInit,
 ): Promise<unknown> {
@@ -148,6 +204,107 @@ async function fetchJson(
   } catch {
     throw new CalcomApiError(operation, response.status, false);
   }
+}
+
+function parseGrantedScopes(value: string): string[] {
+  return [...new Set(value.split(/[ ,]+/u).filter((scope) => scope.length > 0))]
+    .sort();
+}
+
+function parseOAuthToken(
+  operation: 'oauth_exchange' | 'oauth_refresh',
+  value: unknown,
+): CalcomOAuthTokenResult {
+  const parsed = oauthTokenResponseSchema.safeParse(value);
+  if (!parsed.success) throw new CalcomApiError(operation, 200, false);
+  return {
+    accessToken: parsed.data.access_token,
+    refreshToken: parsed.data.refresh_token,
+    expiresAt: new Date(Date.now() + parsed.data.expires_in * 1_000).toISOString(),
+    scopes: parseGrantedScopes(parsed.data.scope),
+  };
+}
+
+export async function exchangeCalcomAuthorizationCode(input: {
+  clientId: string;
+  code: string;
+  redirectUri: string;
+  codeVerifier: string;
+}): Promise<CalcomOAuthTokenResult> {
+  if (
+    input.clientId.length === 0
+    || input.code.length === 0
+    || input.code.length > 4_096
+    || input.codeVerifier.length < 43
+    || input.codeVerifier.length > 128
+  ) throw new CalcomApiError('oauth_exchange', null, false);
+
+  return parseOAuthToken('oauth_exchange', await fetchJson(
+    'oauth_exchange',
+    new URL(CALCOM_TOKEN_URL),
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        client_id: input.clientId,
+        grant_type: 'authorization_code',
+        code: input.code,
+        redirect_uri: input.redirectUri,
+        code_verifier: input.codeVerifier,
+      }),
+    },
+  ));
+}
+
+export async function refreshCalcomOAuthToken(input: {
+  clientId: string;
+  refreshToken: string;
+}): Promise<CalcomOAuthTokenResult> {
+  if (input.clientId.length === 0 || input.refreshToken.length === 0) {
+    throw new CalcomApiError('oauth_refresh', null, false);
+  }
+  return parseOAuthToken('oauth_refresh', await fetchJson(
+    'oauth_refresh',
+    new URL(CALCOM_TOKEN_URL),
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        client_id: input.clientId,
+        grant_type: 'refresh_token',
+        refresh_token: input.refreshToken,
+      }),
+    },
+  ));
+}
+
+export async function getCalcomProfileId(accessToken: string): Promise<string> {
+  if (accessToken.length === 0) throw new CalcomApiError('profile', null, false);
+  const parsed = profileResponseSchema.safeParse(await fetchJson(
+    'profile',
+    new URL('/v2/me', CALCOM_API_BASE_URL),
+    { method: 'GET', headers: authHeaders(accessToken, EVENT_TYPES_API_VERSION) },
+  ));
+  if (!parsed.success) throw new CalcomApiError('profile', 200, false);
+  return String(parsed.data.data.id);
+}
+
+export async function listCalcomEventTypes(
+  accessToken: string,
+): Promise<CalcomEventType[]> {
+  if (accessToken.length === 0) throw new CalcomApiError('event_types', null, false);
+  const parsed = eventTypesResponseSchema.safeParse(await fetchJson(
+    'event_types',
+    new URL('/v2/event-types', CALCOM_API_BASE_URL),
+    { method: 'GET', headers: authHeaders(accessToken, EVENT_TYPES_API_VERSION) },
+  ));
+  if (!parsed.success) throw new CalcomApiError('event_types', 200, false);
+  return parsed.data.data.slice(0, 100).map((eventType) => ({
+    id: String(eventType.id),
+    title: eventType.title,
+    slug: eventType.slug,
+    lengthMinutes: eventType.lengthInMinutes,
+  }));
 }
 
 export async function getCalcomAvailability(

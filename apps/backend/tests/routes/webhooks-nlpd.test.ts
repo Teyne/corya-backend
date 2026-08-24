@@ -54,6 +54,17 @@ vi.mock('../../src/db/queries.js', () => ({
     ),
   ),
   enqueueJobIdempotent: vi.fn(() => Promise.resolve(true)),
+  beginCalcomOAuthFlow: vi.fn(() => Promise.reject(new Error('not_configured'))),
+  consumeCalcomOAuthFlow: vi.fn(() => Promise.resolve(null)),
+  completeCalcomOAuthFlow: vi.fn(() => Promise.resolve(false)),
+  failCalcomOAuthFlow: vi.fn(() => Promise.resolve(false)),
+  getCalcomConnectionCredentials: vi.fn(() => Promise.resolve(null)),
+  claimCalcomOAuthRefresh: vi.fn(() => Promise.resolve(null)),
+  completeCalcomOAuthRefresh: vi.fn(() => Promise.resolve(false)),
+  failCalcomOAuthRefresh: vi.fn(() => Promise.resolve(false)),
+  getCalcomConnectionStatus: vi.fn(() => Promise.resolve(null)),
+  setCalcomEventType: vi.fn(() => Promise.resolve(false)),
+  disconnectCalcomOAuthConnection: vi.fn(() => Promise.resolve(false)),
 }));
 
 // -- Logger mock: intercept the shared `logger` so we can inspect the JSON

@@ -113,6 +113,46 @@ function dependencies(): AdminRouterDependencies {
           : cabinet.config_agent,
     })),
     signPdf: vi.fn(async () => 'https://storage.example.test/signed'),
+    getCalcomStatus: vi.fn(async () => ({
+      connectionId: null,
+      status: null,
+      eventTypeId: null,
+      eventTypeTitle: null,
+      eventTypeLengthMinutes: null,
+      configuredScopes: null,
+      grantedScopes: null,
+      accessTokenExpiresAt: null,
+      connectedAt: null,
+      lastRefreshedAt: null,
+      errorCode: null,
+      demonstrationMode: false,
+      runtimeReady: false,
+    })),
+    connectCalcom: vi.fn(async () => ({
+      authorizationUrl: 'https://app.cal.com/auth/oauth2/authorize?state=synthetic',
+    })),
+    disconnectCalcom: vi.fn(async () => undefined),
+    listCalcomEventTypes: vi.fn(async () => [{
+      id: '6723841',
+      title: 'Consultation test',
+      slug: 'consultation-test',
+      lengthMinutes: 30,
+    }]),
+    selectCalcomEventType: vi.fn(async (_cabinetId, _actorUserId, eventTypeId) => ({
+      connectionId: '77777777-7777-4777-8777-777777777777',
+      status: 'connected' as const,
+      eventTypeId,
+      eventTypeTitle: 'Consultation test',
+      eventTypeLengthMinutes: 30,
+      configuredScopes: ['BOOKING_READ', 'BOOKING_WRITE', 'EVENT_TYPE_READ', 'PROFILE_READ'],
+      grantedScopes: ['BOOKING_READ', 'BOOKING_WRITE', 'EVENT_TYPE_READ', 'PROFILE_READ'],
+      accessTokenExpiresAt: '2026-09-01T12:30:00.000Z',
+      connectedAt: '2026-09-01T12:00:00.000Z',
+      lastRefreshedAt: null,
+      errorCode: null,
+      demonstrationMode: false,
+      runtimeReady: true,
+    })),
   };
 }
 
@@ -399,6 +439,117 @@ describe('portal admin PDF signing', () => {
 });
 
 describe('portal admin read and mutation contracts', () => {
+  it('starts Cal.com OAuth only for the authorized admin tenant', async () => {
+    const deps = dependencies();
+    const response = await request(appFor(deps))
+      .post('/admin/integrations/calcom/connect')
+      .set(bearer());
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({
+      authorizationUrl: 'https://app.cal.com/auth/oauth2/authorize?state=synthetic',
+    });
+    expect(deps.connectCalcom).toHaveBeenCalledWith(CABINET_A, USER_ID);
+  });
+
+  it.each([
+    ['post', '/admin/integrations/calcom/connect'],
+    ['post', '/admin/integrations/calcom/disconnect'],
+    ['get', '/admin/integrations/calcom/event-types'],
+    ['patch', '/admin/integrations/calcom/event-type'],
+  ] as const)('keeps viewer Cal.com management read-only: %s %s', async (method, path) => {
+    const deps = dependencies();
+    vi.mocked(deps.resolveMembership).mockResolvedValue({ cabinetId: CABINET_A, role: 'viewer' });
+    const call = request(appFor(deps))[method](path).set(bearer());
+    const response = method === 'patch' ? await call.send({ eventTypeId: '6723841' }) : await call;
+
+    expect(response.status).toBe(403);
+    expect(deps.connectCalcom).not.toHaveBeenCalled();
+    expect(deps.disconnectCalcom).not.toHaveBeenCalled();
+    expect(deps.listCalcomEventTypes).not.toHaveBeenCalled();
+    expect(deps.selectCalcomEventType).not.toHaveBeenCalled();
+  });
+
+  it('returns only allowlisted event type fields and verifies selection server-side', async () => {
+    const deps = dependencies();
+    const app = appFor(deps);
+    const listed = await request(app)
+      .get('/admin/integrations/calcom/event-types')
+      .set(bearer());
+    const selected = await request(app)
+      .patch('/admin/integrations/calcom/event-type')
+      .set(bearer())
+      .send({ eventTypeId: '6723841' });
+
+    expect(listed.status).toBe(200);
+    expect(listed.body).toEqual({
+      items: [{ id: '6723841', title: 'Consultation test', lengthMinutes: 30 }],
+    });
+    expect(JSON.stringify(listed.body)).not.toContain('slug');
+    expect(selected.status).toBe(200);
+    expect(deps.listCalcomEventTypes).toHaveBeenCalledWith(CABINET_A);
+    expect(deps.selectCalcomEventType).toHaveBeenCalledWith(
+      CABINET_A,
+      USER_ID,
+      '6723841',
+    );
+    expect(selected.body).toEqual({
+      status: 'connected',
+      adminCanManage: true,
+      connectedAt: '2026-09-01T12:00:00.000Z',
+      scopes: ['BOOKING_READ', 'BOOKING_WRITE', 'EVENT_TYPE_READ', 'PROFILE_READ'],
+      eventType: {
+        id: '6723841',
+        title: 'Consultation test',
+        lengthMinutes: 30,
+      },
+    });
+  });
+
+  it('rejects unsafe event type identifiers before provider or DB access', async () => {
+    const deps = dependencies();
+    const response = await request(appFor(deps))
+      .patch('/admin/integrations/calcom/event-type')
+      .set(bearer())
+      .send({ eventTypeId: '99999999999999999999' });
+
+    expect(response.status).toBe(400);
+    expect(deps.selectCalcomEventType).not.toHaveBeenCalled();
+  });
+
+  it('disconnects locally without claiming a provider-side revoke', async () => {
+    const deps = dependencies();
+    vi.mocked(deps.getCalcomStatus).mockResolvedValue({
+      connectionId: '77777777-7777-4777-8777-777777777777',
+      status: 'revoked',
+      eventTypeId: null,
+      eventTypeTitle: null,
+      eventTypeLengthMinutes: null,
+      configuredScopes: ['BOOKING_READ', 'BOOKING_WRITE', 'EVENT_TYPE_READ', 'PROFILE_READ'],
+      grantedScopes: null,
+      accessTokenExpiresAt: null,
+      connectedAt: '2026-09-01T12:00:00.000Z',
+      lastRefreshedAt: null,
+      errorCode: null,
+      demonstrationMode: false,
+      runtimeReady: false,
+    });
+    const response = await request(appFor(deps))
+      .post('/admin/integrations/calcom/disconnect')
+      .set(bearer());
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({
+      status: 'revoked',
+      adminCanManage: true,
+      connectedAt: '2026-09-01T12:00:00.000Z',
+      scopes: [],
+      eventType: null,
+    });
+    expect(deps.disconnectCalcom).toHaveBeenCalledWith(CABINET_A, USER_ID);
+    expect(deps.getCalcomStatus).toHaveBeenCalledWith(CABINET_A);
+  });
+
   it('maps the exact dashboard snapshot without exposing storage fields', async () => {
     const response = await request(appFor(dependencies()))
       .get('/admin/dashboard?period=30d')
@@ -418,6 +569,21 @@ describe('portal admin read and mutation contracts', () => {
 
   it('exposes only an allowlisted Cal.com state when the cabinet config is valid', async () => {
     const deps = dependencies();
+    vi.mocked(deps.getCalcomStatus).mockResolvedValue({
+      connectionId: '77777777-7777-4777-8777-777777777777',
+      status: 'connected',
+      eventTypeId: '6723841',
+      eventTypeTitle: 'Agenda de démonstration',
+      eventTypeLengthMinutes: 30,
+      configuredScopes: ['BOOKING_READ', 'BOOKING_WRITE', 'EVENT_TYPE_READ', 'PROFILE_READ'],
+      grantedScopes: ['BOOKING_READ', 'BOOKING_WRITE', 'EVENT_TYPE_READ', 'PROFILE_READ'],
+      accessTokenExpiresAt: '2026-09-01T12:30:00.000Z',
+      connectedAt: '2026-09-01T12:00:00.000Z',
+      lastRefreshedAt: null,
+      errorCode: null,
+      demonstrationMode: false,
+      runtimeReady: true,
+    });
     vi.mocked(deps.getCabinet).mockResolvedValue({
       ...cabinet,
       config_agent: {
@@ -453,6 +619,13 @@ describe('portal admin read and mutation contracts', () => {
       allowBooking: true,
       allowReschedule: false,
       allowCancellation: false,
+    });
+    expect(integrations.body.calcom).toEqual({
+      status: 'connected',
+      adminCanManage: true,
+      connectedAt: '2026-09-01T12:00:00.000Z',
+      scopes: ['BOOKING_READ', 'BOOKING_WRITE', 'EVENT_TYPE_READ', 'PROFILE_READ'],
+      eventType: { id: '6723841', title: 'Agenda de démonstration', lengthMinutes: 30 },
     });
     expect(JSON.stringify(integrations.body)).not.toContain('apiKey');
     expect(dashboard.body.calendarState).toBe('operational');

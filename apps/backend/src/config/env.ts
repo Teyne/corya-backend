@@ -60,6 +60,13 @@ const booleanString = z
   .enum(['true', 'false'])
   .transform((v) => v === 'true');
 
+const httpsUrl = z.string().url().superRefine((value, ctx) => {
+  const parsed = new URL(value);
+  if (parsed.protocol !== 'https:' || parsed.username || parsed.password) {
+    ctx.addIssue({ code: 'custom', message: 'must be an HTTPS URL without userinfo' });
+  }
+});
+
 const envSchema = z.object({
   // ---- Core (required, with sane defaults) ----
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
@@ -115,6 +122,11 @@ const envSchema = z.object({
     .enum(['true', 'false'])
     .default('false')
     .transform((value) => value === 'true'),
+  // Public OAuth client: PKCE replaces a client secret. All three variables
+  // are optional as a group outside configured environments.
+  CALCOM_OAUTH_CLIENT_ID: z.string().regex(/^[A-Za-z0-9._-]{1,200}$/u).optional(),
+  CALCOM_OAUTH_REDIRECT_URI: httpsUrl.optional(),
+  CALCOM_PORTAL_RETURN_URL: httpsUrl.optional(),
 
   // ---- SMTP Infomaniak (optional in session 1, promote when email lands) ----
   SMTP_HOST: z.string().min(1).optional(),
@@ -297,6 +309,40 @@ const envSchema = z.object({
     }),
 })
   .superRefine((v, ctx) => {
+    const oauthConfigured = [
+      v.CALCOM_OAUTH_CLIENT_ID,
+      v.CALCOM_OAUTH_REDIRECT_URI,
+      v.CALCOM_PORTAL_RETURN_URL,
+    ];
+    if (oauthConfigured.some((value) => value !== undefined)
+      && oauthConfigured.some((value) => value === undefined)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['CALCOM_OAUTH_CLIENT_ID'],
+        message: 'Cal.com OAuth client id, redirect URI and portal return URL must be configured together',
+      });
+    }
+    if (v.CALCOM_OAUTH_REDIRECT_URI !== undefined) {
+      const redirect = new URL(v.CALCOM_OAUTH_REDIRECT_URI);
+      if (redirect.pathname !== '/oauth/calcom/callback' || redirect.search || redirect.hash) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['CALCOM_OAUTH_REDIRECT_URI'],
+          message: 'must use the exact /oauth/calcom/callback path without query or fragment',
+        });
+      }
+    }
+    if (v.CALCOM_PORTAL_RETURN_URL !== undefined) {
+      const portal = new URL(v.CALCOM_PORTAL_RETURN_URL);
+      const allowedOrigins = v.CORS_ORIGIN.split(',').map((origin) => origin.trim());
+      if (!allowedOrigins.includes(portal.origin) || portal.search || portal.hash) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['CALCOM_PORTAL_RETURN_URL'],
+          message: 'must use an allowlisted CORS origin without query or fragment',
+        });
+      }
+    }
     // Production must have an alert recipient wired. Anywhere else the
     // ops team can (temporarily) run without one.
     if (v.NODE_ENV === 'production' && v.ALERT_EMAIL === undefined) {

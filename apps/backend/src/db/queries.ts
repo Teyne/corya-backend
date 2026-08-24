@@ -96,6 +96,111 @@ export interface CalcomConnectionCredentials {
   demonstrationMode: boolean;
 }
 
+const oauthFlowStartSchema = z.object({
+  flow_id: z.string().uuid(),
+  state: z.string().regex(/^[A-Za-z0-9_-]{43,128}$/u),
+  code_challenge: z.string().regex(/^[A-Za-z0-9_-]{43,128}$/u),
+  code_challenge_method: z.literal('S256'),
+  redirect_uri: z.string().url(),
+  requested_scopes: z.array(z.string().min(1).max(120)).length(4),
+  expires_at: z.string().datetime({ offset: true }),
+}).strict();
+
+const consumedOAuthFlowSchema = z.object({
+  outcome: z.enum(['consumed', 'not_found', 'expired', 'replayed', 'failed']),
+  flow_id: z.string().uuid().nullable(),
+  cabinet_id: z.string().uuid().nullable(),
+  actor_user_id: z.string().uuid().nullable(),
+  code_verifier: z.string().regex(/^[A-Za-z0-9_-]{43,128}$/u).nullable(),
+  redirect_uri: z.string().url().nullable(),
+  requested_scopes: z.array(z.string().min(1).max(120)).max(32).nullable(),
+  exchange_deadline: z.string().datetime({ offset: true }).nullable(),
+}).strict();
+
+const completeOAuthFlowSchema = z.object({
+  outcome: z.enum(['connected', 'replayed', 'expired', 'scope_mismatch']),
+  connection_id: z.string().uuid().nullable(),
+  status: z.enum(['connected', 'expired', 'error', 'revoked']).nullable(),
+  access_token_expires_at: z.string().datetime({ offset: true }).nullable(),
+  updated_at: z.string().datetime({ offset: true }).nullable(),
+}).strict();
+
+const calcomConnectionStatusSchema = z.object({
+  connection_id: z.string().uuid().nullable(),
+  status: z.enum(['connected', 'expired', 'error', 'revoked']).nullable(),
+  event_type_id: z.string().regex(/^[1-9]\d{0,19}$/u).nullable(),
+  event_type_title: z.string().min(1).max(120).nullable(),
+  event_type_length_minutes: z.number().int().min(5).max(480).nullable(),
+  configured_scopes: z.array(z.string().min(1).max(120)).max(32).nullable(),
+  granted_scopes: z.array(z.string().min(1).max(120)).max(32).nullable(),
+  access_token_expires_at: z.string().datetime({ offset: true }).nullable(),
+  connected_at: z.string().datetime({ offset: true }).nullable(),
+  last_refreshed_at: z.string().datetime({ offset: true }).nullable(),
+  error_code: z.string().min(1).max(80).nullable(),
+  demonstration_mode: z.boolean(),
+  runtime_ready: z.boolean(),
+}).strict();
+
+const refreshClaimSchema = z.object({
+  outcome: z.enum(['claimed', 'unavailable', 'busy', 'not_due']),
+  connection_id: z.string().uuid().nullable(),
+  token_generation: z.coerce.number().int().nonnegative().safe().nullable(),
+  refresh_token: z.string().min(1).max(16_384).nullable(),
+  configured_scopes: z.array(z.string().min(1).max(120)).max(32).nullable(),
+  event_type_id: z.string().regex(/^[1-9]\d{0,19}$/u).nullable(),
+  lease_until: z.string().datetime({ offset: true }).nullable(),
+}).strict();
+
+export interface CalcomOAuthFlowStartRow {
+  flowId: string;
+  state: string;
+  codeChallenge: string;
+  codeChallengeMethod: 'S256';
+  redirectUri: string;
+  scopes: string[];
+  expiresAt: string;
+}
+
+export interface ConsumedCalcomOAuthFlowRow {
+  flowId: string;
+  cabinetId: string;
+  actorUserId: string;
+  codeVerifier: string;
+  redirectUri: string;
+  scopes: string[];
+  deadline: string;
+}
+
+export interface CalcomConnectionStatus {
+  connectionId: string | null;
+  status: 'connected' | 'expired' | 'error' | 'revoked' | null;
+  eventTypeId: string | null;
+  eventTypeTitle: string | null;
+  eventTypeLengthMinutes: number | null;
+  configuredScopes: string[] | null;
+  grantedScopes: string[] | null;
+  accessTokenExpiresAt: string | null;
+  connectedAt: string | null;
+  lastRefreshedAt: string | null;
+  errorCode: string | null;
+  demonstrationMode: boolean;
+  runtimeReady: boolean;
+}
+
+export interface CalcomRefreshClaim {
+  connectionId: string;
+  tokenGeneration: number;
+  refreshToken: string;
+  configuredScopes: string[];
+  eventTypeId: string | null;
+  leaseUntil: string;
+}
+
+function oneRpcRow(data: unknown, errorCode: string): unknown {
+  if (!Array.isArray(data) || data.length !== 1) throw new Error(errorCode);
+  return data[0];
+}
+
 /**
  * Resolve one cabinet's decrypted Cal.com credential through the dedicated
  * SECURITY DEFINER RPC. The function is service-role only and always scoped
@@ -136,6 +241,277 @@ export async function getCalcomConnectionCredentials(
     providerAccountId: parsed.data.provider_account_id,
     demonstrationMode: parsed.data.demonstration_mode,
   };
+}
+
+export async function beginCalcomOAuthFlow(
+  cabinetId: string,
+  actorUserId: string,
+  redirectUri: string,
+): Promise<CalcomOAuthFlowStartRow> {
+  const result = await withDbTimeout(
+    (signal) => getServiceClient().rpc('begin_calcom_oauth_flow', {
+      p_cabinet_id: cabinetId,
+      p_actor_user_id: actorUserId,
+      p_redirect_uri: redirectUri,
+    }).abortSignal(signal),
+    'db:beginCalcomOAuthFlow',
+  ) as { data: unknown; error: unknown };
+  if (result.error) throw new Error('db_begin_calcom_oauth_failed');
+  const parsed = oauthFlowStartSchema.safeParse(oneRpcRow(
+    result.data,
+    'db_begin_calcom_oauth_invalid_result',
+  ));
+  if (!parsed.success) throw new Error('db_begin_calcom_oauth_invalid_result');
+  return {
+    flowId: parsed.data.flow_id,
+    state: parsed.data.state,
+    codeChallenge: parsed.data.code_challenge,
+    codeChallengeMethod: parsed.data.code_challenge_method,
+    redirectUri: parsed.data.redirect_uri,
+    scopes: parsed.data.requested_scopes,
+    expiresAt: parsed.data.expires_at,
+  };
+}
+
+export async function consumeCalcomOAuthFlow(
+  state: string,
+): Promise<ConsumedCalcomOAuthFlowRow | null> {
+  const result = await withDbTimeout(
+    (signal) => getServiceClient().rpc('consume_calcom_oauth_flow', {
+      p_state: state,
+    }).abortSignal(signal),
+    'db:consumeCalcomOAuthFlow',
+  ) as { data: unknown; error: unknown };
+  if (result.error) throw new Error('db_consume_calcom_oauth_failed');
+  const parsed = consumedOAuthFlowSchema.safeParse(oneRpcRow(
+    result.data,
+    'db_consume_calcom_oauth_invalid_result',
+  ));
+  if (!parsed.success) throw new Error('db_consume_calcom_oauth_invalid_result');
+  const row = parsed.data;
+  if (row.outcome !== 'consumed') return null;
+  if (
+    row.flow_id === null || row.cabinet_id === null || row.actor_user_id === null
+    || row.code_verifier === null || row.redirect_uri === null
+    || row.requested_scopes === null || row.exchange_deadline === null
+  ) throw new Error('db_consume_calcom_oauth_invalid_result');
+  return {
+    flowId: row.flow_id,
+    cabinetId: row.cabinet_id,
+    actorUserId: row.actor_user_id,
+    codeVerifier: row.code_verifier,
+    redirectUri: row.redirect_uri,
+    scopes: row.requested_scopes,
+    deadline: row.exchange_deadline,
+  };
+}
+
+export async function completeCalcomOAuthFlow(input: {
+  flowId: string;
+  accessToken: string;
+  refreshToken: string;
+  accessTokenExpiresAt: string;
+  grantedScopes: string[];
+  providerAccountId: string | null;
+}): Promise<boolean> {
+  const result = await withDbTimeout(
+    (signal) => getServiceClient().rpc('complete_calcom_oauth_flow', {
+      p_flow_id: input.flowId,
+      p_access_token: input.accessToken,
+      p_refresh_token: input.refreshToken,
+      p_access_token_expires_at: input.accessTokenExpiresAt,
+      p_granted_scopes: input.grantedScopes,
+      p_provider_account_id: input.providerAccountId,
+    }).abortSignal(signal),
+    'db:completeCalcomOAuthFlow',
+  ) as { data: unknown; error: unknown };
+  if (result.error) throw new Error('db_complete_calcom_oauth_failed');
+  const parsed = completeOAuthFlowSchema.safeParse(oneRpcRow(
+    result.data,
+    'db_complete_calcom_oauth_invalid_result',
+  ));
+  if (!parsed.success) throw new Error('db_complete_calcom_oauth_invalid_result');
+  return parsed.data.outcome === 'connected'
+    && parsed.data.connection_id !== null
+    && parsed.data.status === 'connected';
+}
+
+export async function failCalcomOAuthFlow(
+  flowId: string,
+  reason: 'access_denied' | 'token_exchange_failed' | 'event_type_invalid',
+): Promise<void> {
+  const result = await withDbTimeout(
+    (signal) => getServiceClient().rpc('fail_calcom_oauth_flow', {
+      p_flow_id: flowId,
+      p_reason_code: reason,
+    }).abortSignal(signal),
+    'db:failCalcomOAuthFlow',
+  ) as { data: unknown; error: unknown };
+  if (result.error || typeof result.data !== 'boolean') {
+    throw new Error('db_fail_calcom_oauth_failed');
+  }
+}
+
+export async function getCalcomConnectionStatus(
+  cabinetId: string,
+): Promise<CalcomConnectionStatus | null> {
+  const result = await withDbTimeout(
+    (signal) => getServiceClient().rpc('get_calcom_connection_status', {
+      p_cabinet_id: cabinetId,
+    }).abortSignal(signal),
+    'db:getCalcomConnectionStatus',
+  ) as { data: unknown; error: unknown };
+  if (result.error) throw new Error('db_get_calcom_status_failed');
+  if (!Array.isArray(result.data)) throw new Error('db_get_calcom_status_invalid_result');
+  if (result.data.length === 0) return null;
+  const parsed = calcomConnectionStatusSchema.safeParse(oneRpcRow(
+    result.data,
+    'db_get_calcom_status_invalid_result',
+  ));
+  if (!parsed.success) throw new Error('db_get_calcom_status_invalid_result');
+  const row = parsed.data;
+  return {
+    connectionId: row.connection_id,
+    status: row.status,
+    eventTypeId: row.event_type_id,
+    eventTypeTitle: row.event_type_title,
+    eventTypeLengthMinutes: row.event_type_length_minutes,
+    configuredScopes: row.configured_scopes,
+    grantedScopes: row.granted_scopes,
+    accessTokenExpiresAt: row.access_token_expires_at,
+    connectedAt: row.connected_at,
+    lastRefreshedAt: row.last_refreshed_at,
+    errorCode: row.error_code,
+    demonstrationMode: row.demonstration_mode,
+    runtimeReady: row.runtime_ready,
+  };
+}
+
+export async function setCalcomEventType(input: {
+  cabinetId: string;
+  actorUserId: string;
+  eventTypeId: string;
+  title: string;
+  lengthMinutes: number;
+}): Promise<boolean> {
+  const result = await withDbTimeout(
+    (signal) => getServiceClient().rpc('set_calcom_event_type', {
+      p_cabinet_id: input.cabinetId,
+      p_actor_user_id: input.actorUserId,
+      p_event_type_id: input.eventTypeId,
+      p_title: input.title,
+      p_length_minutes: input.lengthMinutes,
+    }).abortSignal(signal),
+    'db:setCalcomEventType',
+  ) as { data: unknown; error: unknown };
+  if (result.error || typeof result.data !== 'boolean') {
+    throw new Error('db_set_calcom_event_type_failed');
+  }
+  return result.data;
+}
+
+export async function claimCalcomOAuthRefresh(
+  cabinetId: string,
+  leaseOwner: string,
+  minValiditySeconds = 120,
+): Promise<CalcomRefreshClaim | null> {
+  const result = await withDbTimeout(
+    (signal) => getServiceClient().rpc('claim_calcom_oauth_refresh', {
+      p_cabinet_id: cabinetId,
+      p_lease_owner: leaseOwner,
+      p_min_validity_seconds: minValiditySeconds,
+    }).abortSignal(signal),
+    'db:claimCalcomOAuthRefresh',
+  ) as { data: unknown; error: unknown };
+  if (result.error) throw new Error('db_claim_calcom_refresh_failed');
+  const parsed = refreshClaimSchema.safeParse(oneRpcRow(
+    result.data,
+    'db_claim_calcom_refresh_invalid_result',
+  ));
+  if (!parsed.success) throw new Error('db_claim_calcom_refresh_invalid_result');
+  const row = parsed.data;
+  if (row.outcome !== 'claimed') return null;
+  if (
+    row.connection_id === null || row.token_generation === null
+    || row.refresh_token === null || row.configured_scopes === null
+    || row.lease_until === null
+  ) throw new Error('db_claim_calcom_refresh_invalid_result');
+  return {
+    connectionId: row.connection_id,
+    tokenGeneration: row.token_generation,
+    refreshToken: row.refresh_token,
+    configuredScopes: row.configured_scopes,
+    eventTypeId: row.event_type_id,
+    leaseUntil: row.lease_until,
+  };
+}
+
+export async function completeCalcomOAuthRefresh(input: {
+  connectionId: string;
+  leaseOwner: string;
+  expectedGeneration: number;
+  accessToken: string;
+  refreshToken: string;
+  accessTokenExpiresAt: string;
+  grantedScopes: string[];
+}): Promise<boolean> {
+  const result = await withDbTimeout(
+    (signal) => getServiceClient().rpc('complete_calcom_oauth_refresh', {
+      p_connection_id: input.connectionId,
+      p_lease_owner: input.leaseOwner,
+      p_expected_generation: input.expectedGeneration,
+      p_access_token: input.accessToken,
+      p_refresh_token: input.refreshToken,
+      p_access_token_expires_at: input.accessTokenExpiresAt,
+      p_granted_scopes: input.grantedScopes,
+    }).abortSignal(signal),
+    'db:completeCalcomOAuthRefresh',
+  ) as { data: unknown; error: unknown };
+  if (result.error || typeof result.data !== 'boolean') {
+    throw new Error('db_complete_calcom_refresh_failed');
+  }
+  return result.data;
+}
+
+export async function failCalcomOAuthRefresh(input: {
+  connectionId: string;
+  leaseOwner: string;
+  expectedGeneration: number;
+  reason: 'refresh_transient' | 'refresh_invalid_grant';
+  terminal: boolean;
+}): Promise<boolean> {
+  const result = await withDbTimeout(
+    (signal) => getServiceClient().rpc('fail_calcom_oauth_refresh', {
+      p_connection_id: input.connectionId,
+      p_lease_owner: input.leaseOwner,
+      p_expected_generation: input.expectedGeneration,
+      p_reason_code: input.reason,
+      p_terminal: input.terminal,
+    }).abortSignal(signal),
+    'db:failCalcomOAuthRefresh',
+  ) as { data: unknown; error: unknown };
+  if (result.error || typeof result.data !== 'boolean') {
+    throw new Error('db_fail_calcom_refresh_failed');
+  }
+  return result.data;
+}
+
+export async function disconnectCalcomOAuthConnection(
+  cabinetId: string,
+  actorUserId: string,
+): Promise<boolean> {
+  const result = await withDbTimeout(
+    (signal) => getServiceClient().rpc('disconnect_calcom_oauth_connection', {
+      p_cabinet_id: cabinetId,
+      p_actor_user_id: actorUserId,
+      p_reason_code: 'user_requested',
+    }).abortSignal(signal),
+    'db:disconnectCalcomOAuthConnection',
+  ) as { data: unknown; error: unknown };
+  if (result.error || typeof result.data !== 'boolean') {
+    throw new Error('db_disconnect_calcom_failed');
+  }
+  return result.data;
 }
 
 /**

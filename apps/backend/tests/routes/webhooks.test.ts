@@ -79,6 +79,17 @@ vi.mock('../../src/db/queries.js', () => {
       return Promise.resolve({ appelId, duplicate: Boolean(existing) });
     }),
     reconcileCalendarBookingForAppel: vi.fn(() => Promise.resolve(null)),
+    beginCalcomOAuthFlow: vi.fn(() => Promise.reject(new Error('not_configured'))),
+    consumeCalcomOAuthFlow: vi.fn(() => Promise.resolve(null)),
+    completeCalcomOAuthFlow: vi.fn(() => Promise.resolve(false)),
+    failCalcomOAuthFlow: vi.fn(() => Promise.resolve(false)),
+    getCalcomConnectionCredentials: vi.fn(() => Promise.resolve(null)),
+    claimCalcomOAuthRefresh: vi.fn(() => Promise.resolve(null)),
+    completeCalcomOAuthRefresh: vi.fn(() => Promise.resolve(false)),
+    failCalcomOAuthRefresh: vi.fn(() => Promise.resolve(false)),
+    getCalcomConnectionStatus: vi.fn(() => Promise.resolve(null)),
+    setCalcomEventType: vi.fn(() => Promise.resolve(false)),
+    disconnectCalcomOAuthConnection: vi.fn(() => Promise.resolve(false)),
   };
 });
 
