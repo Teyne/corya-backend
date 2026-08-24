@@ -89,6 +89,7 @@ const { verify: sdkVerify } = await import('retell-sdk');
 const mockSdkVerify = vi.mocked(sdkVerify);
 const { __resetRateLimitForTests } = await import('../../src/middleware/rate-limit.js');
 const { env } = await import('../../src/config/env.js');
+const { hashPhoneNumber } = await import('../../src/utils/redact.js');
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixturesDir = resolve(__dirname, '..', 'fixtures');
@@ -136,6 +137,28 @@ async function waitForAsyncProcessing(): Promise<void> {
     },
     { timeout: 2000, interval: 10 },
   );
+}
+
+function analyzedPayloadWithPhones(
+  customPhone: unknown,
+  callerPhone: string,
+  rappelAutorise?: unknown,
+): string {
+  const payload = JSON.parse(fixtureAnalyzed) as {
+    call: {
+      from_number: string;
+      call_analysis: {
+        custom_analysis_data: Record<string, unknown>;
+      };
+    };
+  };
+  payload.call.from_number = callerPhone;
+  payload.call.call_analysis.custom_analysis_data.patient_telephone = customPhone;
+  if (rappelAutorise !== undefined) {
+    payload.call.call_analysis.custom_analysis_data.rappel_autorise =
+      rappelAutorise;
+  }
+  return JSON.stringify(payload);
 }
 
 beforeEach(() => {
@@ -299,6 +322,87 @@ describe('POST /webhooks/retell/call-ended — authenticated but unusable', () =
 // call_analyzed happy path
 // ---------------------------------------------------------------------------
 describe('POST /webhooks/retell/call-ended — call_analyzed', () => {
+  it('normalizes and prefers a valid custom callback number', async () => {
+    mockSdkVerify.mockResolvedValue(true);
+    const res = await postWebhook(
+      analyzedPayloadWithPhones('078 400 16 80', '+41 79 123 45 67', true),
+      placeholderSignature(),
+    );
+    expect(res.status).toBe(200);
+    await waitForAsyncProcessing();
+
+    const persisted = vi.mocked(queries.persistCallAnalyzed).mock.calls[0]?.[0];
+    expect(persisted?.appel).toMatchObject({
+      patient_telephone: '+41784001680',
+      numero_appelant_hash: hashPhoneNumber('+41791234567'),
+      numero_appelant_masque: '079 *** ** 67',
+    });
+  });
+
+  it('persists no callback number when callback permission is strictly false', async () => {
+    mockSdkVerify.mockResolvedValue(true);
+    const res = await postWebhook(
+      analyzedPayloadWithPhones('078 400 16 80', '+41 79 123 45 67', false),
+      placeholderSignature(),
+    );
+    expect(res.status).toBe(200);
+    await waitForAsyncProcessing();
+
+    const persisted = vi.mocked(queries.persistCallAnalyzed).mock.calls[0]?.[0];
+    expect(persisted?.appel).toMatchObject({
+      patient_telephone: null,
+      numero_appelant_hash: hashPhoneNumber('+41791234567'),
+      numero_appelant_masque: '079 *** ** 67',
+    });
+  });
+
+  it('does not coerce the string "false" into a callback veto', async () => {
+    mockSdkVerify.mockResolvedValue(true);
+    const res = await postWebhook(
+      analyzedPayloadWithPhones('078 400 16 80', '+41 79 123 45 67', 'false'),
+      placeholderSignature(),
+    );
+    expect(res.status).toBe(200);
+    await waitForAsyncProcessing();
+
+    const persisted = vi.mocked(queries.persistCallAnalyzed).mock.calls[0]?.[0];
+    expect(persisted?.appel.patient_telephone).toBe('+41784001680');
+  });
+
+  it('keeps the legacy fallback when callback permission is absent', async () => {
+    mockSdkVerify.mockResolvedValue(true);
+    const res = await postWebhook(
+      analyzedPayloadWithPhones('numéro indisponible', '0041 78 400 16 80'),
+      placeholderSignature(),
+    );
+    expect(res.status).toBe(200);
+    await waitForAsyncProcessing();
+
+    const persisted = vi.mocked(queries.persistCallAnalyzed).mock.calls[0]?.[0];
+    expect(persisted?.appel).toMatchObject({
+      patient_telephone: '+41784001680',
+      numero_appelant_hash: hashPhoneNumber('+41784001680'),
+      numero_appelant_masque: '078 *** ** 80',
+    });
+  });
+
+  it('persists no callback identifier when custom data and caller-ID are invalid', async () => {
+    mockSdkVerify.mockResolvedValue(true);
+    const res = await postWebhook(
+      analyzedPayloadWithPhones('12345', '+33123456789'),
+      placeholderSignature(),
+    );
+    expect(res.status).toBe(200);
+    await waitForAsyncProcessing();
+
+    const persisted = vi.mocked(queries.persistCallAnalyzed).mock.calls[0]?.[0];
+    expect(persisted?.appel).toMatchObject({
+      patient_telephone: null,
+      numero_appelant_hash: null,
+      numero_appelant_masque: null,
+    });
+  });
+
   it('returns 500 and does not acknowledge when persistence fails before insert', async () => {
     mockSdkVerify.mockResolvedValue(true);
     vi.mocked(queries.persistCallAnalyzed).mockRejectedValueOnce(
@@ -341,7 +445,21 @@ describe('POST /webhooks/retell/call-ended — call_analyzed', () => {
     // with per-step checkpoints in its payload. The audio purge stays a
     // separate job because it fires at +48 h.
     mockSdkVerify.mockResolvedValue(true);
-    const res = await postWebhook(fixtureAnalyzed, placeholderSignature());
+    const appointmentPayload = JSON.parse(fixtureAnalyzed) as {
+      call: {
+        call_analysis: {
+          custom_analysis_data: Record<string, unknown>;
+        };
+      };
+    };
+    appointmentPayload.call.call_analysis.custom_analysis_data.resultat = 'echec';
+    appointmentPayload.call.call_analysis.custom_analysis_data.motif_appel =
+      'prendre_rendez_vous';
+    appointmentPayload.call.call_analysis.custom_analysis_data.rdv_date = null;
+    const res = await postWebhook(
+      JSON.stringify(appointmentPayload),
+      placeholderSignature(),
+    );
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ received: true, event: 'call_analyzed' });
 
@@ -363,7 +481,7 @@ describe('POST /webhooks/retell/call-ended — call_analyzed', () => {
       cabinetRow.id,
       expect.any(String),
       expect.any(String),
-      '2026-08-14T10:00:00.000Z',
+      null,
     );
   });
 

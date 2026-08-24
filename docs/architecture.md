@@ -33,6 +33,17 @@ contrôlée, sans ouverture à de vrais patients.
 4. `process_appel` génère le PDF, l'upload dans `pdf-recaps` privé, crée une URL signée courte et envoie l'e-mail.
 5. `purge_audio_retell`, planifié à +48 h, supprime l'appel Retell. Un échec est journalisé et alerté mais ne bloque pas la file ; la rétention Retell configurée à un jour sert de filet indépendant.
 
+### Numéro de rappel
+
+Le numéro utilisable pour un rappel est distinct du Caller ID technique. Le
+backend n'accepte que les formats suisses `+41`, `0041` ou nationaux `0...`,
+les normalise en E.164 et rejette les textes, extensions, pays étrangers,
+longueurs ou préfixes incohérents. Un numéro explicitement confirmé dans
+l'analyse Retell est prioritaire ; à défaut, le Caller ID validé sert de
+compatibilité. Le booléen strict `rappel_autorise = false` interdit ce fallback
+et laisse `patient_telephone` vide. Le hash et le masque techniques du Caller ID
+restent séparés du consentement de rappel et aucun numéro n'est journalisé.
+
 ## Registre et réconciliation Cal.com
 
 Cal.com reste la source de vérité de la réservation. Le webhook
@@ -45,9 +56,24 @@ les notes et les URL de réunion ne sont jamais persistés ni journalisés.
 `calendar_booking_events` fournit la clé d'idempotence du webhook et
 `calendar_bookings` conserve uniquement le cabinet, les UID fournisseur,
 l'event type, l'état et les horaires. La réconciliation avec `appels` accepte
-les deux ordres d'arrivée Retell/Cal.com. Elle utilise l'horaire de rendez-vous
-lorsqu'il existe, sinon la fenêtre technique de création pendant l'appel, et
-ne crée un lien que si le candidat est unique. Un cas ambigu reste non lié.
+les deux ordres d'arrivée Retell/Cal.com. Une réservation Cal.com confirmée
+est autoritaire : si le parcours est `prendre_rendez_vous` et que le couple
+appel/réservation est unique dans les deux directions, la même transaction lie
+les lignes et impose `resultat = rdv_pris` ainsi que l'horaire fournisseur dans
+`rdv_date`, même si l'analyse Retell avait retourné `echec` ou aucune valeur.
+La preuve repose toujours sur un événement Cal.com de création ou de
+déplacement dans la fenêtre technique de l'appel ; lorsqu'un `rdv_date` Retell
+existe, il sert uniquement de filtre de cohérence avec l'horaire fournisseur.
+Un cas absent, incohérent ou ambigu reste non lié et n'est jamais promu.
+
+Pour éviter qu'un PDF ou un e-mail ne fige l'analyse Retell avant l'arrivée du
+webhook calendrier, le job `process_appel` d'un parcours rendez-vous non encore
+rapproché est différé de cinq minutes. Une réconciliation réussie l'accélère
+immédiatement ; le worker effectue encore une dernière réconciliation et relit
+la ligne `appels` avant tout rendu durable. Cette grâce constitue un SLO borné,
+pas une garantie de livraison fournisseur : un webhook exceptionnellement reçu
+après cinq minutes peut corriger la base sans pouvoir rectifier un e-mail déjà
+envoyé.
 Les deux tables sont privées (RLS, aucun droit `anon`/`authenticated`) et sont
 purgées après 24 mois par le cron mensuel existant.
 

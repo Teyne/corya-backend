@@ -16,7 +16,7 @@
  *        - `purge_audio_retell` scheduled at date_appel + 48 h
  *
  * PII handling:
- *   - `patient_telephone` (raw) goes into DB (purged at J+7 by DB cron)
+ *   - `patient_telephone` (validated E.164) goes into DB (purged at J+7 by DB cron)
  *   - `numero_appelant_hash` + `numero_appelant_masque` live longer for
  *     analytics
  *   - Nothing PII ever transits through log messages (only field names in
@@ -37,6 +37,7 @@ import type {
   WebhookProcessResult,
 } from '../types/index.js';
 import { hashPhoneNumber, maskPhoneNumber } from '../utils/redact.js';
+import { normalizeSwissPhoneNumber } from '../utils/phone.js';
 
 const KNOWN_RESULTATS: ReadonlySet<AppelResultat> = new Set<AppelResultat>([
   'rdv_pris',
@@ -131,9 +132,16 @@ export async function processCallAnalyzed(
       ? Math.round(call.duration_ms / 1000)
       : null;
 
-  const numeroBrut = call.from_number ?? null;
-  const numeroHash = numeroBrut ? hashPhoneNumber(numeroBrut) : null;
-  const numeroMasque = numeroBrut ? maskPhoneNumber(numeroBrut) : null;
+  const numeroAppelant = normalizeSwissPhoneNumber(call.from_number);
+  const rappelAutorise = custom?.rappel_autorise;
+  const numeroPatient = rappelAutorise === false
+    ? null
+    : normalizeSwissPhoneNumber(pickString(custom, 'patient_telephone'))
+      ?? numeroAppelant;
+  const numeroHash = numeroAppelant ? hashPhoneNumber(numeroAppelant) : null;
+  const numeroMasque = numeroAppelant
+    ? maskPhoneNumber(`0${numeroAppelant.slice(3)}`)
+    : null;
 
   const audioUrl = call.recording_url ?? null;
   const audioExpiresAt = audioUrl ? computeAudioExpiresAt(dateAppelIso) : null;
@@ -149,9 +157,10 @@ export async function processCallAnalyzed(
     motif_appel: pickString(custom, 'motif_appel'),
     patient_nom: pickString(custom, 'patient_nom'),
     patient_prenom: pickString(custom, 'patient_prenom'),
-    // Prefer the number the patient GAVE the agent (custom analysis) over the
-    // caller-ID, which may be withheld. Fall back to caller-ID otherwise.
-    patient_telephone: pickString(custom, 'patient_telephone') ?? numeroBrut,
+    // A strict boolean false forbids use as a callback number. When true or
+    // absent (legacy agents), prefer a valid number explicitly given to the
+    // agent, then the validated caller-ID. String values are never coerced.
+    patient_telephone: numeroPatient,
     rdv_date: pickIsoDate(custom, 'rdv_date'),
     rdv_praticien: pickString(custom, 'rdv_praticien'),
     transcript: call.transcript ?? null,
@@ -194,10 +203,11 @@ export async function processCallAnalyzed(
     correlationId,
   });
 
-  // Cal.com and Retell webhooks are independent and may arrive in either
-  // order. Reconcile only a confirmed rdv_pris with an exact cabinet/start
-  // match; the SQL function deliberately refuses ambiguous candidates.
-  if (row.resultat === 'rdv_pris') {
+  // Cal.com is authoritative for bookings. Retell may classify a genuinely
+  // booked call as `echec`, so use the general appointment intent to trigger
+  // the fail-closed SQL reconciliation instead of trusting `resultat` here.
+  // The SQL function still refuses zero or ambiguous candidates.
+  if (row.motif_appel === 'prendre_rendez_vous') {
     const bookingId = await reconcileCalendarBookingForAppel(
       appelId,
       cabinet.id,

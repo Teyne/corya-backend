@@ -41,11 +41,13 @@ $test$;
 -- Retell first, Cal.com second: the provider event time uniquely identifies
 -- the call even when Retell did not extract rdv_date.
 INSERT INTO public.appels (
-  id, cabinet_id, retell_call_id, date_appel, duree_secondes, resultat
+  id, cabinet_id, retell_call_id, date_appel, duree_secondes, resultat,
+  motif_appel
 ) VALUES (
   'ca200000-0000-4000-8000-000000000001',
   'ca100000-0000-4000-8000-000000000001',
-  'synthetic-call-before-cal', '2026-08-22T17:00:00Z', 120, 'rdv_pris'
+  'synthetic-call-before-cal', '2026-08-22T17:00:00Z', 120, 'echec',
+  'prendre_rendez_vous'
 );
 
 DO $test$
@@ -61,6 +63,14 @@ BEGIN
   IF v_result.outcome <> 'applied'
      OR v_result.source_appel_id <> 'ca200000-0000-4000-8000-000000000001'::UUID THEN
     RAISE EXCEPTION 'retell_first_reconciliation_failed result=%', v_result;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM public.appels
+     WHERE id = 'ca200000-0000-4000-8000-000000000001'
+       AND resultat = 'rdv_pris'
+       AND rdv_date = '2026-08-24T08:00:00Z'::TIMESTAMPTZ
+  ) THEN
+    RAISE EXCEPTION 'retell_first_call_not_authoritatively_promoted';
   END IF;
 
   SELECT * INTO STRICT v_replay FROM public.persist_calcom_booking_event(
@@ -84,17 +94,21 @@ SELECT * FROM public.persist_calcom_booking_event(
 );
 
 INSERT INTO public.appels (
-  id, cabinet_id, retell_call_id, date_appel, duree_secondes, resultat
+  id, cabinet_id, retell_call_id, date_appel, duree_secondes, resultat,
+  motif_appel
 ) VALUES (
   'ca200000-0000-4000-8000-000000000002',
   'ca100000-0000-4000-8000-000000000001',
-  'synthetic-call-after-cal', '2026-08-22T18:00:00Z', 120, 'rdv_pris'
+  'synthetic-call-after-cal', '2026-08-22T18:00:00Z', 120, NULL,
+  'prendre_rendez_vous'
 );
 
 DO $test$
 DECLARE
   v_booking UUID;
   v_linked UUID;
+  v_resultat TEXT;
+  v_rdv_date TIMESTAMPTZ;
 BEGIN
   v_booking := public.reconcile_calendar_booking_for_appel(
     'ca200000-0000-4000-8000-000000000002',
@@ -104,7 +118,13 @@ BEGIN
   SELECT source_appel_id INTO v_linked
     FROM public.calendar_bookings
    WHERE provider_booking_uid = 'synthetic-booking-b';
-  IF v_booking IS NULL OR v_linked <> 'ca200000-0000-4000-8000-000000000002'::UUID THEN
+  SELECT resultat, rdv_date INTO v_resultat, v_rdv_date
+    FROM public.appels
+   WHERE id = 'ca200000-0000-4000-8000-000000000002';
+  IF v_booking IS NULL
+     OR v_linked <> 'ca200000-0000-4000-8000-000000000002'::UUID
+     OR v_resultat <> 'rdv_pris'
+     OR v_rdv_date <> '2026-08-25T09:00:00Z'::TIMESTAMPTZ THEN
     RAISE EXCEPTION 'cal_first_reconciliation_failed booking=% linked=%', v_booking, v_linked;
   END IF;
 END;
@@ -118,11 +138,13 @@ SELECT * FROM public.persist_calcom_booking_event(
   '2026-08-27T11:00:00Z', '2026-08-27T11:30:00Z'
 );
 INSERT INTO public.appels (
-  id, cabinet_id, retell_call_id, date_appel, duree_secondes, resultat
+  id, cabinet_id, retell_call_id, date_appel, duree_secondes, resultat,
+  motif_appel
 ) VALUES (
   'ca200000-0000-4000-8000-000000000005',
   'ca100000-0000-4000-8000-000000000001',
-  'synthetic-replay-repair', '2026-08-22T20:00:00Z', 120, 'rdv_pris'
+  'synthetic-replay-repair', '2026-08-22T20:00:00Z', 120, 'echec',
+  'prendre_rendez_vous'
 );
 DO $test$
 DECLARE
@@ -142,12 +164,13 @@ $test$;
 
 -- Two calls covering the same provider event must remain unresolved.
 INSERT INTO public.appels (
-  id, cabinet_id, retell_call_id, date_appel, duree_secondes, resultat
+  id, cabinet_id, retell_call_id, date_appel, duree_secondes, resultat,
+  motif_appel
 ) VALUES
   ('ca200000-0000-4000-8000-000000000003', 'ca100000-0000-4000-8000-000000000001',
-   'synthetic-ambiguous-1', '2026-08-22T19:00:00Z', 180, 'rdv_pris'),
+   'synthetic-ambiguous-1', '2026-08-22T19:00:00Z', 180, 'echec', 'prendre_rendez_vous'),
   ('ca200000-0000-4000-8000-000000000004', 'ca100000-0000-4000-8000-000000000001',
-   'synthetic-ambiguous-2', '2026-08-22T19:00:30Z', 180, 'rdv_pris');
+   'synthetic-ambiguous-2', '2026-08-22T19:00:30Z', 180, 'echec', 'prendre_rendez_vous');
 
 SELECT * FROM public.persist_calcom_booking_event(
   repeat('c', 64), 'BOOKING_CREATED', '2026-08-22T19:01:00Z',
@@ -164,8 +187,90 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'ambiguous_booking_was_linked';
   END IF;
+  IF EXISTS (
+    SELECT 1 FROM public.appels
+     WHERE id IN (
+       'ca200000-0000-4000-8000-000000000003',
+       'ca200000-0000-4000-8000-000000000004'
+     )
+       AND resultat = 'rdv_pris'
+  ) THEN
+    RAISE EXCEPTION 'ambiguous_call_was_promoted';
+  END IF;
   IF (SELECT count(*) FROM public.calendar_booking_events) <> 4 THEN
     RAISE EXCEPTION 'unexpected_event_count';
+  END IF;
+END;
+$test$;
+
+-- A uniquely timed call from another intent must remain untouched.
+INSERT INTO public.appels (
+  id, cabinet_id, retell_call_id, date_appel, duree_secondes, resultat,
+  motif_appel
+) VALUES (
+  'ca200000-0000-4000-8000-000000000006',
+  'ca100000-0000-4000-8000-000000000001',
+  'synthetic-non-appointment', '2026-08-22T21:00:00Z', 120, 'echec',
+  'information_administrative'
+);
+
+SELECT * FROM public.persist_calcom_booking_event(
+  repeat('e', 64), 'BOOKING_CREATED', '2026-08-22T21:01:00Z',
+  'synthetic-booking-non-appointment', NULL, '6723841',
+  '2026-08-28T12:00:00Z', '2026-08-28T12:30:00Z'
+);
+
+DO $test$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM public.calendar_bookings
+     WHERE provider_booking_uid = 'synthetic-booking-non-appointment'
+       AND source_appel_id IS NOT NULL
+  ) OR EXISTS (
+    SELECT 1 FROM public.appels
+     WHERE id = 'ca200000-0000-4000-8000-000000000006'
+       AND resultat = 'rdv_pris'
+  ) THEN
+    RAISE EXCEPTION 'non_appointment_call_was_reconciled';
+  END IF;
+END;
+$test$;
+
+-- A matching Retell rdv_date is only a consistency filter. Without an
+-- authenticated Cal.com creation/reschedule event inside the call window it
+-- must never prove that this call created the booking.
+SELECT * FROM public.persist_calcom_booking_event(
+  repeat('f', 64), 'BOOKING_CREATED', '2026-08-22T22:01:00Z',
+  'synthetic-booking-date-only', NULL, '6723841',
+  '2026-08-29T10:00:00Z', '2026-08-29T10:30:00Z'
+);
+
+INSERT INTO public.appels (
+  id, cabinet_id, retell_call_id, date_appel, duree_secondes, resultat,
+  motif_appel, rdv_date
+) VALUES (
+  'ca200000-0000-4000-8000-000000000007',
+  'ca100000-0000-4000-8000-000000000001',
+  'synthetic-date-only-call', '2026-08-22T23:00:00Z', 120, 'echec',
+  'prendre_rendez_vous', '2026-08-29T10:00:00Z'
+);
+
+DO $test$
+DECLARE
+  v_booking UUID;
+BEGIN
+  v_booking := public.reconcile_calendar_booking_for_appel(
+    'ca200000-0000-4000-8000-000000000007',
+    'ca100000-0000-4000-8000-000000000001',
+    '2026-08-22T23:00:00Z', '2026-08-22T23:02:00Z',
+    '2026-08-29T10:00:00Z'
+  );
+  IF v_booking IS NOT NULL OR EXISTS (
+    SELECT 1 FROM public.appels
+     WHERE id = 'ca200000-0000-4000-8000-000000000007'
+       AND resultat = 'rdv_pris'
+  ) THEN
+    RAISE EXCEPTION 'date_only_match_was_reconciled';
   END IF;
 END;
 $test$;

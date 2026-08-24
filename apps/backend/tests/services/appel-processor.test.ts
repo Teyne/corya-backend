@@ -24,6 +24,15 @@ import type { ProcessAppelPayload } from '../../src/types/index.js';
 // `async () => ...` to satisfy ESLint's `require-await`.
 const getAppelForProcessingMock = vi.fn<(id: string) => Promise<unknown>>();
 const getCabinetForProcessingMock = vi.fn<(id: string) => Promise<unknown>>();
+const reconcileCalendarBookingForAppelMock = vi.fn<
+  (
+    appelId: string,
+    cabinetId: string,
+    callStartedAt: string,
+    callEndedAt: string,
+    bookingStartAt: string | null,
+  ) => Promise<string | null>
+>(() => Promise.resolve(null));
 const setAppelPdfPathMock = vi.fn<(id: string, path: string) => Promise<void>>(
   () => Promise.resolve(undefined),
 );
@@ -37,6 +46,7 @@ const updateJobPayloadMock = vi.fn<(id: string, payload: ProcessAppelPayload) =>
 vi.mock('../../src/db/queries.js', () => ({
   getAppelForProcessing: getAppelForProcessingMock,
   getCabinetForProcessing: getCabinetForProcessingMock,
+  reconcileCalendarBookingForAppel: reconcileCalendarBookingForAppelMock,
   setAppelPdfPath: setAppelPdfPathMock,
   markAppelEmailSent: markAppelEmailSentMock,
   updateJobPayload: updateJobPayloadMock,
@@ -190,6 +200,7 @@ function makeJob(overrides?: Partial<{ id: string; attempts: number; payload: Re
 beforeEach(() => {
   getAppelForProcessingMock.mockReset();
   getCabinetForProcessingMock.mockReset();
+  reconcileCalendarBookingForAppelMock.mockReset().mockResolvedValue(null);
   setAppelPdfPathMock.mockReset().mockResolvedValue(undefined);
   markAppelEmailSentMock.mockReset().mockResolvedValue(undefined);
   updateJobPayloadMock.mockReset().mockResolvedValue(undefined);
@@ -237,6 +248,67 @@ describe('processAppelJob — happy path', () => {
     expect(finalPayload?.steps?.pdf_uploaded_at).toBeTruthy();
     expect(finalPayload?.steps?.storage_path).toBe(`${CABINET_ID}/2026-07/${APPEL_ID}.pdf`);
     expect(finalPayload?.steps?.email_sent_at).toBeTruthy();
+  });
+});
+
+describe('processAppelJob — authoritative Cal.com reconciliation', () => {
+  const RETELL_FAILED_RDV = {
+    ...APPEL_ROW,
+    resultat: 'echec' as const,
+    motif_appel: 'prendre_rendez_vous',
+    rdv_date: null,
+  };
+
+  it('reloads a promoted appointment before rendering the PDF and email', async () => {
+    const reconciled = {
+      ...RETELL_FAILED_RDV,
+      resultat: 'rdv_pris' as const,
+      rdv_date: '2026-08-25T10:00:00.000Z',
+    };
+    getAppelForProcessingMock
+      .mockResolvedValueOnce(RETELL_FAILED_RDV)
+      .mockResolvedValueOnce(reconciled);
+    getCabinetForProcessingMock.mockResolvedValue(CABINET_ROW);
+    reconcileCalendarBookingForAppelMock.mockResolvedValue('booking-uuid-1');
+
+    await processAppelJob(makeJob());
+
+    expect(reconcileCalendarBookingForAppelMock).toHaveBeenCalledWith(
+      APPEL_ID,
+      CABINET_ID,
+      RETELL_FAILED_RDV.date_appel,
+      '2026-07-31T09:43:36.000Z',
+      null,
+    );
+    expect(getAppelForProcessingMock).toHaveBeenCalledTimes(2);
+    expect(renderAppelPdfMock).toHaveBeenCalledWith(reconciled, CABINET_ROW);
+    expect(sendRecapEmailMock.mock.calls[0]?.[0].appel).toBe(reconciled);
+  });
+
+  it('keeps the existing Retell outcome when no unique booking is found', async () => {
+    getAppelForProcessingMock.mockResolvedValue(RETELL_FAILED_RDV);
+    getCabinetForProcessingMock.mockResolvedValue(CABINET_ROW);
+    reconcileCalendarBookingForAppelMock.mockResolvedValue(null);
+
+    await processAppelJob(makeJob());
+
+    expect(reconcileCalendarBookingForAppelMock).toHaveBeenCalledTimes(1);
+    expect(getAppelForProcessingMock).toHaveBeenCalledTimes(1);
+    expect(renderAppelPdfMock).toHaveBeenCalledWith(
+      RETELL_FAILED_RDV,
+      CABINET_ROW,
+    );
+    expect(sendRecapEmailMock.mock.calls[0]?.[0].appel).toBe(RETELL_FAILED_RDV);
+  });
+
+  it('does not reconcile a non-appointment call', async () => {
+    getAppelForProcessingMock.mockResolvedValue(APPEL_ROW);
+    getCabinetForProcessingMock.mockResolvedValue(CABINET_ROW);
+
+    await processAppelJob(makeJob());
+
+    expect(reconcileCalendarBookingForAppelMock).not.toHaveBeenCalled();
+    expect(getAppelForProcessingMock).toHaveBeenCalledTimes(1);
   });
 });
 

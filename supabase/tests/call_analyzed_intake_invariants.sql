@@ -214,5 +214,33 @@ BEGIN
 END;
 $test$;
 
+-- An unresolved appointment waits for the bounded Cal.com webhook grace
+-- instead of becoming immediately claimable by the PDF/email worker.
+DO $test$
+DECLARE
+  v_before TIMESTAMPTZ := pg_catalog.clock_timestamp();
+  v_result RECORD;
+  v_run_after TIMESTAMPTZ;
+BEGIN
+  SELECT * INTO STRICT v_result FROM public.persist_call_analyzed(
+    '{"cabinet_id":"a4000000-0000-4000-8000-000000000001","retell_call_id":"synthetic-intake-appointment-grace","date_appel":"2026-08-04T01:00:00Z","resultat":"echec","motif_appel":"prendre_rendez_vous"}',
+    '{"version":1,"steps":{}}',
+    '{"retell_call_id":"synthetic-intake-appointment-grace"}',
+    '2026-08-06T01:00:00Z',
+    'synthetic-correlation-appointment-grace'
+  );
+
+  SELECT run_after INTO STRICT v_run_after
+    FROM public.jobs
+   WHERE appel_id = v_result.appel_id
+     AND type = 'process_appel';
+
+  IF v_run_after < v_before + INTERVAL '295 seconds'
+     OR v_run_after > pg_catalog.clock_timestamp() + INTERVAL '305 seconds' THEN
+    RAISE EXCEPTION 'appointment_grace_out_of_bounds run_after=%', v_run_after;
+  END IF;
+END;
+$test$;
+
 ROLLBACK;
 SELECT 'CALL_ANALYZED_INTAKE_INVARIANTS_PASS' AS result;

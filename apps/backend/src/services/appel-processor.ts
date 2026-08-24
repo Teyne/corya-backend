@@ -42,6 +42,7 @@ import {
   getAppelForProcessing,
   getCabinetForProcessing,
   markAppelEmailSent,
+  reconcileCalendarBookingForAppel,
   setAppelPdfPath,
   updateJobPayload,
 } from '../db/queries.js';
@@ -143,7 +144,7 @@ export async function processAppelJob(job: Job): Promise<void> {
   };
 
   // 1. Load rows -----------------------------------------------------------
-  const appel = await getAppelForProcessing(job.appel_id);
+  let appel = await getAppelForProcessing(job.appel_id);
   if (!appel) {
     // Appel purged between enqueue and claim (24-month cron, or
     // right-to-erasure). Nothing to do — success.
@@ -184,6 +185,45 @@ export async function processAppelJob(job: Job): Promise<void> {
   }
   if (payload.cc === undefined) {
     payload = mergePayload(payload, { cc: cabinet.email_notification_cc });
+  }
+
+  // Cal.com is authoritative for confirmed bookings. Retell post-call
+  // analysis can report `echec` even when the booking tool succeeded. Before
+  // rendering anything durable, give the fail-closed SQL reconciliation one
+  // final opportunity to promote a unique confirmed booking, then reload the
+  // row so both PDF and email use the corrected resultat / rdv_date.
+  if (appel.motif_appel === 'prendre_rendez_vous') {
+    const callEndedAt = new Date(
+      new Date(appel.date_appel).getTime()
+        + (appel.duree_secondes ?? 0) * 1_000,
+    ).toISOString();
+    const bookingId = await reconcileCalendarBookingForAppel(
+      appel.id,
+      appel.cabinet_id,
+      appel.date_appel,
+      callEndedAt,
+      appel.rdv_date,
+    );
+
+    if (bookingId) {
+      const reconciledAppel = await getAppelForProcessing(appel.id);
+      if (!reconciledAppel) {
+        logger.info(corrWithCall, 'process_appel_reconciled_appel_missing_skip');
+        return;
+      }
+      appel = reconciledAppel;
+      logger.info(
+        { ...corrWithCall, booking_id: bookingId },
+        'process_appel_calendar_booking_reconciled',
+      );
+
+      // A concurrent worker or administrative replay may have completed the
+      // email between the initial read and the reconciliation reload.
+      if (appel.email_status === 'sent') {
+        logger.info(corrWithCall, 'process_appel_email_already_sent_skip');
+        return;
+      }
+    }
   }
 
   // 5. PDF + upload --------------------------------------------------------
