@@ -37,6 +37,7 @@ import { toLogFields } from './utils/errors.js';
 import { runWave7GatedStartup } from './services/startup.js';
 import { adminRouter } from './routes/admin.js';
 import { calcomOAuthRouter } from './routes/calcom-oauth.js';
+import { retellCalcomToolsRouter } from './routes/retell-calcom-tools.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -125,6 +126,7 @@ app.use(
 // BEFORE the router so a burst is rejected before entering any handler.
 app.use('/webhooks', buildWebhookRateLimiter());
 app.use('/webhooks', webhooksRouter);
+app.use('/webhooks/retell/tools/calcom', retellCalcomToolsRouter);
 
 // Session 4 vague 4 — /health (liveness) and /health/deep (readiness).
 // The old inline handler moved to src/routes/health.ts. `uptime_seconds`

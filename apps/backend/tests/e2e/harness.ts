@@ -164,6 +164,9 @@ export function installQueryMocks(): void {
       getCalcomConnectionStatus: () => Promise.resolve(null),
       setCalcomEventType: () => Promise.resolve(false),
       disconnectCalcomOAuthConnection: () => Promise.resolve(false),
+      claimCalendarBookingCommand: () => Promise.resolve(null),
+      completeCalendarBookingCommand: () => Promise.resolve(false),
+      markCalendarBookingCommandUncertain: () => Promise.resolve(false),
       // ---------- reads ----------
       findCabinetByCoryaNumber: (toNumber: string): Promise<CabinetRow | null> => {
         for (const c of store.cabinets.values()) {

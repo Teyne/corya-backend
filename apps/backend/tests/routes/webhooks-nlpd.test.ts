@@ -65,6 +65,9 @@ vi.mock('../../src/db/queries.js', () => ({
   getCalcomConnectionStatus: vi.fn(() => Promise.resolve(null)),
   setCalcomEventType: vi.fn(() => Promise.resolve(false)),
   disconnectCalcomOAuthConnection: vi.fn(() => Promise.resolve(false)),
+  claimCalendarBookingCommand: vi.fn(() => Promise.resolve(null)),
+  completeCalendarBookingCommand: vi.fn(() => Promise.resolve(false)),
+  markCalendarBookingCommandUncertain: vi.fn(() => Promise.resolve(false)),
 }));
 
 // -- Logger mock: intercept the shared `logger` so we can inspect the JSON

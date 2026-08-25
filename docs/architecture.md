@@ -1,6 +1,6 @@
 # Architecture technique Corya
 
-État revu le 22 août 2026. Le schéma versionné couvre Wave 7, l'intake Retell
+État revu le 25 août 2026. Le schéma versionné couvre Wave 7, l'intake Retell
 atomique, le portail multi-tenant et le registre/réconciliation Cal.com. Les
 environnements Jelastic API et worker sont déployés depuis le même artefact
 précompilé immuable ; leur provenance exacte et leurs condensats sont relevés
@@ -45,6 +45,24 @@ et laisse `patient_telephone` vide. Le hash et le masque techniques du Caller ID
 restent séparés du consentement de rappel et aucun numéro n'est journalisé.
 
 ## Registre et réconciliation Cal.com
+
+Les fonctions de calendrier appelées pendant la conversation passent par
+`POST /webhooks/retell/tools/calcom/availability` et
+`POST /webhooks/retell/tools/calcom/booking`. Chaque requête est authentifiée
+avec la signature Retell calculée sur le corps brut. Le cabinet est résolu
+uniquement depuis `call.to_number` signé ; aucun `cabinet_id` fourni par le
+modèle n'est accepté. Le runtime choisit ensuite la connexion OAuth Cal.com du
+cabinet et n'utilise la clé partagée de démonstration que selon le fallback
+borné déjà défini pour le cabinet démo.
+
+La réservation emploie l'adresse technique `no-reply@corya.ch` et peut
+transmettre un numéro suisse validé et normalisé. Le corps Retell, le
+transcript, le nom et le téléphone ne sont ni journalisés ni persistés par ce
+chemin. `calendar_booking_commands` conserve seulement une empreinte de
+commande, des identifiants techniques fournisseur et les horaires. Cette
+barrière empêche deux écritures concurrentes et refuse tout rejeu automatique
+après un résultat fournisseur incertain ; elle rejoint la purge mensuelle du
+registre à 24 mois.
 
 Cal.com reste la source de vérité de la réservation. Le webhook
 `POST /webhooks/calcom/booking` vérifie `x-cal-signature-256` sur le corps brut,

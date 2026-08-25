@@ -6,7 +6,12 @@ vi.mock('../../src/config/supabase.js', () => ({
   getAuthClient: vi.fn(),
 }));
 
-const { getCalcomConnectionCredentials } = await import(
+const {
+  claimCalendarBookingCommand,
+  completeCalendarBookingCommand,
+  getCalcomConnectionCredentials,
+  markCalendarBookingCommandUncertain,
+} = await import(
   '../../src/db/queries.js'
 );
 
@@ -122,4 +127,66 @@ describe('getCalcomConnectionCredentials', () => {
       );
     },
   );
+});
+
+describe('calendar booking command RPC wrappers', () => {
+  it('maps the strict claim response without exposing payload data', async () => {
+    queueRpcResult([{
+      outcome: 'claimed',
+      provider_booking_uid: null,
+      provider_status: null,
+      booked_start: null,
+      booked_end: null,
+    }]);
+
+    await expect(claimCalendarBookingCommand({
+      commandKey: 'a'.repeat(64),
+      cabinetId: CABINET_ID,
+      requestedStart: '2026-09-10T10:00:00.000Z',
+      leaseOwner: '33333333-3333-4333-8333-333333333333',
+    })).resolves.toEqual({
+      outcome: 'claimed',
+      providerBookingUid: null,
+      providerStatus: null,
+      bookedStart: null,
+      bookedEnd: null,
+    });
+    expect(rpcMock).toHaveBeenCalledWith('claim_calendar_booking_command', {
+      p_command_key: 'a'.repeat(64),
+      p_cabinet_id: CABINET_ID,
+      p_requested_start: '2026-09-10T10:00:00.000Z',
+      p_lease_owner: '33333333-3333-4333-8333-333333333333',
+    });
+  });
+
+  it('maps completion and uncertainty transitions to booleans', async () => {
+    queueRpcResult(true);
+    await expect(completeCalendarBookingCommand({
+      commandKey: 'b'.repeat(64),
+      leaseOwner: '33333333-3333-4333-8333-333333333333',
+      providerBookingUid: 'synthetic-booking-uid',
+      providerStatus: 'accepted',
+      bookedStart: '2026-09-10T10:00:00.000Z',
+      bookedEnd: '2026-09-10T10:30:00.000Z',
+    })).resolves.toBe(true);
+
+    queueRpcResult(false);
+    await expect(markCalendarBookingCommandUncertain({
+      commandKey: 'b'.repeat(64),
+      leaseOwner: '33333333-3333-4333-8333-333333333333',
+    })).resolves.toBe(false);
+  });
+
+  it('rejects malformed claim rows with a constant error', async () => {
+    queueRpcResult([{
+      outcome: 'claimed',
+      provider_booking_uid: 'must-not-be-present-on-a-new-claim',
+    }]);
+    await expect(claimCalendarBookingCommand({
+      commandKey: 'c'.repeat(64),
+      cabinetId: CABINET_ID,
+      requestedStart: '2026-09-10T10:00:00.000Z',
+      leaseOwner: '33333333-3333-4333-8333-333333333333',
+    })).rejects.toThrow('db_claim_calendar_booking_command_invalid_result');
+  });
 });

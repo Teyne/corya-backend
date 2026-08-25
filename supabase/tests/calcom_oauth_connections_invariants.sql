@@ -103,8 +103,12 @@ BEGIN
        OR pg_catalog.has_function_privilege('authenticated', v_proc::OID, 'EXECUTE') THEN
       RAISE EXCEPTION 'calendar_connection_rpc_exposed_to_user_role proc=%', v_proc;
     END IF;
-    IF NOT pg_catalog.has_function_privilege('service_role', v_proc::OID, 'EXECUTE') THEN
-      RAISE EXCEPTION 'calendar_connection_rpc_missing_service_grant proc=%', v_proc;
+    IF v_proc = 'public.get_calcom_connection_credentials(uuid)'::REGPROCEDURE THEN
+      IF NOT pg_catalog.has_function_privilege('service_role', v_proc::OID, 'EXECUTE') THEN
+        RAISE EXCEPTION 'calendar_connection_read_rpc_missing_service_grant proc=%', v_proc;
+      END IF;
+    ELSIF pg_catalog.has_function_privilege('service_role', v_proc::OID, 'EXECUTE') THEN
+      RAISE EXCEPTION 'calendar_connection_internal_mutation_exposed proc=%', v_proc;
     END IF;
 
     SELECT p.prosecdef,

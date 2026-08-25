@@ -151,6 +151,14 @@ const refreshClaimSchema = z.object({
   lease_until: z.string().datetime({ offset: true }).nullable(),
 }).strict();
 
+const calendarBookingCommandClaimSchema = z.object({
+  outcome: z.enum(['claimed', 'replay', 'in_progress', 'uncertain']),
+  provider_booking_uid: z.string().min(1).max(200).nullable(),
+  provider_status: z.string().min(1).max(40).nullable(),
+  booked_start: z.string().datetime({ offset: true }).nullable(),
+  booked_end: z.string().datetime({ offset: true }).nullable(),
+}).strict();
+
 export interface CalcomOAuthFlowStartRow {
   flowId: string;
   state: string;
@@ -194,6 +202,14 @@ export interface CalcomRefreshClaim {
   configuredScopes: string[];
   eventTypeId: string | null;
   leaseUntil: string;
+}
+
+export interface CalendarBookingCommandClaim {
+  outcome: 'claimed' | 'replay' | 'in_progress' | 'uncertain';
+  providerBookingUid: string | null;
+  providerStatus: string | null;
+  bookedStart: string | null;
+  bookedEnd: string | null;
 }
 
 function oneRpcRow(data: unknown, errorCode: string): unknown {
@@ -543,6 +559,77 @@ export async function findCabinetByCoryaNumber(
     throw new Error(`db_find_cabinet_failed: ${error.message}`);
   }
   return data ?? null;
+}
+
+export async function claimCalendarBookingCommand(input: {
+  commandKey: string;
+  cabinetId: string;
+  requestedStart: string;
+  leaseOwner: string;
+}): Promise<CalendarBookingCommandClaim> {
+  const result = await withDbTimeout(
+    (signal) => getServiceClient().rpc('claim_calendar_booking_command', {
+      p_command_key: input.commandKey,
+      p_cabinet_id: input.cabinetId,
+      p_requested_start: input.requestedStart,
+      p_lease_owner: input.leaseOwner,
+    }).abortSignal(signal),
+    'db:claimCalendarBookingCommand',
+  ) as { data: unknown; error: unknown };
+  if (result.error) throw new Error('db_claim_calendar_booking_command_failed');
+  const parsed = calendarBookingCommandClaimSchema.safeParse(
+    oneRpcRow(result.data, 'db_claim_calendar_booking_command_invalid_result'),
+  );
+  if (!parsed.success) throw new Error('db_claim_calendar_booking_command_invalid_result');
+  return {
+    outcome: parsed.data.outcome,
+    providerBookingUid: parsed.data.provider_booking_uid,
+    providerStatus: parsed.data.provider_status,
+    bookedStart: parsed.data.booked_start,
+    bookedEnd: parsed.data.booked_end,
+  };
+}
+
+export async function completeCalendarBookingCommand(input: {
+  commandKey: string;
+  leaseOwner: string;
+  providerBookingUid: string;
+  providerStatus: string;
+  bookedStart: string;
+  bookedEnd: string;
+}): Promise<boolean> {
+  const result = await withDbTimeout(
+    (signal) => getServiceClient().rpc('complete_calendar_booking_command', {
+      p_command_key: input.commandKey,
+      p_lease_owner: input.leaseOwner,
+      p_provider_booking_uid: input.providerBookingUid,
+      p_provider_status: input.providerStatus,
+      p_booked_start: input.bookedStart,
+      p_booked_end: input.bookedEnd,
+    }).abortSignal(signal),
+    'db:completeCalendarBookingCommand',
+  ) as { data: unknown; error: unknown };
+  if (result.error || typeof result.data !== 'boolean') {
+    throw new Error('db_complete_calendar_booking_command_failed');
+  }
+  return result.data;
+}
+
+export async function markCalendarBookingCommandUncertain(input: {
+  commandKey: string;
+  leaseOwner: string;
+}): Promise<boolean> {
+  const result = await withDbTimeout(
+    (signal) => getServiceClient().rpc('mark_calendar_booking_command_uncertain', {
+      p_command_key: input.commandKey,
+      p_lease_owner: input.leaseOwner,
+    }).abortSignal(signal),
+    'db:markCalendarBookingCommandUncertain',
+  ) as { data: unknown; error: unknown };
+  if (result.error || typeof result.data !== 'boolean') {
+    throw new Error('db_mark_calendar_booking_command_uncertain_failed');
+  }
+  return result.data;
 }
 
 /**
