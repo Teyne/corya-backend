@@ -101,7 +101,37 @@ function dependencies(): AdminRouterDependencies {
       role: 'admin' as const,
       actif: true,
       created_at: '2026-08-01T00:00:00.000Z',
+      email: 'member@example.test',
+      invitation_pending: false,
+      last_seen_at: '2026-08-06T09:30:00.000Z',
     }]),
+    inviteTeamMember: vi.fn(async (_cabinetId, _actorUserId, _email, role) => ({
+      user_id: '55555555-5555-4555-8555-555555555555',
+      role,
+      actif: true,
+      created_at: '2026-08-06T11:00:00.000Z',
+      email: 'invitee@example.invalid',
+      invitation_pending: true,
+      last_seen_at: null,
+    })),
+    updateTeamMemberRole: vi.fn(async (_cabinetId, _actorUserId, targetUserId, role) => ({
+      user_id: targetUserId,
+      role,
+      actif: true,
+      created_at: '2026-08-01T00:00:00.000Z',
+      email: '',
+      invitation_pending: false,
+      last_seen_at: null,
+    })),
+    disableTeamMember: vi.fn(async (_cabinetId, _actorUserId, targetUserId) => ({
+      user_id: targetUserId,
+      role: 'viewer' as const,
+      actif: false,
+      created_at: '2026-08-01T00:00:00.000Z',
+      email: '',
+      invitation_pending: false,
+      last_seen_at: null,
+    })),
     listPractices: vi.fn(async () => [{ id: CABINET_A, name: cabinet.nom, role: 'admin' as const }]),
     mutateCabinet: vi.fn(async (_cabinetId, _actorUserId, _action, patch) => ({
       ...cabinet,
@@ -712,10 +742,110 @@ describe('portal admin read and mutation contracts', () => {
     const app = appFor(deps);
     const settings = await request(app).patch('/admin/settings').set(bearer()).send({ weeklyDigest: true });
     const assistant = await request(app).patch('/admin/assistant').set(bearer()).send({ publicName: 'Nom test' });
+    const invitation = await request(app)
+      .post('/admin/team/invitations')
+      .set(bearer())
+      .send({ email: 'invitee@example.test', role: 'viewer' });
 
     expect(settings.status).toBe(403);
     expect(assistant.status).toBe(403);
+    expect(invitation.status).toBe(403);
     expect(deps.mutateCabinet).not.toHaveBeenCalled();
+    expect(deps.inviteTeamMember).not.toHaveBeenCalled();
+  });
+
+  it('exposes the enforced retention contract without simulated service health', async () => {
+    const response = await request(appFor(dependencies()))
+      .get('/admin/security/status')
+      .set(bearer());
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      retentionDays: 730,
+      auditLogAvailable: true,
+      services: [],
+    });
+    expect(response.body.audioDeletionPolicy).toContain('48 heures');
+    expect(response.body.transcriptPolicy).toContain('7 jours');
+    expect(response.body.pdfStoragePolicy).toContain('30 jours');
+    expect(JSON.stringify(response.body).toLowerCase()).not.toContain('démonstration');
+  });
+
+  it('invites a member through the tenant-scoped dependency and returns it to the administrator', async () => {
+    const deps = dependencies();
+    const response = await request(appFor(deps))
+      .post('/admin/team/invitations')
+      .set(bearer())
+      .send({ email: 'invitee@example.test', role: 'viewer' });
+
+    expect(response.status).toBe(201);
+    expect(response.body).toMatchObject({
+      displayName: 'Invitation en attente',
+      email: 'invitee@example.invalid',
+      isCurrentUser: false,
+      role: 'viewer',
+      status: 'invited',
+    });
+    expect(deps.inviteTeamMember).toHaveBeenCalledWith(
+      CABINET_A,
+      USER_ID,
+      'invitee@example.test',
+      'viewer',
+    );
+  });
+
+  it('updates a member role and disables a member through separate allowlisted mutations', async () => {
+    const deps = dependencies();
+    const target = '55555555-5555-4555-8555-555555555555';
+    const app = appFor(deps);
+    const role = await request(app)
+      .patch(`/admin/team/${target}`)
+      .set(bearer())
+      .send({ role: 'admin' });
+    const disabled = await request(app)
+      .patch(`/admin/team/${target}`)
+      .set(bearer())
+      .send({ status: 'disabled' });
+
+    expect(role.status).toBe(200);
+    expect(role.body.role).toBe('admin');
+    expect(disabled.status).toBe(200);
+    expect(disabled.body.status).toBe('disabled');
+    expect(deps.updateTeamMemberRole).toHaveBeenCalledWith(CABINET_A, USER_ID, target, 'admin');
+    expect(deps.disableTeamMember).toHaveBeenCalledWith(CABINET_A, USER_ID, target);
+  });
+
+  it('rejects malformed or combined team mutations', async () => {
+    const deps = dependencies();
+    const target = '55555555-5555-4555-8555-555555555555';
+    const invitation = await request(appFor(deps))
+      .post('/admin/team/invitations')
+      .set(bearer())
+      .send({ email: 'not-an-email', role: 'owner' });
+    const combined = await request(appFor(deps))
+      .patch(`/admin/team/${target}`)
+      .set(bearer())
+      .send({ role: 'viewer', status: 'disabled' });
+
+    expect(invitation.status).toBe(400);
+    expect(combined.status).toBe(400);
+    expect(deps.inviteTeamMember).not.toHaveBeenCalled();
+    expect(deps.updateTeamMemberRole).not.toHaveBeenCalled();
+    expect(deps.disableTeamMember).not.toHaveBeenCalled();
+  });
+
+  it('maps self-mutation and last-admin protections to forbidden', async () => {
+    const deps = dependencies();
+    vi.mocked(deps.disableTeamMember).mockRejectedValue(
+      new Error('portal_team_last_admin_forbidden'),
+    );
+    const response = await request(appFor(deps))
+      .patch('/admin/team/55555555-5555-4555-8555-555555555555')
+      .set(bearer())
+      .send({ status: 'disabled' });
+
+    expect(response.status).toBe(403);
+    expect(response.body).toEqual({ error: 'forbidden' });
   });
 
   it('rejects unknown or invalid mutation fields', async () => {
@@ -815,16 +945,21 @@ describe('portal admin read and mutation contracts', () => {
     );
   });
 
-  it('does not expose other team member email addresses', async () => {
+  it('shows team email addresses only to the cabinet administrator', async () => {
     const deps = dependencies();
     vi.mocked(deps.listTeam).mockResolvedValue([
-      { user_id: USER_ID, role: 'admin', actif: true, created_at: '2026-08-01T00:00:00.000Z' },
-      { user_id: '55555555-5555-4555-8555-555555555555', role: 'viewer', actif: true, created_at: '2026-08-02T00:00:00.000Z' },
+      { user_id: USER_ID, role: 'admin', actif: true, created_at: '2026-08-01T00:00:00.000Z', email: 'member@example.test', invitation_pending: false, last_seen_at: '2026-08-06T09:30:00.000Z' },
+      { user_id: '55555555-5555-4555-8555-555555555555', role: 'viewer', actif: true, created_at: '2026-08-02T00:00:00.000Z', email: 'invitee@example.invalid', invitation_pending: true, last_seen_at: null },
     ]);
-    const response = await request(appFor(deps)).get('/admin/team').set(bearer());
+    const adminResponse = await request(appFor(deps)).get('/admin/team').set(bearer());
 
-    expect(response.status).toBe(200);
-    expect(response.body[0].email).toBe('member@example.test');
-    expect(response.body[1].email).toBe('');
+    expect(adminResponse.status).toBe(200);
+    expect(adminResponse.body[0]).toMatchObject({ email: 'member@example.test', isCurrentUser: true });
+    expect(adminResponse.body[1]).toMatchObject({ email: 'invitee@example.invalid', isCurrentUser: false, status: 'invited' });
+
+    vi.mocked(deps.resolveMembership).mockResolvedValue({ cabinetId: CABINET_A, role: 'viewer' });
+    const viewerResponse = await request(appFor(deps)).get('/admin/team').set(bearer());
+    expect(viewerResponse.status).toBe(200);
+    expect(viewerResponse.body[1].email).toBe('');
   });
 });

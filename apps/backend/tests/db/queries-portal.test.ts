@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => {
     abortSignal: vi.fn(),
     maybeSingle: vi.fn(),
     getUser: vi.fn(),
+    inviteUserByEmail: vi.fn(),
     then: vi.fn(),
     rpc: vi.fn(),
   };
@@ -41,6 +42,9 @@ Object.assign(mocks.builder, {
 
 vi.mock('../../src/config/supabase.js', () => ({
   getAuthClient: () => ({ auth: { getUser: mocks.methods.getUser } }),
+  getAuthAdminClient: () => ({
+    auth: { admin: { inviteUserByEmail: mocks.methods.inviteUserByEmail } },
+  }),
   getServiceClient: () => ({
     from: mocks.methods.from,
     rpc: mocks.methods.rpc,
@@ -53,6 +57,9 @@ const {
   getPortalDashboardSnapshot,
   listPortalCalls,
   listPortalPractices,
+  listPortalTeam,
+  invitePortalTeamMember,
+  updatePortalTeamMemberRole,
   applyPortalCabinetPatchWithAudit,
   resolvePortalMembership,
 } = await import('../../src/db/queries.js');
@@ -239,6 +246,89 @@ describe('portal Auth and tenant query wrappers', () => {
       ['user_id', USER_ID],
       ['actif', true],
     ]);
+  });
+
+  it('lists team members through the UUID-only service RPC', async () => {
+    const row = {
+      user_id: USER_ID,
+      role: 'admin',
+      actif: true,
+      created_at: '2026-08-26T10:00:00.000Z',
+      email: 'member@example.invalid',
+      invitation_pending: false,
+      last_seen_at: '2026-08-26T09:00:00.000Z',
+    };
+    mocks.methods.then.mockImplementationOnce((resolve: (value: unknown) => unknown) =>
+      Promise.resolve(resolve({ data: [row], error: null })));
+
+    await expect(listPortalTeam(CABINET_ID)).resolves.toEqual([row]);
+    expect(mocks.methods.rpc).toHaveBeenCalledWith('list_portal_team_summaries', {
+      p_cabinet_id: CABINET_ID,
+    });
+  });
+
+  it('invites an unknown Auth user then applies the audited membership mutation', async () => {
+    const invitedUserId = '44444444-4444-4444-8444-444444444444';
+    mocks.methods.then
+      .mockImplementationOnce((resolve: (value: unknown) => unknown) =>
+        Promise.resolve(resolve({ data: null, error: null })))
+      .mockImplementationOnce((resolve: (value: unknown) => unknown) =>
+        Promise.resolve(resolve({
+          data: {
+            id: '55555555-5555-4555-8555-555555555555',
+            cabinet_id: CABINET_ID,
+            user_id: invitedUserId,
+            role: 'viewer',
+            actif: true,
+            created_at: '2026-08-26T10:00:00.000Z',
+            updated_at: '2026-08-26T10:00:00.000Z',
+          },
+          error: null,
+        })));
+    mocks.methods.inviteUserByEmail.mockResolvedValue({
+      data: { user: { id: invitedUserId } },
+      error: null,
+    });
+
+    await expect(invitePortalTeamMember(
+      CABINET_ID,
+      USER_ID,
+      'invitee@example.invalid',
+      'viewer',
+    )).resolves.toMatchObject({
+      user_id: invitedUserId,
+      invitation_pending: true,
+      last_seen_at: null,
+    });
+    expect(mocks.methods.inviteUserByEmail).toHaveBeenCalledWith(
+      'invitee@example.invalid',
+      { redirectTo: 'http://localhost:3001/auth/callback' },
+    );
+    expect(mocks.methods.rpc).toHaveBeenLastCalledWith(
+      'apply_portal_membership_mutation_with_audit',
+      {
+        p_cabinet_id: CABINET_ID,
+        p_actor_user_id: USER_ID,
+        p_target_user_id: invitedUserId,
+        p_action: 'team_member_invited',
+        p_role: 'viewer',
+      },
+    );
+  });
+
+  it('maps a protected team mutation without leaking database diagnostics', async () => {
+    mocks.methods.then.mockImplementationOnce((resolve: (value: unknown) => unknown) =>
+      Promise.resolve(resolve({
+        data: null,
+        error: { message: 'cabinet_requires_active_admin private detail' },
+      })));
+
+    await expect(updatePortalTeamMemberRole(
+      CABINET_ID,
+      USER_ID,
+      '44444444-4444-4444-8444-444444444444',
+      'viewer',
+    )).rejects.toThrow('portal_team_last_admin_forbidden');
   });
 
   it('computes a stable period lower bound from the request clock', async () => {

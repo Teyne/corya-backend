@@ -8,7 +8,7 @@
  * All functions return plain JS types or `null` (for "not found"). They
  * throw only on truly unexpected DB errors, never on empty result sets.
  */
-import { getAuthClient, getServiceClient } from '../config/supabase.js';
+import { getAuthAdminClient, getAuthClient, getServiceClient } from '../config/supabase.js';
 import { env } from '../config/env.js';
 import { z } from 'zod';
 import type {
@@ -33,6 +33,7 @@ import type {
   PortalDashboardSnapshot,
   PortalMembership,
   PortalPractice,
+  PortalRole,
   PortalTeamRow,
 } from '../admin/types.js';
 
@@ -1883,18 +1884,130 @@ export async function getPortalCall(
 }
 
 export async function listPortalTeam(cabinetId: string): Promise<PortalTeamRow[]> {
-  const { data, error } = await withDbTimeout(
-    (signal) =>
-      getServiceClient()
-        .from('cabinet_memberships')
-        .select('user_id, role, actif, created_at')
-        .eq('cabinet_id', cabinetId)
-        .order('created_at', { ascending: true })
-        .abortSignal(signal),
+  const { data, error } = (await withDbTimeout(
+    (signal) => getServiceClient().rpc('list_portal_team_summaries', {
+      p_cabinet_id: cabinetId,
+    }).abortSignal(signal),
     'db:listPortalTeam',
-  );
+  )) as { data: PortalTeamRow[] | null; error: { message: string } | null };
   if (error) throw new Error('portal_team_list_failed');
   return data ?? [];
+}
+
+async function findPortalAuthUserIdByEmail(email: string): Promise<string | null> {
+  const { data, error } = (await withDbTimeout(
+    (signal) => getServiceClient().rpc('find_portal_auth_user_by_email', {
+      p_email: email,
+    }).abortSignal(signal),
+    'db:findPortalAuthUserByEmail',
+  )) as { data: string | null; error: { message: string } | null };
+  if (error) throw new Error('portal_team_user_lookup_failed');
+  return data;
+}
+
+async function applyPortalTeamMutation(
+  cabinetId: string,
+  actorUserId: string,
+  targetUserId: string,
+  action: 'team_member_invited' | 'team_member_role_updated' | 'team_member_disabled',
+  role: PortalRole | null,
+): Promise<PortalTeamRow> {
+  const { data, error } = (await withDbTimeout(
+    (signal) => getServiceClient().rpc('apply_portal_membership_mutation_with_audit', {
+      p_cabinet_id: cabinetId,
+      p_actor_user_id: actorUserId,
+      p_target_user_id: targetUserId,
+      p_action: action,
+      p_role: role,
+    }).abortSignal(signal),
+    'db:applyPortalTeamMutation',
+  )) as {
+    data: Omit<PortalTeamRow, 'email' | 'invitation_pending' | 'last_seen_at'> | null;
+    error: { code?: string; message: string } | null;
+  };
+  if (error) {
+    if (error.message.includes('portal_team_self_mutation_forbidden')) {
+      throw new Error('portal_team_self_mutation_forbidden');
+    }
+    if (error.message.includes('cabinet_requires_active_admin')) {
+      throw new Error('portal_team_last_admin_forbidden');
+    }
+    if (error.message.includes('portal_team_member_not_found')) {
+      throw new Error('portal_team_member_not_found');
+    }
+    if (error.message.includes('portal_admin_membership_required')) {
+      throw new Error('portal_admin_revoked');
+    }
+    throw new Error('portal_team_mutation_failed');
+  }
+  if (!data) throw new Error('portal_team_mutation_failed');
+  return {
+    ...data,
+    email: '',
+    invitation_pending: action === 'team_member_invited',
+    last_seen_at: null,
+  };
+}
+
+export async function invitePortalTeamMember(
+  cabinetId: string,
+  actorUserId: string,
+  email: string,
+  role: PortalRole,
+): Promise<PortalTeamRow> {
+  let userId = await findPortalAuthUserIdByEmail(email);
+  let invitationCreated = false;
+  if (!userId) {
+    const { data, error } = await getAuthAdminClient().auth.admin.inviteUserByEmail(email, {
+      redirectTo: new URL('/auth/callback', env.ADMIN_APP_URL).toString(),
+    });
+    if (error || !data.user?.id) {
+      // A concurrent invitation may have created the Auth user first. Recover
+      // through the UUID-only lookup without exposing provider diagnostics.
+      userId = await findPortalAuthUserIdByEmail(email);
+      if (!userId) throw new Error('portal_team_invite_failed');
+    } else {
+      userId = data.user.id;
+      invitationCreated = true;
+    }
+  }
+  const membership = await applyPortalTeamMutation(
+    cabinetId,
+    actorUserId,
+    userId,
+    'team_member_invited',
+    role,
+  );
+  return { ...membership, email, invitation_pending: invitationCreated };
+}
+
+export function updatePortalTeamMemberRole(
+  cabinetId: string,
+  actorUserId: string,
+  targetUserId: string,
+  role: PortalRole,
+): Promise<PortalTeamRow> {
+  return applyPortalTeamMutation(
+    cabinetId,
+    actorUserId,
+    targetUserId,
+    'team_member_role_updated',
+    role,
+  );
+}
+
+export function disablePortalTeamMember(
+  cabinetId: string,
+  actorUserId: string,
+  targetUserId: string,
+): Promise<PortalTeamRow> {
+  return applyPortalTeamMutation(
+    cabinetId,
+    actorUserId,
+    targetUserId,
+    'team_member_disabled',
+    null,
+  );
 }
 
 /**

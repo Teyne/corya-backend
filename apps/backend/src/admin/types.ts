@@ -91,6 +91,9 @@ export interface PortalTeamRow {
   role: PortalRole;
   actif: boolean;
   created_at: string;
+  email: string;
+  invitation_pending: boolean;
+  last_seen_at: string | null;
 }
 
 export interface PortalCabinetPatch {

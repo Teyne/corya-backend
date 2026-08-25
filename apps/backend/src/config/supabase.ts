@@ -21,6 +21,7 @@ import { env } from './env.js';
  */
 let cached: SupabaseClient | null = null;
 let cachedAuth: SupabaseClient | null = null;
+let cachedAuthAdmin: SupabaseClient | null = null;
 
 export function getServiceClient(): SupabaseClient {
   if (cached) return cached;
@@ -72,8 +73,44 @@ export function getAuthClient(): SupabaseClient | null {
   return cachedAuth;
 }
 
+/**
+ * Service-role Auth client for bounded administrative operations such as a
+ * portal invitation. It is intentionally separate from the PostgREST client
+ * so an Auth timeout cannot inherit a browser session or leak credentials.
+ */
+export function getAuthAdminClient(): SupabaseClient {
+  if (cachedAuthAdmin) return cachedAuthAdmin;
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_KEY) {
+    throw new Error('Supabase Auth admin client is not configured');
+  }
+  cachedAuthAdmin = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+    },
+    global: {
+      fetch: async (input, init) => {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), env.TIMEOUT_AUTH_MS);
+        try {
+          const incomingSignal = init?.signal;
+          const signal = incomingSignal
+            ? AbortSignal.any([incomingSignal, controller.signal])
+            : controller.signal;
+          return await fetch(input, { ...init, signal });
+        } finally {
+          clearTimeout(timer);
+        }
+      },
+    },
+  });
+  return cachedAuthAdmin;
+}
+
 /** Test-only: drop the cached client so tests can rebuild it. */
 export function __resetForTests(): void {
   cached = null;
   cachedAuth = null;
+  cachedAuthAdmin = null;
 }

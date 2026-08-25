@@ -19,7 +19,9 @@ sont bornées : `unauthorized`, `authentication_unavailable`, `forbidden`,
 | POST | `/calls/:id/pdf-url` | viewer/admin | `{ url, expiresIn: 300 }` après contrôle du path privé |
 | GET | `/integrations` | viewer/admin | état projeté des intégrations |
 | GET/PATCH | `/settings` | lecture tous, écriture admin | configuration cabinet allowlistée |
-| GET | `/team` | viewer/admin | identifiant, rôle, statut; email complet uniquement pour soi |
+| GET | `/team` | viewer/admin | identifiant, rôle, statut; les adresses des autres membres ne sont visibles que par un admin du cabinet |
+| POST | `/team/invitations` | admin | invitation Supabase Auth puis membership tenant-scopée auditée |
+| PATCH | `/team/:userId` | admin | exactement un changement : `role` ou `status=disabled` |
 | GET | `/security/status` | viewer/admin | politique de rétention et services exposables |
 | GET/PATCH | `/assistant` | lecture tous, écriture admin | projection stricte de l'assistant |
 
@@ -56,6 +58,19 @@ des champs modifiés : aucune valeur, adresse e-mail, adresse IP, en-tête ou
 token. Un PATCH idempotent sans changement n'appelle pas la RPC et ne crée pas
 d'événement.
 
+Les mutations d'équipe passent par
+`apply_portal_membership_mutation_with_audit`. La RPC reverifie le rôle admin
+dans la transaction, refuse l'auto-rétrogradation et l'auto-désactivation, et
+le trigger `cabinet_requires_active_admin` protège le dernier administrateur
+actif sous concurrence. L'audit ne conserve que l'action et `role`/`status` ;
+jamais l'adresse invitée. Les appels Supabase Auth sont bornés par le timeout
+Auth du backend et le lien d'invitation revient sur `/auth/callback` du portail.
+
+`/security/status` reflète les migrations exécutables : métadonnées d'appel au
+maximum 24 mois, transcript brut et données identifiantes 7 jours, audio 48 h,
+PDF privé 30 jours. Aucun état de service simulé n'est présenté comme une
+télémétrie réelle.
+
 ## Validation SQL locale uniquement
 
 Les invariants tenant sont exécutables exclusivement sur le Supabase local
@@ -65,6 +80,8 @@ jetable, après `supabase start` et `supabase db reset` :
 $LocalPortalDb = 'postgresql://postgres:postgres@127.0.0.1:54322/postgres'
 if (([uri]$LocalPortalDb.Replace('postgresql:', 'http:')).Host -notin @('127.0.0.1', 'localhost')) { throw 'loopback_required' }
 psql $LocalPortalDb -v ON_ERROR_STOP=1 -f supabase/tests/portal_tenant_rls_invariants.sql
+psql $LocalPortalDb -v ON_ERROR_STOP=1 -f supabase/tests/portal_audit_events_invariants.sql
+psql $LocalPortalDb -v ON_ERROR_STOP=1 -f supabase/tests/portal_team_management_invariants.sql
 powershell -File supabase/tests/portal_tenant_rls_concurrency.ps1
 ```
 

@@ -87,6 +87,18 @@ const settingsPatchSchema = z.object({
   notifyOnFailure: z.boolean().optional(),
 }).strict();
 
+const teamInviteSchema = z.object({
+  email: z.string().trim().email().max(254),
+  role: z.enum(['admin', 'viewer']),
+}).strict();
+
+const teamMemberPatchSchema = z.object({
+  role: z.enum(['admin', 'viewer']).optional(),
+  status: z.literal('disabled').optional(),
+}).strict().refine((value) => Object.keys(value).length === 1, {
+  message: 'exactly_one_team_change_required',
+});
+
 const assistantPatchSchema = z.object({
   publicName: z.string().trim().min(2).max(80).optional(),
   greeting: z.string().trim().min(10).max(500).optional(),
@@ -127,6 +139,23 @@ export interface AdminRouterDependencies {
   dashboardSnapshot(cabinetId: string, period: PortalCallsQuery['period']): Promise<PortalDashboardSnapshot>;
   getCall(cabinetId: string, callId: string): Promise<PortalCallRow | null>;
   listTeam(cabinetId: string): Promise<PortalTeamRow[]>;
+  inviteTeamMember(
+    cabinetId: string,
+    actorUserId: string,
+    email: string,
+    role: PortalMembership['role'],
+  ): Promise<PortalTeamRow>;
+  updateTeamMemberRole(
+    cabinetId: string,
+    actorUserId: string,
+    targetUserId: string,
+    role: PortalMembership['role'],
+  ): Promise<PortalTeamRow>;
+  disableTeamMember(
+    cabinetId: string,
+    actorUserId: string,
+    targetUserId: string,
+  ): Promise<PortalTeamRow>;
   listPractices(userId: string): Promise<PortalPractice[]>;
   mutateCabinet(
     cabinetId: string,
@@ -156,6 +185,12 @@ const defaultDependencies: AdminRouterDependencies = {
   dashboardSnapshot: (cabinetId, period) => portalQueries.getPortalDashboardSnapshot(cabinetId, period),
   getCall: (cabinetId, callId) => portalQueries.getPortalCall(cabinetId, callId),
   listTeam: (cabinetId) => portalQueries.listPortalTeam(cabinetId),
+  inviteTeamMember: (cabinetId, actorUserId, email, role) =>
+    portalQueries.invitePortalTeamMember(cabinetId, actorUserId, email, role),
+  updateTeamMemberRole: (cabinetId, actorUserId, targetUserId, role) =>
+    portalQueries.updatePortalTeamMemberRole(cabinetId, actorUserId, targetUserId, role),
+  disableTeamMember: (cabinetId, actorUserId, targetUserId) =>
+    portalQueries.disablePortalTeamMember(cabinetId, actorUserId, targetUserId),
   listPractices: (userId) => portalQueries.listPortalPractices(userId),
   mutateCabinet: (cabinetId, actorUserId, action, patch, changedFields, expectedUpdatedAt) =>
     portalQueries.applyPortalCabinetPatchWithAudit(
@@ -406,6 +441,41 @@ function isPortalNotFound(error: unknown): boolean {
 
 function isPortalAdminRevoked(error: unknown): boolean {
   return error instanceof Error && error.message === 'portal_admin_membership_required';
+}
+
+function teamMutationErrorStatus(error: unknown): 403 | 404 | 409 | 500 {
+  if (!(error instanceof Error)) return 500;
+  if (
+    error.message === 'portal_team_self_mutation_forbidden'
+    || error.message === 'portal_team_last_admin_forbidden'
+    || error.message === 'portal_admin_revoked'
+  ) return 403;
+  if (error.message === 'portal_team_member_not_found') return 404;
+  if (error.message === 'portal_team_invite_failed') return 409;
+  return 500;
+}
+
+function teamMemberDto(
+  member: PortalTeamRow,
+  currentUser: PortalAuthUser,
+  canViewTeamEmails: boolean,
+): Record<string, unknown> {
+  const isCurrentUser = member.user_id === currentUser.id;
+  return {
+    id: member.user_id,
+    displayName: isCurrentUser
+      ? (currentUser.displayName || 'Utilisateur Corya')
+      : member.invitation_pending
+        ? 'Invitation en attente'
+        : 'Membre du cabinet',
+    email: isCurrentUser ? currentUser.email : canViewTeamEmails ? member.email : '',
+    isCurrentUser,
+    role: member.role,
+    status: member.actif
+      ? member.invitation_pending ? 'invited' : 'active'
+      : 'disabled',
+    lastSeenAt: isCurrentUser ? member.last_seen_at : null,
+  };
 }
 
 function changedFieldNames(
@@ -720,14 +790,64 @@ export function buildAdminRouter(
   router.get('/team', async (req, res): Promise<void> => {
     const ctx = context(req);
     const rows = await dependencies.listTeam(ctx.membership.cabinetId);
-    res.json(rows.map((member) => ({
-      id: member.user_id,
-      displayName: member.user_id === ctx.user.id ? (ctx.user.displayName || 'Utilisateur Corya') : 'Membre du cabinet',
-      email: member.user_id === ctx.user.id ? ctx.user.email : '',
-      role: member.role,
-      status: member.actif ? 'active' : 'disabled',
-      lastSeenAt: null,
-    })));
+    res.json(rows.map((member) => teamMemberDto(
+      member,
+      ctx.user,
+      ctx.membership.role === 'admin',
+    )));
+  });
+
+  router.post('/team/invitations', async (req, res): Promise<void> => {
+    const ctx = context(req);
+    if (ctx.membership.role !== 'admin') {
+      res.status(403).json({ error: 'forbidden' });
+      return;
+    }
+    const parsed = teamInviteSchema.safeParse(req.body);
+    if (!parsed.success) return sendInvalid(res);
+    try {
+      const member = await dependencies.inviteTeamMember(
+        ctx.membership.cabinetId,
+        ctx.user.id,
+        parsed.data.email,
+        parsed.data.role,
+      );
+      res.status(201).json(teamMemberDto(member, ctx.user, true));
+    } catch (error: unknown) {
+      const status = teamMutationErrorStatus(error);
+      if (status === 500) throw error;
+      res.status(status).json({ error: status === 404 ? 'not_found' : status === 409 ? 'conflict' : 'forbidden' });
+    }
+  });
+
+  router.patch('/team/:userId', async (req, res): Promise<void> => {
+    const ctx = context(req);
+    if (ctx.membership.role !== 'admin') {
+      res.status(403).json({ error: 'forbidden' });
+      return;
+    }
+    const userId = UUID.safeParse(req.params.userId);
+    const patch = teamMemberPatchSchema.safeParse(req.body);
+    if (!userId.success || !patch.success) return sendInvalid(res);
+    try {
+      const member = patch.data.role
+        ? await dependencies.updateTeamMemberRole(
+          ctx.membership.cabinetId,
+          ctx.user.id,
+          userId.data,
+          patch.data.role,
+        )
+        : await dependencies.disableTeamMember(
+          ctx.membership.cabinetId,
+          ctx.user.id,
+          userId.data,
+        );
+      res.json(teamMemberDto(member, ctx.user, true));
+    } catch (error: unknown) {
+      const status = teamMutationErrorStatus(error);
+      if (status === 500) throw error;
+      res.status(status).json({ error: status === 404 ? 'not_found' : status === 409 ? 'conflict' : 'forbidden' });
+    }
   });
 
   router.get('/security/status', async (req, res): Promise<void> => {
@@ -735,18 +855,18 @@ export function buildAdminRouter(
     if (res.headersSent) return;
     res.json({
       retentionDays: 730,
-      audioDeletionPolicy: 'Suppression planifiée sous 48 heures',
-      transcriptPolicy: 'Données identifiantes supprimées après 7 jours',
-      pdfStoragePolicy: 'Stockage privé, accès temporaire après autorisation',
+      audioDeletionPolicy: 'URL audio supprimée de Corya et suppression Retell planifiée au plus tard 48 heures après l’appel',
+      transcriptPolicy: 'Transcript brut et données identifiantes supprimés après 7 jours',
+      pdfStoragePolicy: 'Stockage privé, accès par lien signé temporaire et purge au plus tard 30 jours après l’appel',
       roleAccess: [
         { role: 'admin', description: 'Lecture et configuration du cabinet' },
         { role: 'viewer', description: 'Lecture seule' },
       ],
-      auditLogAvailable: false,
-      services: [{ name: 'Stockage des récapitulatifs', state: 'operational' }],
+      auditLogAvailable: true,
+      services: [],
       storedData: [
-        { category: 'Appels', detail: 'Métadonnées minimales, sans numéro appelant' },
-        { category: 'Récapitulatifs', detail: 'PDF dans un stockage privé' },
+        { category: 'Appels', detail: 'Métadonnées métier conservées au maximum 24 mois' },
+        { category: 'Récapitulatifs', detail: 'PDF privé conservé au maximum 30 jours' },
       ],
     });
   });
