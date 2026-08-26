@@ -302,7 +302,7 @@ describe('portal Auth and tenant query wrappers', () => {
     });
     expect(mocks.methods.inviteUserByEmail).toHaveBeenCalledWith(
       'invitee@example.invalid',
-      { redirectTo: 'http://localhost:3001/auth/callback' },
+      { redirectTo: 'http://localhost:3001/auth/callback?next=/reset-password' },
     );
     expect(mocks.methods.rpc).toHaveBeenLastCalledWith(
       'apply_portal_membership_mutation_with_audit',

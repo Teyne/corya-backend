@@ -1959,7 +1959,7 @@ export async function invitePortalTeamMember(
   let invitationCreated = false;
   if (!userId) {
     const { data, error } = await getAuthAdminClient().auth.admin.inviteUserByEmail(email, {
-      redirectTo: new URL('/auth/callback', env.ADMIN_APP_URL).toString(),
+      redirectTo: new URL('/auth/callback?next=/reset-password', env.ADMIN_APP_URL).toString(),
     });
     if (error || !data.user?.id) {
       // A concurrent invitation may have created the Auth user first. Recover
