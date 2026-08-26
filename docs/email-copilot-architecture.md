@@ -4,8 +4,8 @@
 
 Le copilote administratif e-mail est un **outil d'assistance** pour les
 secrétaires et les médecins des cabinets. Il classe les messages entrants,
-prépare un brouillon et rend les informations opérationnelles plus faciles à
-traiter dans le portail Corya. Une personne autorisée du cabinet reste
+prépare un brouillon et le rend disponible dans Outlook, sans changer l'outil
+quotidien du cabinet. Une personne autorisée du cabinet reste
 responsable de la lecture, de la décision et de l'envoi.
 
 Il ne constitue ni un répondeur médical ni un système de décision autonome.
@@ -22,9 +22,10 @@ explicite et ne met jamais un e-mail en production sans validation humaine.
    bref ; les éléments incertains restent signalés comme tels.
 4. Génération d'un **brouillon**, selon les consignes du cabinet et les
    modèles validés dans le portail.
-5. Validation, modification ou rejet humain ; seul un utilisateur habilité
-   déclenche l'envoi via la boîte professionnelle du cabinet.
-6. Suivi des statuts et piste d'audit minimale dans le portail.
+5. Création d'un brouillon directement dans Outlook ; l'utilisateur le relit,
+   le modifie et l'envoie depuis sa boîte professionnelle habituelle.
+6. Suivi technique, configuration et piste d'audit minimale dans le portail,
+   sans imposer une seconde interface de lecture des e-mails.
 
 Le premier périmètre privilégie les demandes administratives et de
 rendez-vous. Un message pouvant évoquer une urgence est mis en évidence et
@@ -33,19 +34,21 @@ orienté vers la procédure du cabinet ; le copilote ne l'évalue pas.
 ## Architecture technique cible
 
 ```text
-Boîte e-mail dédiée du cabinet
-  -> connecteur d'ingestion borné (webhook fournisseur ou API/IMAP dédié)
+Boîte fonctionnelle Microsoft 365 du cabinet
+  -> notification Microsoft Graph, utilisée comme signal uniquement
   -> API Corya : authentification, déduplication, cloisonnement cabinet
-  -> stockage privé chiffré des contenus/annexes nécessaires
-  -> job PostgreSQL idempotent
+  -> Delta Query autoritaire et stockage privé minimisé
+  -> file Inbox PostgreSQL idempotente, indépendante de Voice
   -> service de classification et de brouillon, avec timeout et redaction
-  -> portail Corya : file, aperçu, validation humaine
-  -> job d'envoi SMTP/API du cabinet
+  -> brouillon de réponse créé dans Outlook
+  -> validation, modification et envoi humain dans Outlook
+  -> portail Corya : configuration et supervision sans contenu
   -> audit à métadonnées minimales et rétention contrôlée
 ```
 
-Le design reprend les fondations existantes : API Express, jobs PostgreSQL
-réclamés de façon atomique, worker séparé, Storage privé, portail
+Le design détaillé et les décisions Microsoft-first sont définis dans
+[`inbox-architecture.md`](./inbox-architecture.md). Il reprend les fondations
+existantes : API Express, claims PostgreSQL atomiques, worker séparé, Storage privé, portail
 multi-tenant Supabase et audit portal sans valeurs métier. Les nouveaux
 connecteurs et le modèle IA doivent être isolés derrière des interfaces avec
 timeout, retries bornés, idempotency key et erreurs redactées. Aucun secret de
@@ -56,11 +59,11 @@ logs, les jobs lisibles par le portail ou les événements d'audit.
 
 | Concept | Données minimales | Règle d'accès |
 | --- | --- | --- |
-| `email_inbound` | cabinet, identifiant fournisseur haché, horodatages, statut, références privées au contenu et aux pièces jointes | service interne ; portail projeté par cabinet uniquement |
-| `email_classification` | catégorie allowlistée, confiance bornée, drapeaux `needs_human_review` / `possible_urgency` | lecture des membres du cabinet concernés |
-| `email_draft` | référence au message, version, contenu du brouillon, statut de validation, auteur humain | lecture/édition selon rôle ; jamais partagé entre cabinets |
-| `email_delivery` | destination validée, identifiant fournisseur, statut et tentatives techniques | envoi uniquement après approbation humaine |
-| `email_attachment` | type, taille, antivirus, référence Storage privée, statut de suppression | aucun accès public ; téléchargement signé et court |
+| `email_inbound` | cabinet, identifiant fournisseur opaque, horodatages, statut, références privées temporaires | service interne ; aucun contenu dans le portail |
+| `email_classification` | catégorie allowlistée, confiance bornée, drapeaux `needs_human_review` / `possible_urgency` | service interne ; métriques agrégées seulement dans le portail |
+| `email_draft` | référence au message, identifiant Outlook, `changeKey`, statut technique | corps conservé dans Outlook ; jamais édité dans le portail |
+| `email_delivery` | état observé du brouillon Outlook et identifiant fournisseur | aucune capacité d'envoi Corya au MVP |
+| `email_attachment` | type, taille, quarantaine et statut de suppression | aucune analyse IA ni accès portail au MVP |
 | `email_audit_event` | cabinet, acteur technique, action allowlistée, horodatage, champs modifiés sans valeur | conservation d'audit distincte du contenu |
 
 Toutes ces entités porteront `cabinet_id`, avec RLS deny-by-default et RPC/API
@@ -72,8 +75,7 @@ exposées au portail.
 ```text
 received -> quarantined | queued
 queued -> classifying -> draft_ready | needs_human_review | failed
-draft_ready -> approved | edited | rejected | expired
-approved -> sending -> sent | delivery_failed
+draft_ready -> human_modified | sent_externally | rejected | expired
 needs_human_review -> draft_ready | rejected | expired
 ```
 
@@ -81,11 +83,9 @@ needs_human_review -> draft_ready | rejected | expired
   ou contrôle fournisseur incomplet ; aucune analyse IA ni envoi.
 - `needs_human_review` : ambiguïté, contenu médical, urgence potentielle,
   destinataire incertain ou confiance insuffisante.
-- `approved` doit contenir l'identité de l'utilisateur, la version validée et
-  une empreinte du brouillon ; l'envoi est atomique et idempotent.
-- `delivery_failed` est réessayé de façon bornée, puis visible au cabinet et
-  aux opérateurs selon la politique d'alerte existante.
-- aucun passage automatique de `draft_ready` à `sending`.
+- la création du brouillon est idempotente et ne doit jamais écraser une
+  modification humaine observée via `changeKey` ;
+- aucun passage automatique de `draft_ready` à un état d'envoi n'existe.
 
 ## Confidentialité, secret médical et pièces jointes
 
@@ -116,23 +116,24 @@ médical (art. 321 CP).
 ## Déploiement par cabinet
 
 Chaque activation est isolée : adresse/boîte dédiée ou routage explicite,
-`cabinet_id`, membres du portail, rôles, destinataires autorisés, modèles de
+`cabinet_id`, membres du portail, rôles, boîtes autorisées, modèles de
 réponse, catégories, langue, règles d'escalade et politique de rétention.
-Les secrets du connecteur e-mail et de l'émetteur sont distincts par cabinet,
+Les secrets du connecteur e-mail sont distincts par cabinet,
 stockés dans un coffre et rotables sans impact inter-tenant. Le cabinet reste
 propriétaire de sa boîte et de l'approbation des brouillons.
 
-Le déploiement initial se fait en mode observation : ingestion + classement +
-brouillon, sans envoi. Après revue d'un échantillon par le cabinet, l'envoi
-humain validé est activé ; l'envoi automatisé reste hors MVP.
+Le déploiement initial se fait en mode observation : ingestion + classement,
+sans création de brouillon. Après revue d'un échantillon par le cabinet, le
+mode `draft-only` crée les brouillons dans Outlook ; l'envoi automatisé reste
+hors MVP.
 
 ## Indicateurs
 
 - volume reçu, dédupliqué, mis en quarantaine et expiré ;
-- délai réception → brouillon, brouillon → validation, validation → envoi ;
+- délai réception → brouillon et activité humaine observée dans Outlook ;
 - taux de modification/rejet humain des brouillons ;
 - taux d'escalade, ambiguïté et urgence potentielle ;
-- succès, échecs et réessais d'envoi ;
+- succès, échecs et réessais de création/réconciliation des brouillons ;
 - erreurs de cloisonnement (objectif : zéro), incidents de pièce jointe et
   conformité de purge ;
 - aucune métrique ne contient de sujet, adresse, nom ou contenu d'e-mail.
