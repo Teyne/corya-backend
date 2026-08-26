@@ -50,7 +50,7 @@ git clone https://github.com/Teyne/corya-patient-connect.git corya-portal-client
 
 Set-Location corya-backend
 git fetch --all --prune
-git worktree add ..\corya-backend-inbox origin/codex/inbox-architecture
+git worktree add -b codex/inbox-architecture ..\corya-backend-inbox origin/codex/inbox-architecture
 ```
 
 Installer ensuite les dépendances :
