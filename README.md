@@ -61,6 +61,9 @@ mutations. Il ne doit jamais viser une base distante.
 - `docs/architecture.md` : architecture déployable et état réel
 - `docs/compliance.md` : règles nLPD et écarts encore manuels
 - `docs/registre-traitements.md` : registre versionné
+- `docs/inbox-agent-handoff.md` : point d'entrée pour reprendre Inbox sur un autre poste ou avec un autre agent
+- `docs/inbox-architecture.md` : contrat Microsoft-first, sécurité et modèle de données Inbox
+- `docs/inbox-implementation-plan.md` : vagues d'implémentation, validations et gates Inbox
 - `.claude/session4-decisions.md` : historique des décisions de résilience
 
 Les documents de prompts de sessions sont historiques : le code, les migrations non appliquées et les documents ci-dessus priment.
