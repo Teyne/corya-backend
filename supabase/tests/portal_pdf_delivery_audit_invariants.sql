@@ -38,6 +38,19 @@ INSERT INTO public.appels (
   'sent'
 );
 
+-- The PDF migration must preserve every action introduced by the earlier
+-- portal_team_management migration.
+SET LOCAL ROLE service_role;
+INSERT INTO public.portal_audit_events (
+  cabinet_id, actor_user_id, action, changed_fields
+) VALUES (
+  'e2000000-0000-4000-8000-000000000001',
+  'e4000000-0000-4000-8000-000000000001',
+  'team_member_disabled',
+  ARRAY['status']::TEXT[]
+);
+RESET ROLE;
+
 SET LOCAL ROLE service_role;
 SELECT public.record_portal_pdf_download_authorization(
   'e2000000-0000-4000-8000-000000000001',
