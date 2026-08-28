@@ -30,7 +30,8 @@ contrôlée, sans ouverture à de vrais patients.
    qu'après le commit PostgreSQL. Une panne ou un timeout DB renvoie `500` afin
    que Retell rejoue ; un rejeu est idempotent et répare un type de job absent.
 3. Le worker réclame atomiquement les jobs, avec récupération des verrous zombies, checkpoints et backoff.
-4. `process_appel` génère le PDF, l'upload dans `pdf-recaps` privé, crée une URL signée courte et envoie l'e-mail.
+4. `process_appel` génère le PDF, l'upload dans `pdf-recaps` privé et envoie une notification minimale vers la fiche authentifiée du Portail. Le PDF n'est ni joint ni lié dans l'e-mail.
+5. Le Portail autorise le téléchargement, journalise l'autorisation, obtient un ticket Storage de 60 secondes côté serveur puis proxyfie les octets PDF validés sans révéler l'URL signée au navigateur.
 5. `purge_audio_retell`, planifié à +48 h, supprime l'appel Retell. Un échec est journalisé et alerté mais ne bloque pas la file ; la rétention Retell configurée à un jour sert de filet indépendant.
 
 ### Numéro de rappel

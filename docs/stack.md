@@ -51,7 +51,7 @@ Critères de validation appliqués à chaque ajout : licence permissive **MIT, A
 | Dépendance | Type | Rôle |
 |---|---|---|
 | `puppeteer` | prod | Rendu du PDF récap. Version complète (et non `puppeteer-core`) pour que Chromium soit téléchargé à l'install sans configuration manuelle. |
-| `nodemailer` | prod | Envoi SMTP vers Infomaniak, avec pièce jointe PDF. |
+| `nodemailer` | prod | Notification SMTP minimale vers le portail authentifié, sans donnée patient ni pièce jointe. |
 | `@types/nodemailer` | dev | Typings |
 
 ### Traitement asynchrone (verrouillé session 3)

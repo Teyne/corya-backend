@@ -62,6 +62,7 @@ const {
   updatePortalTeamMemberRole,
   applyPortalCabinetPatchWithAudit,
   resolvePortalMembership,
+  recordPortalPdfDownloadAuthorization,
 } = await import('../../src/db/queries.js');
 
 const CABINET_ID = '11111111-1111-4111-8111-111111111111';
@@ -89,6 +90,29 @@ beforeEach(() => {
 });
 
 describe('portal Auth and tenant query wrappers', () => {
+  it('records a minimal PDF authorization through one bounded RPC', async () => {
+    mocks.methods.then.mockImplementationOnce((resolve: (value: unknown) => unknown) =>
+      Promise.resolve(resolve({
+        data: '44444444-4444-4444-8444-444444444444',
+        error: null,
+      })));
+
+    await expect(recordPortalPdfDownloadAuthorization(
+      CABINET_ID,
+      USER_ID,
+      CALL_ID,
+    )).resolves.toBeUndefined();
+    expect(mocks.methods.rpc).toHaveBeenCalledWith(
+      'record_portal_pdf_download_authorization',
+      {
+        p_cabinet_id: CABINET_ID,
+        p_actor_user_id: USER_ID,
+        p_call_id: CALL_ID,
+      },
+    );
+    expect(mocks.methods.abortSignal).toHaveBeenCalledTimes(1);
+  });
+
   it('uses the official getUser(token) primitive and projects only safe identity fields', async () => {
     mocks.methods.getUser.mockResolvedValue({
       data: {

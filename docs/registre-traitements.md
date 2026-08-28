@@ -143,16 +143,16 @@ Les mesures suivantes s'appliquent transversalement, en complément des mesures 
 
 **Statut** : actif.
 
-**Finalité** : notifier le cabinet client, immédiatement après chaque appel, du contenu et du résultat de la conversation, en lui adressant par email le récapitulatif au format PDF ainsi qu'un lien de téléchargement à durée limitée.
+**Finalité** : notifier le cabinet client qu'un nouveau récapitulatif est disponible dans son espace Corya authentifié.
 
 **Base légale** : contrat (art. 31 al. 2 let. a nLPD).
 
 **Catégories de données traitées** :
 - Adresse email de destination communiquée par le cabinet (adresse professionnelle de la secrétaire ou d'un médecin, telle que déclarée à la souscription).
 - Éventuelle adresse email en copie déclarée par le cabinet.
-- Corps du message (données de l'appel, en clair dans l'email : nom du cabinet, date, durée, motif court, résultat, action à mener).
-- **Pièce jointe : récapitulatif PDF** (traitement n° 2), qui contient les données identifiantes du patient et la transcription intégrale.
-- Lien de téléchargement du PDF à durée de vie limitée à 30 minutes.
+- Corps minimal du message : nom du cabinet et lien vers la fiche du portail authentifié.
+- Aucune donnée patient, aucun motif, résultat, transcript ou horaire d'appel.
+- Aucune pièce jointe et aucune URL Storage signée.
 
 **Catégories de personnes concernées** :
 - Patients (indirectement, en tant qu'auteurs des données transmises).
@@ -165,13 +165,13 @@ Les mesures suivantes s'appliquent transversalement, en complément des mesures 
 
 **Durée de conservation** :
 - Chez Corya : l'email n'est pas conservé après envoi. Seule la trace horodatée « email envoyé avec succès » est conservée en base pour permettre la purge du PDF au 30ᵉ jour (traitement n° 2).
-- Chez le cabinet destinataire : la conservation relève de la responsabilité et de la politique propres du cabinet, qui est libre de télécharger et d'archiver le PDF pour la durée qu'il juge nécessaire à son dossier patient.
+- Chez le cabinet destinataire : seul le message de notification minimal peut être conservé par sa messagerie. Le PDF n'y transite pas.
 
 **Transferts internationaux** : aucun côté Corya. Le prestataire de messagerie de destination utilisé par le cabinet est indépendant de Corya.
 
 **Mesures de sécurité spécifiques** :
 - Chiffrement obligatoire de la connexion au serveur de messagerie (STARTTLS exigé) : aucun envoi en clair n'est possible.
-- Lien de téléchargement du PDF signé cryptographiquement, expirant après 30 minutes, non devinable, non partageable au-delà de cette fenêtre.
+- Le lien d'e-mail pointe uniquement vers une page authentifiée. Le ticket Storage de 60 secondes est obtenu et consommé par le serveur du portail, puis les octets validés sont proxyfiés au navigateur sans divulguer le ticket.
 - Le message d'email n'est jamais envoyé deux fois pour le même appel (mécanismes de contrôle d'idempotence).
 
 ---
@@ -199,9 +199,9 @@ de suppression physique et de preuve ci-dessous.
 | Type de donnée | Échéance |
 |---|---|
 | Enregistrement audio (base Corya et serveur de l'opérateur conversationnel) | 48 heures après l'appel |
-| Nom, prénom, téléphone du patient, transcription intégrale | 7 jours après l'appel |
+| Nom, prénom, téléphone, empreinte appelant, motif, praticien et transcripts | 7 jours après l'appel |
 | Récapitulatif PDF | 30 jours après l'envoi email ; à défaut, 30 jours après l'appel |
-| Métadonnées techniques de l'appel et transcription anonymisée | 24 mois après l'appel |
+| Métadonnées techniques agrégables de l'appel | 24 mois après l'appel |
 | Journalisation applicative (voir traitement n° 5) | 12 mois |
 | Journalisation des actions d'administration | 24 mois |
 
@@ -298,7 +298,7 @@ tout envoi de journaux.
 
 **Statut** : actif.
 
-**Finalité** : héberger de façon sécurisée les récapitulatifs PDF produits par le traitement n° 2, entre leur génération et leur purge, avec accès uniquement par lien signé à durée limitée.
+**Finalité** : héberger de façon sécurisée les récapitulatifs PDF produits par le traitement n° 2, entre leur génération et leur purge, avec accès uniquement via le portail authentifié.
 
 **Base légale** : contrat (art. 31 al. 2 let. a nLPD), en tant que support technique nécessaire aux traitements n° 2 et n° 3.
 
@@ -315,7 +315,7 @@ tout envoi de journaux.
 **Mesures de sécurité spécifiques** :
 - **Bucket privé** : aucun accès public direct au fichier, quel que soit son chemin.
 - Accès aux fichiers réservé au service applicatif de Corya, avec des clés d'accès dédiées et protégées.
-- Génération à la demande d'un **lien signé à durée limitée** (30 minutes maximum, plafond dur non contournable) pour toute lecture par un destinataire externe (cabinet).
+- Génération à la demande d'un **ticket signé de 60 secondes maximum**, consommé uniquement par le BFF du portail après contrôle d'appartenance et audit minimal de l'autorisation. L'URL signée n'est jamais transmise au navigateur.
 - Chemin de stockage constitué exclusivement d'identifiants techniques opaques (aucun nom de patient, aucun numéro de téléphone).
 - Types de fichiers autorisés restreints (uniquement PDF) ; taille maximale plafonnée.
 - Suppression des fichiers gérée par le traitement n° 4, avec preuve d'audit horodatée.

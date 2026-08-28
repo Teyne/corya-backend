@@ -14,8 +14,7 @@
  *          deterministic path)
  *        - persist `appels.pdf_url` and checkpoint in `payload.steps`
  *   5. If `payload.steps.email_sent_at` is unset:
- *        - create a 30-min signed URL
- *        - send the email with PDF attached
+ *        - send a minimal notification linking to the authenticated portal
  *        - mark `appels.email_status = 'sent'` + set `pdf_envoye_at`
  *        - checkpoint in `payload.steps`
  *
@@ -54,8 +53,6 @@ import { renderAppelPdf } from './pdf.js';
 import { PermanentEmailError, sendRecapEmail } from './email.js';
 import {
   buildPdfObjectPath,
-  createSignedPdfUrl,
-  DEFAULT_SIGNED_URL_TTL_SECONDS,
   uploadPdf,
 } from './storage.js';
 import { toLogFields } from '../utils/errors.js';
@@ -231,24 +228,18 @@ export async function processAppelJob(job: Job): Promise<void> {
   const alreadyUploaded =
     payload.steps?.pdf_uploaded_at !== undefined && objectPath !== undefined;
 
-  // We ALWAYS need PDF bytes for the email attachment. When the PDF was
-  // uploaded on a previous attempt we still re-render its bytes here —
-  // the alternative would be to download from Storage, which trades one
-  // Puppeteer render for one HTTP round-trip and adds a failure mode.
-  // Keeping the render is simpler and stays well within the 5 s budget.
-  let pdfBytes: Buffer;
-  try {
-    pdfBytes = await renderAppelPdf(appel, cabinet);
-  } catch (err: unknown) {
-    // Loud alerting event — without a PDF we can't send the email.
-    logger.error(
-      { ...corrWithCall, ...toLogFields(err) },
-      'pdf_generation_failed',
-    );
-    throw new PdfPipelineError('pdf_render_failed');
-  }
-
   if (!alreadyUploaded) {
+    let pdfBytes: Buffer;
+    try {
+      pdfBytes = await renderAppelPdf(appel, cabinet);
+    } catch (err: unknown) {
+      logger.error(
+        { ...corrWithCall, ...toLogFields(err) },
+        'pdf_generation_failed',
+      );
+      throw new PdfPipelineError('pdf_render_failed');
+    }
+
     objectPath = buildPdfObjectPath(cabinet.id, appel.id, appel.date_appel);
     try {
       await uploadPdf(objectPath, pdfBytes);
@@ -286,29 +277,14 @@ export async function processAppelJob(job: Job): Promise<void> {
     throw new PdfPipelineError('pdf_object_path_missing');
   }
 
-  let signedUrl: string;
   try {
-    signedUrl = await createSignedPdfUrl(
-      objectPath,
-      DEFAULT_SIGNED_URL_TTL_SECONDS,
-    );
-  } catch (err: unknown) {
-    logger.error(
-      { ...corrWithCall, ...toLogFields(err) },
-      'pdf_sign_url_failed',
-    );
-    throw new PdfPipelineError('pdf_sign_url_failed');
-  }
-
-  try {
+    const portalUrl = new URL(`/calls/${appel.id}`, env.ADMIN_APP_URL).toString();
     await sendRecapEmail({
       to: payload.to ?? cabinet.email_notification,
       cc: payload.cc ?? cabinet.email_notification_cc,
       appel,
       cabinet,
-      pdfUrl: signedUrl,
-      adminUrl: env.ADMIN_APP_URL,
-      pdfBytes,
+      adminUrl: portalUrl,
     });
   } catch (err: unknown) {
     // Session 4 vague 3: distinguish PERMANENT from TRANSIENT.

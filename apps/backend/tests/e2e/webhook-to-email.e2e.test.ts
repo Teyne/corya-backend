@@ -112,7 +112,7 @@ afterEach(() => {
 });
 
 describe('webhook-to-email e2e — happy path', () => {
-  it('POST /webhooks → worker drain → recap email with non-empty PDF attachment', async () => {
+  it('POST /webhooks → worker drain → minimal recap email without PDF attachment', async () => {
     // Cabinet whose numero_corya matches the fixture's to_number.
     seedCabinet({ numero_corya: '+41215550100', email_notification: 'ops@cabinet.example' });
 
@@ -152,15 +152,10 @@ describe('webhook-to-email e2e — happy path', () => {
     const recap = sentMails.find((m) => !m.subject.startsWith('[Corya]'));
     expect(recap).toBeDefined();
     expect(recap?.to).toBe('ops@cabinet.example');
-    expect(recap?.subject).toMatch(/Nouvel appel reçu/);
-
-    // Attachment: single PDF, non-empty bytes.
-    expect(recap?.attachments).toHaveLength(1);
-    const att = recap?.attachments?.[0];
-    expect(att?.contentType).toBe('application/pdf');
-    const bytes = att?.content;
-    expect(Buffer.isBuffer(bytes)).toBe(true);
-    expect((bytes as Buffer).length).toBeGreaterThan(0);
+    expect(recap?.subject).toMatch(/Nouveau récapitulatif disponible/);
+    expect(recap?.attachments).toBeUndefined();
+    expect(recap?.html).toContain(`/calls/${processAppel?.appel_id}`);
+    expect(recap?.html).not.toContain('MOTIF-SENTINEL');
   });
 
   it('a webhook targeting an unknown numero_corya does NOT send an email', async () => {

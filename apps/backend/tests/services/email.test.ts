@@ -2,8 +2,8 @@
  * Unit tests — services/email.ts
  *
  * Nodemailer is mocked: we DO NOT touch the real SMTP. We prove:
- *   - subject respects the "Nouvel appel reçu — <cabinet> — HH:mm" format
- *   - `to`, `cc`, `from` and PDF attachment are wired correctly
+ *   - subject is generic and contains no call detail
+ *   - `to`, `cc` and `from` are wired without a PDF attachment
  *   - assertSmtpConfigured lists every missing env var
  *   - plaintext body is emitted alongside HTML
  */
@@ -37,11 +37,6 @@ const {
 const EMAIL_TEMPLATE_STUB = `
 <html><body>
 <h1>{{CABINET_NOM}}</h1>
-<p>{{DATE_HEURE}} - {{DUREE}}</p>
-<p>Motif: {{MOTIF}}</p>
-<p>Résultat: {{RESULTAT_LABEL}}</p>
-<p>{{ACTION}}</p>
-<a href="{{PDF_URL}}">pdf</a>
 <a href="{{ADMIN_URL}}">admin</a>
 </body></html>`;
 
@@ -110,30 +105,28 @@ describe('assertSmtpConfigured', () => {
 });
 
 describe('renderEmailBodies', () => {
-  it('produces the "Nouvel appel reçu — <cabinet> — HH:mm" subject', () => {
-    const { subject } = renderEmailBodies(APPEL, CABINET, {
-      pdfUrl: 'https://sig/x',
+  it('produces a generic subject without call details', () => {
+    const { subject } = renderEmailBodies(CABINET, {
       adminUrl: 'https://admin/x',
     });
-    // 09:42 UTC is 11:42 in Europe/Zurich on 31 July (CEST).
-    expect(subject).toBe('Nouvel appel reçu — Cabinet Corya Test — 11:42');
+    expect(subject).toBe('Nouveau récapitulatif disponible — Cabinet Corya Test');
+    expect(subject).not.toContain('11:42');
   });
 
-  it('renders call times in Europe/Zurich independently of the server timezone', () => {
-    const { html, text } = renderEmailBodies(APPEL, CABINET, {
-      pdfUrl: 'https://sig/x',
+  it('keeps the notification free of call result, motif and patient data', () => {
+    const { html, text } = renderEmailBodies(CABINET, {
       adminUrl: 'https://portail.corya.ch',
     });
-
-    expect(html).toContain('11:42');
-    expect(text).toContain('11:42');
+    const bodies = `${html}\n${text}`;
+    expect(bodies).not.toContain(APPEL.motif_appel);
+    expect(bodies).not.toContain(APPEL.patient_nom);
+    expect(bodies).not.toContain('Rendez-vous pris');
     expect(text).toContain('Portail Corya : https://portail.corya.ch');
   });
 
   it('labels the application link as Portail Corya in the real template', () => {
     __setTemplateForTests(null);
-    const { html } = renderEmailBodies(APPEL, CABINET, {
-      pdfUrl: 'https://sig/x',
+    const { html } = renderEmailBodies(CABINET, {
       adminUrl: 'https://portail.corya.ch',
     });
 
@@ -142,22 +135,18 @@ describe('renderEmailBodies', () => {
   });
 
   it('emits both an HTML and a plaintext body', () => {
-    const { html, text } = renderEmailBodies(APPEL, CABINET, {
-      pdfUrl: 'https://sig/x',
+    const { html, text } = renderEmailBodies(CABINET, {
       adminUrl: 'https://admin/x',
     });
     expect(html).toContain('Cabinet Corya Test');
-    expect(html).toContain('https://sig/x');
     expect(text).toContain('Cabinet Corya Test');
-    expect(text).toContain('https://sig/x');
     expect(text).toContain('https://admin/x');
   });
 
   it('escapes HTML metacharacters in the cabinet name', () => {
     const { html } = renderEmailBodies(
-      APPEL,
       { nom: 'Cabinet <b>Injection</b>' },
-      { pdfUrl: 'u', adminUrl: 'a' },
+      { adminUrl: 'https://admin.test' },
     );
     expect(html).not.toContain('<b>Injection</b>');
     expect(html).toContain('&lt;b&gt;Injection&lt;/b&gt;');
@@ -165,35 +154,23 @@ describe('renderEmailBodies', () => {
 });
 
 describe('sendRecapEmail', () => {
-  it('sends with from, to, cc, subject, text, html and PDF attachment', async () => {
+  it('sends with from, to, cc, subject, text and html without attachment', async () => {
     await sendRecapEmail({
       to: 'cabinet@example.com',
       cc: 'ops@example.com',
       appel: APPEL,
       cabinet: CABINET,
-      pdfUrl: 'https://sig/x',
       adminUrl: 'https://admin/x',
-      pdfBytes: Buffer.from('%PDF-fake'),
     });
     expect(sendMailMock).toHaveBeenCalledTimes(1);
     const message = sendMailMock.mock.calls[0]?.[0];
     if (!message) throw new Error('sendMail not invoked');
     expect(message.to).toBe('cabinet@example.com');
     expect(message.cc).toBe('ops@example.com');
-    expect(message.subject).toMatch(/Nouvel appel reçu/);
+    expect(message.subject).toMatch(/Nouveau récapitulatif disponible/);
     expect(typeof message.text).toBe('string');
     expect(typeof message.html).toBe('string');
-    const attachments = message.attachments as Array<{
-      filename: string;
-      contentType: string;
-      content: unknown;
-    }>;
-    expect(attachments).toHaveLength(1);
-    expect(attachments[0]).toMatchObject({
-      filename: `corya-recap-${APPEL.id}.pdf`,
-      contentType: 'application/pdf',
-    });
-    expect(Buffer.isBuffer(attachments[0].content)).toBe(true);
+    expect(message.attachments).toBeUndefined();
   });
 
   it('omits the cc field when cc is null', async () => {
@@ -202,9 +179,7 @@ describe('sendRecapEmail', () => {
       cc: null,
       appel: APPEL,
       cabinet: CABINET,
-      pdfUrl: 'https://sig/x',
       adminUrl: 'https://admin/x',
-      pdfBytes: Buffer.from('%PDF-fake'),
     });
     const message = sendMailMock.mock.calls[0]?.[0];
     if (!message) throw new Error('sendMail not invoked');
@@ -219,9 +194,7 @@ describe('sendRecapEmail', () => {
       cc: copy,
       appel: APPEL,
       cabinet: CABINET,
-      pdfUrl: 'https://sig/x',
       adminUrl: 'https://admin/x',
-      pdfBytes: Buffer.from('%PDF-fake'),
     });
 
     expect(JSON.stringify(loggerMock.info.mock.calls)).not.toContain(recipient);
@@ -240,9 +213,7 @@ describe('sendRecapEmail', () => {
         cc: null,
         appel: APPEL,
         cabinet: CABINET,
-        pdfUrl: 'u',
-        adminUrl: 'a',
-        pdfBytes: Buffer.from(''),
+        adminUrl: 'https://admin.test',
       }),
     ).rejects.toThrow(/smtp temporarily unavailable/);
     // 3 internal attempts consumed. Delays are 0,0,0 in tests/setup.ts so
@@ -261,9 +232,7 @@ describe('sendRecapEmail — retry policy (session 4 vague 3)', () => {
     cc: null,
     appel: APPEL,
     cabinet: CABINET,
-    pdfUrl: 'u',
-    adminUrl: 'a',
-    pdfBytes: Buffer.from(''),
+    adminUrl: 'https://admin.test',
   };
 
   it('retries after a transient failure and eventually succeeds', async () => {

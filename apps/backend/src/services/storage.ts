@@ -12,8 +12,9 @@
  *   - Upload uses `upsert: true`. Idempotence at the Storage layer means a
  *     retry after a partial upload doesn't fail with a 409 collision.
  *
- *   - Signed URLs are capped at 30 min (compliance.md § Storage). We do NOT
- *     expose a public URL helper — the bucket is private on purpose.
+ *   - Signed URLs are capped at 60 seconds and are consumed server-side by
+ *     the authenticated Portal BFF. They are never exposed to a browser or
+ *     email client.
  *
  *   - `ensureBucketAccessible()` runs at worker boot to fail LOUDLY if the
  *     bucket is missing or the service role can't reach it. Discovering
@@ -28,10 +29,10 @@ import { withTimeout } from '../utils/timeout.js';
 export const PDF_BUCKET = 'pdf-recaps';
 
 /** Max signed URL lifetime we ever grant (compliance-hard). */
-export const MAX_SIGNED_URL_TTL_SECONDS = 30 * 60;
+export const MAX_SIGNED_URL_TTL_SECONDS = 60;
 
-/** Default signed URL lifetime for emails. Kept explicit so callers see it. */
-export const DEFAULT_SIGNED_URL_TTL_SECONDS = 30 * 60;
+/** Default server-to-server ticket lifetime. */
+export const DEFAULT_SIGNED_URL_TTL_SECONDS = 60;
 
 /**
  * Compute the Storage object path for a given appel.
@@ -117,7 +118,7 @@ export async function uploadPdf(
 
 /**
  * Create a signed URL for the given object. `ttlSeconds` is clamped to
- * `MAX_SIGNED_URL_TTL_SECONDS` (30 min) — a caller cannot accidentally
+ * `MAX_SIGNED_URL_TTL_SECONDS` (60 seconds) — a caller cannot accidentally
  * grant a long-lived URL.
  */
 export async function createSignedPdfUrl(
