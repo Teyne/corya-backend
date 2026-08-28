@@ -16,6 +16,13 @@ const sendMailMock = vi.fn<(opts: SendMailOptions) => Promise<{ messageId: strin
   () => Promise.resolve({ messageId: '<id@test>' }),
 );
 const closeMock = vi.fn<() => void>();
+const loggerMock = vi.hoisted(() => ({
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+}));
+
+vi.mock('../../src/config/logger.js', () => ({ logger: loggerMock }));
 
 const {
   __setTemplateForTests,
@@ -204,6 +211,23 @@ describe('sendRecapEmail', () => {
     expect(message.cc).toBeUndefined();
   });
 
+  it('never writes recipient addresses to success logs', async () => {
+    const recipient = 'recipient-canary@example.invalid';
+    const copy = 'copy-canary@example.invalid';
+    await sendRecapEmail({
+      to: recipient,
+      cc: copy,
+      appel: APPEL,
+      cabinet: CABINET,
+      pdfUrl: 'https://sig/x',
+      adminUrl: 'https://admin/x',
+      pdfBytes: Buffer.from('%PDF-fake'),
+    });
+
+    expect(JSON.stringify(loggerMock.info.mock.calls)).not.toContain(recipient);
+    expect(JSON.stringify(loggerMock.info.mock.calls)).not.toContain(copy);
+  });
+
   it('propagates SMTP failures so the caller can trigger a retry (after exhausting internal attempts)', async () => {
     // Session 4 vague 3: the internal retry loop tries SMTP_RETRY_ATTEMPTS
     // times (3 in test setup). Persistent rejection must exhaust ALL of
@@ -262,6 +286,7 @@ describe('sendRecapEmail — retry policy (session 4 vague 3)', () => {
     await expect(sendRecapEmail(baseArgs)).rejects.toBeInstanceOf(PermanentEmailError);
     // Only ONE attempt — no retries burned on a doomed send.
     expect(sendMailMock).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(loggerMock.error.mock.calls)).not.toContain(baseArgs.to);
   });
 
   it('throws PermanentEmailError immediately on SMTP 553 (bad address syntax)', async () => {
@@ -298,5 +323,6 @@ describe('sendRecapEmail — retry policy (session 4 vague 3)', () => {
       .mockResolvedValueOnce({ messageId: '<ok@x>' });
     await expect(sendRecapEmail(baseArgs)).resolves.toBeUndefined();
     expect(sendMailMock).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(loggerMock.warn.mock.calls)).not.toContain(baseArgs.to);
   });
 });
