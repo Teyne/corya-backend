@@ -22,9 +22,9 @@
  * ---------------------------------------------------------------------------
  * Logging
  * ---------------------------------------------------------------------------
- * The recipient address (`to`) is the CABINET's inbox — not patient PII —
- * and can safely be logged for support. Patient name/phone/motif from the
- * appel NEVER touch this file's log lines.
+ * Recipient addresses are operational personal data and must not enter logs.
+ * Only technical identifiers, retry state and allowlisted error fields are
+ * emitted. Patient name/phone/motif never touch this file's log lines.
  */
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -517,11 +517,8 @@ export async function sendRecapEmail(args: {
         'smtp:sendMail',
       )) as unknown as { messageId?: string };
 
-      // `to` is a cabinet-owned address, safe to log.
       logger.info(
         {
-          to,
-          cc: cc ?? null,
           appel_id: appel.id,
           message_id: info.messageId ?? null,
           attempt,
@@ -541,7 +538,6 @@ export async function sendRecapEmail(args: {
         // subject in verbose modes. Class + code is enough.
         logger.error(
           {
-            to,
             appel_id: appel.id,
             attempt,
             smtp_code: smtpCode,
@@ -556,7 +552,6 @@ export async function sendRecapEmail(args: {
       const willRetry = attempt < attempts;
       logger.warn(
         {
-          to,
           appel_id: appel.id,
           attempt,
           max_attempts: attempts,
