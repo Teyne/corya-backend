@@ -22,20 +22,24 @@ mesuré à 689,4 Mio et sans processus Chromium résiduel.
 Ne pas démarrer corya-api et corya-worker dans le même environnement.
 N'ajouter ni PostgreSQL, ni autre base, ni bucket dans Jelastic.
 
-## Déploiement immuable validé
+## Déploiement précompilé et traçable
 
 Le premier essai du 4 août 2026 utilisait une archive de sources, suivie de
 `npm ci` et `npm run build` sur chaque nœud. Cette procédure a révélé une course
 de démarrage : Jelastic pouvait lancer PM2 avant la création de
 `dist/server.js` ou `dist/worker.js`. Elle a été remplacée par une archive
-précompilée et immuable, construite hors Jelastic depuis un SHA Git exact.
+précompilée, construite hors Jelastic depuis un SHA Git exact et accompagnée
+d'un manifeste vérifiable.
 
 L'archive contient au minimum `dist/` (y
 compris les templates copiés), `package.json`, `package-lock.json` et
 `ecosystem.config.cjs`. Elle ne contient jamais `.env`, `.env.local`, secret,
-log, dump, fixture métier ni `node_modules`. Le SHA et le condensat de
-l'archive doivent être consignés, et la même archive doit être déployée dans
-les environnements API et worker.
+log, dump, fixture métier ni `node_modules`. Le SHA Git, le condensat de
+l'archive et les condensats des fichiers doivent être consignés, et la même
+archive doit être déployée dans les environnements API et worker. Comme
+`node_modules` et Chromium sont installés sur chaque cible, cette procédure
+garantit la provenance du code et du lockfile, pas une identité binaire complète
+des dépendances. Une image OCI déployée par digest reste la cible forte.
 
 Publication validée le 4 août 2026 :
 
@@ -63,11 +67,36 @@ apps/backend/.
 cd apps/backend
 npm ci
 npm run build
+npm run artifact:create
+npm run artifact:verify
 ~~~
+
+Le workflow GitHub `Build backend release artifact` exécute ces étapes depuis
+un SHA exact, crée une archive de transport et son SHA-256, puis les conserve
+pendant 14 jours. Il ne déploie rien. Son déclenchement est manuel ou limité
+aux tags `backend-v*`.
+
+Le manifeste `artifact-manifest.json` contient le SHA Git complet, les versions
+Node/npm, le modèle d'installation et le SHA-256 de chaque fichier allowlisté.
+`SHA256SUMS` fournit le même contrôle sous une forme standard. Le vérificateur
+refuse tout fichier ajouté, supprimé ou modifié ainsi que les liens symboliques,
+sources maps, fichiers `.env`, logs, dumps et `node_modules`. Le scan Gitleaks
+de la CI couvre séparément les secrets présents dans les contenus et l'historique.
 
 Ces commandes décrivent uniquement le pipeline de fabrication externe. Aucun
 build TypeScript ne doit être lancé au démarrage ou après le déploiement de
 l'archive précompilée.
+
+Sur chaque cible, installer les dépendances de production depuis le lockfile
+avant démarrage :
+
+~~~bash
+npm ci --omit=dev
+~~~
+
+Le rapport de déploiement doit relever le SHA Git du manifeste, le SHA-256 de
+l'archive, `node --version`, `npm --version`, `npm ls --omit=dev` et la version
+Chromium. Une différence entre API et worker bloque la mise en service.
 
 Avant le démarrage, exécuter le préflight du rôle. Il lit uniquement
 process.env, ne charge aucun fichier dotenv et n'affiche jamais les valeurs.

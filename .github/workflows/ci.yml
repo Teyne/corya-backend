@@ -1,0 +1,81 @@
+name: Backend CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: backend-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/backend
+    steps:
+      - name: Checkout exact revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
+        with:
+          node-version-file: apps/backend/.nvmrc
+          cache: npm
+          cache-dependency-path: apps/backend/package-lock.json
+
+      - name: Install exact dependencies
+        run: npm ci --include=dev
+
+      - name: Reject lockfile drift
+        run: git diff --exit-code -- package-lock.json
+
+      - name: Unit tests
+        run: npm test -- --run --maxWorkers=1
+
+      - name: End-to-end tests
+        run: npm run test:e2e
+
+      - name: Type check
+        run: npm run type-check
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Chromium PDF smoke test
+        run: node scripts/smoke-puppeteer.mjs --renders 1
+
+      - name: Dependency audit
+        run: npm audit --audit-level=high
+
+      - name: Reject generated changes and whitespace errors
+        working-directory: .
+        run: |
+          git diff --check
+          git diff --exit-code
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout complete history
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scan Git history for secrets
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

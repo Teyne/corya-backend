@@ -1,0 +1,67 @@
+name: Build backend release artifact
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['backend-v*']
+
+permissions:
+  contents: read
+
+jobs:
+  artifact:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/backend
+    steps:
+      - name: Checkout exact revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
+        with:
+          node-version-file: apps/backend/.nvmrc
+          cache: npm
+          cache-dependency-path: apps/backend/package-lock.json
+
+      - name: Install exact dependencies
+        run: npm ci --include=dev
+
+      - name: Validate source revision
+        run: |
+          git diff --exit-code -- package-lock.json
+          npm test -- --run --maxWorkers=1
+          npm run test:e2e
+          npm run type-check
+          npm run lint
+          npm audit --audit-level=high
+
+      - name: Build once
+        run: npm run build
+
+      - name: Create and verify allowlisted payload
+        run: |
+          npm run artifact:create
+          npm run artifact:verify
+
+      - name: Create deterministic transport archive and checksum
+        run: |
+          mkdir -p release-output
+          artifact_dir="$(find release-artifact -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          artifact_name="$(basename "$artifact_dir")"
+          tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+            -czf "release-output/${artifact_name}.tar.gz" -C release-artifact "$artifact_name"
+          sha256sum "release-output/${artifact_name}.tar.gz" \
+            > "release-output/${artifact_name}.tar.gz.sha256"
+
+      - name: Upload only the validated transport archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: corya-backend-${{ github.sha }}
+          path: apps/backend/release-output/*
+          if-no-files-found: error
+          retention-days: 14
