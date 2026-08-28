@@ -143,6 +143,7 @@ function dependencies(): AdminRouterDependencies {
           : cabinet.config_agent,
     })),
     signPdf: vi.fn(async () => 'https://storage.example.test/signed'),
+    recordPdfAuthorization: vi.fn(async () => undefined),
     getCalcomStatus: vi.fn(async () => ({
       connectionId: null,
       status: null,
@@ -442,13 +443,16 @@ describe('portal admin call DTOs and pagination', () => {
 });
 
 describe('portal admin PDF signing', () => {
-  it('signs only the expected cabinet path with a five-minute TTL and no-store', async () => {
+  it('audits then signs only the expected cabinet path with a 60-second TTL and no-store', async () => {
     const deps = dependencies();
     const response = await request(appFor(deps)).post(`/admin/calls/${CALL_ID}/pdf-url`).set(bearer());
 
     expect(response.status).toBe(200);
-    expect(response.body).toEqual({ url: 'https://storage.example.test/signed', expiresIn: 300 });
-    expect(deps.signPdf).toHaveBeenCalledWith(`${CABINET_A}/2026-08/${CALL_ID}.pdf`, 300);
+    expect(response.body).toEqual({ url: 'https://storage.example.test/signed', expiresIn: 60 });
+    expect(deps.recordPdfAuthorization).toHaveBeenCalledWith(CABINET_A, USER_ID, CALL_ID);
+    expect(deps.signPdf).toHaveBeenCalledWith(`${CABINET_A}/2026-08/${CALL_ID}.pdf`, 60);
+    expect(vi.mocked(deps.recordPdfAuthorization).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(deps.signPdf).mock.invocationCallOrder[0] ?? Number.MAX_SAFE_INTEGER);
     expect(response.headers['cache-control']).toBe('private, no-store');
   });
 
@@ -464,6 +468,19 @@ describe('portal admin PDF signing', () => {
 
     expect(idor.status).toBe(404);
     expect(wrongPath.status).toBe(404);
+    expect(deps.signPdf).not.toHaveBeenCalled();
+    expect(deps.recordPdfAuthorization).not.toHaveBeenCalled();
+  });
+
+  it('fails closed and never signs when the authorization audit fails', async () => {
+    const deps = dependencies();
+    vi.mocked(deps.recordPdfAuthorization).mockRejectedValue(new Error('audit unavailable'));
+    const response = await request(appFor(deps))
+      .post(`/admin/calls/${CALL_ID}/pdf-url`)
+      .set(bearer());
+
+    expect(response.status).toBe(500);
+    expect(response.body).toEqual({ error: 'internal_server_error' });
     expect(deps.signPdf).not.toHaveBeenCalled();
   });
 });

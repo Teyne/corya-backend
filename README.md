@@ -4,7 +4,7 @@ Backend de Corya pour la réception des appels Retell, la persistance Supabase e
 
 ## Flux réel
 
-`Retell -> webhook Express signé -> Supabase -> worker -> PDF Puppeteer -> Storage privé -> e-mail Infomaniak`
+`Retell -> webhook Express signé -> Supabase -> worker -> PDF Puppeteer -> Storage privé -> notification Infomaniak -> Portail authentifié`
 
 Le même processus worker exécute deux boucles indépendantes : la file `jobs` et l'outbox de suppressions physiques. Chacune possède son propre heartbeat. Les migrations Supabase sont dans `supabase/migrations/`.
 

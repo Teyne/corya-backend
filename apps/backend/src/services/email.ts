@@ -131,8 +131,7 @@ function getTransporter(): Transporter {
     auth: { user: cfg.user, pass: cfg.password },
     pool: true,
     maxConnections: 3,
-    // nLPD compliance (session 3.1 audit): the recap email carries the
-    // PDF as an attachment, which contains patient PII + transcript.
+    // Require transport encryption even though the notification is minimal.
     // `secure: true` opens an implicit TLS socket (port 465). For any
     // non-implicit-TLS port (587/25), Nodemailer only issues STARTTLS
     // OPPORTUNISTICALLY — if the server does not advertise STARTTLS, the
@@ -208,90 +207,17 @@ function htmlEscape(input: string): string {
     .replace(/'/g, '&#39;');
 }
 
-const RESULTAT_LABELS: Record<string, string> = {
-  rdv_pris: 'Rendez-vous pris',
-  message: 'Message à traiter',
-  transfere: 'Appel transféré',
-  urgence: 'Urgence signalée',
-  echec: 'Échec (à rappeler)',
-  refus: 'Refus / annulation',
-};
-
-const DISPLAY_TIME_ZONE = 'Europe/Zurich';
-
-function actionText(resultat: string | null): string {
-  switch (resultat) {
-    case 'rdv_pris':
-      return 'Rendez-vous confirmé — aucune action requise, à titre d\'information.';
-    case 'urgence':
-      return 'Urgence signalée par le patient. Rappeler dès que possible.';
-    case 'echec':
-    case 'refus':
-      return 'Appel non concluant. À rappeler pour un suivi.';
-    case 'message':
-      return 'Message laissé par le patient. Traiter dans la journée.';
-    case 'transfere':
-      return 'Appel transféré à un praticien. Aucune action supplémentaire.';
-    default:
-      return 'Résultat non catégorisé. Consulter le PDF ci-joint.';
-  }
-}
-
-function formatDate(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  // fr-CH format — Node bundles ICU by default on modern Windows/Linux
-  // (Alpine builds may not — safeguard with a fallback).
-  try {
-    return d.toLocaleString('fr-CH', {
-      timeZone: DISPLAY_TIME_ZONE,
-      day: '2-digit',
-      month: 'long',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-    });
-  } catch {
-    return d.toISOString().replace('T', ' ').slice(0, 16);
-  }
-}
-
-function formatDuree(secs: number | null): string {
-  if (secs === null || !Number.isFinite(secs) || secs < 0) return '—';
-  const m = Math.floor(secs / 60);
-  const s = Math.floor(secs % 60);
-  if (m === 0) return `${s} s`;
-  return `${m} min ${s < 10 ? '0' : ''}${s} s`;
-}
-
 /**
- * Build the HTML + plain-text bodies. Exported for tests so we can assert
- * on the output without touching SMTP.
+ * Build a deliberately minimal notification. Call details, results, free
+ * text and storage links remain inside the authenticated portal.
  */
 export function renderEmailBodies(
-  appel: AppelProcessingRow,
   cabinet: Pick<CabinetProcessingRow, 'nom'>,
-  ctx: { pdfUrl: string; adminUrl: string },
+  ctx: { adminUrl: string },
 ): { html: string; text: string; subject: string } {
   const tpl = loadTemplate();
-  const resultatLabel = appel.resultat
-    ? RESULTAT_LABELS[appel.resultat] ?? appel.resultat
-    : '—';
-  const action = actionText(appel.resultat);
-  const dateHeure = formatDate(appel.date_appel);
-  const duree = formatDuree(appel.duree_secondes);
-  const motif = appel.motif_appel && appel.motif_appel.length > 0 ? appel.motif_appel : '—';
-
   const substitutions: Record<string, string> = {
     '{{CABINET_NOM}}': htmlEscape(cabinet.nom),
-    '{{DATE_HEURE}}': htmlEscape(dateHeure),
-    '{{DUREE}}': htmlEscape(duree),
-    '{{MOTIF}}': htmlEscape(motif),
-    '{{ACTION}}': htmlEscape(action),
-    '{{RESULTAT_LABEL}}': htmlEscape(resultatLabel),
-    // URLs come from our own code — signed URL from storage.ts and
-    // ADMIN_APP_URL from env. Safe as-is in href, still escape to be tidy.
-    '{{PDF_URL}}': htmlEscape(ctx.pdfUrl),
     '{{ADMIN_URL}}': htmlEscape(ctx.adminUrl),
   };
 
@@ -300,41 +226,17 @@ export function renderEmailBodies(
     html = html.split(needle).join(value);
   }
 
-  // Plain-text fallback for clients that reject HTML. Kept short and
-  // action-first — the PDF is the source of truth.
   const text = [
-    `Corya — Nouvel appel reçu pour ${cabinet.nom}`,
+    `Corya — Nouveau récapitulatif disponible pour ${cabinet.nom}`,
     '',
-    `Date : ${dateHeure}`,
-    `Durée : ${duree}`,
-    `Motif : ${motif}`,
-    `Résultat : ${resultatLabel}`,
+    'Un nouveau récapitulatif est disponible dans votre espace sécurisé.',
     '',
-    action,
-    '',
-    `PDF récap (lien valable 30 min) : ${ctx.pdfUrl}`,
     `Portail Corya : ${ctx.adminUrl}`,
-    '',
-    'Le récapitulatif est également joint à cet email.',
     '',
     'Cet email est envoyé automatiquement, ne pas y répondre.',
     'Support : support@corya.ch',
   ].join('\n');
-
-  const subjectHour = (() => {
-    const d = new Date(appel.date_appel);
-    if (Number.isNaN(d.getTime())) return '';
-    try {
-      return d.toLocaleTimeString('fr-CH', {
-        timeZone: DISPLAY_TIME_ZONE,
-        hour: '2-digit',
-        minute: '2-digit',
-      });
-    } catch {
-      return d.toISOString().slice(11, 16);
-    }
-  })();
-  const subject = `Nouvel appel reçu — ${cabinet.nom} — ${subjectHour}`;
+  const subject = `Nouveau récapitulatif disponible — ${cabinet.nom}`;
 
   return { html, text, subject };
 }
@@ -464,23 +366,18 @@ function sleep(ms: number): Promise<void> {
  *     own socket-level timeouts (see getTransporter) — belt AND braces
  *     to guarantee no leaked handle.
  *
- * Never logs patient data: `to` / `cc` are cabinet addresses, `appel_id`
- * and `messageId` are technical identifiers.
+ * Never logs patient data or recipient addresses. `appel_id` and messageId
+ * are technical identifiers only.
  */
 export async function sendRecapEmail(args: {
   to: string;
   cc: string | null;
   appel: AppelProcessingRow;
   cabinet: Pick<CabinetProcessingRow, 'nom'>;
-  pdfUrl: string;
   adminUrl: string;
-  pdfBytes: Buffer;
 }): Promise<void> {
-  const { to, cc, appel, cabinet, pdfUrl, adminUrl, pdfBytes } = args;
-  const { html, text, subject } = renderEmailBodies(appel, cabinet, {
-    pdfUrl,
-    adminUrl,
-  });
+  const { to, cc, appel, cabinet, adminUrl } = args;
+  const { html, text, subject } = renderEmailBodies(cabinet, { adminUrl });
 
   const cfg = assertSmtpConfigured();
 
@@ -490,13 +387,6 @@ export async function sendRecapEmail(args: {
     subject,
     text,
     html,
-    attachments: [
-      {
-        filename: `corya-recap-${appel.id}.pdf`,
-        content: pdfBytes,
-        contentType: 'application/pdf',
-      },
-    ],
   };
   if (cc && cc.length > 0) {
     message.cc = cc;
@@ -534,8 +424,7 @@ export async function sendRecapEmail(args: {
       if (classification === 'permanent') {
         // Loud log — this is the ops-critical event for a bad recipient.
         // No err.message: nodemailer may echo the recipient address which
-        // is a cabinet address (safe) but can also include the message
-        // subject in verbose modes. Class + code is enough.
+        // and subject. Class + code is enough.
         logger.error(
           {
             appel_id: appel.id,

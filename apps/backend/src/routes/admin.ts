@@ -166,6 +166,7 @@ export interface AdminRouterDependencies {
     expectedUpdatedAt: string,
   ): Promise<PortalCabinetRow>;
   signPdf(path: string, ttlSeconds: number): Promise<string>;
+  recordPdfAuthorization(cabinetId: string, actorUserId: string, callId: string): Promise<void>;
   getCalcomStatus(cabinetId: string): Promise<CalcomConnectionStatus | null>;
   connectCalcom(cabinetId: string, actorUserId: string): Promise<{ authorizationUrl: string }>;
   disconnectCalcom(cabinetId: string, actorUserId: string): Promise<void>;
@@ -202,6 +203,8 @@ const defaultDependencies: AdminRouterDependencies = {
       expectedUpdatedAt,
     ),
   signPdf: createSignedPdfUrl,
+  recordPdfAuthorization: (cabinetId, actorUserId, callId) =>
+    portalQueries.recordPortalPdfDownloadAuthorization(cabinetId, actorUserId, callId),
   getCalcomStatus: portalQueries.getCalcomConnectionStatus,
   connectCalcom: async (cabinetId, actorUserId) => {
     const started = await startCalcomOAuth(
@@ -649,7 +652,12 @@ export function buildAdminRouter(
       res.status(404).json({ error: 'not_found' });
       return;
     }
-    const expiresIn = 300;
+    await dependencies.recordPdfAuthorization(
+      ctx.membership.cabinetId,
+      ctx.user.id,
+      row.id,
+    );
+    const expiresIn = 60;
     const url = await dependencies.signPdf(expected, expiresIn);
     res.json({ url, expiresIn });
   });

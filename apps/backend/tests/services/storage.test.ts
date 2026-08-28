@@ -101,7 +101,7 @@ describe('uploadPdf', () => {
 });
 
 describe('createSignedPdfUrl', () => {
-  it('clamps the TTL to MAX_SIGNED_URL_TTL_SECONDS (30 min)', async () => {
+  it('clamps the TTL to MAX_SIGNED_URL_TTL_SECONDS (60 seconds)', async () => {
     createSignedUrlMock.mockResolvedValue({
       data: { signedUrl: 'https://example/sig' },
       error: null,

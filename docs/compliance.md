@@ -150,7 +150,7 @@ Statut du PDF vis-à-vis du patient :
 
 - Le PDF n'est **PAS un livrable long terme destiné au patient**. C'est un artefact opérationnel destiné au cabinet (traitement du dossier, prise de RDV, rappel).
 - Le patient qui exerce son droit d'accès (art. 25 nLPD) reçoit ce que Corya détient au moment de la demande. Après J+30 il ne reste plus, côté Corya, que la ligne `appels` avec le `transcript_anonymise` et des métadonnées non identifiantes. Ceci est cohérent avec le principe de minimisation (art. 6 nLPD) et documenté dans la politique de confidentialité.
-- Si le cabinet veut conserver plus longtemps le récap, il télécharge le PDF depuis l'email dans la fenêtre de 30 jours et le stocke dans son propre système (le cabinet, en tant que responsable de traitement, choisit sa propre durée de conservation).
+- Si le cabinet veut conserver plus longtemps le récap, il le télécharge depuis le portail authentifié dans la fenêtre de 30 jours et le stocke dans son propre système (le cabinet, en tant que responsable de traitement, choisit sa propre durée de conservation). L'e-mail ne contient ni document, ni URL Storage signée, ni détail d'appel.
 
 Pour une extension future qui offrirait au patient un espace de consultation persistant, prévoir un flux séparé avec un contenu anonymisé aligné sur ce qui reste en base à J+7.
 

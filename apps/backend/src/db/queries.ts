@@ -1883,6 +1883,25 @@ export async function getPortalCall(
   return data ?? null;
 }
 
+/** Fail-closed technical audit written before a PDF ticket is issued. */
+export async function recordPortalPdfDownloadAuthorization(
+  cabinetId: string,
+  actorUserId: string,
+  callId: string,
+): Promise<void> {
+  const { data, error } = (await withDbTimeout(
+    (signal) => getServiceClient()
+      .rpc('record_portal_pdf_download_authorization', {
+        p_cabinet_id: cabinetId,
+        p_actor_user_id: actorUserId,
+        p_call_id: callId,
+      })
+      .abortSignal(signal),
+    'db:recordPortalPdfDownloadAuthorization',
+  )) as { data: string | null; error: { message: string } | null };
+  if (error || !data) throw new Error('portal_pdf_audit_failed');
+}
+
 export async function listPortalTeam(cabinetId: string): Promise<PortalTeamRow[]> {
   const { data, error } = (await withDbTimeout(
     (signal) => getServiceClient().rpc('list_portal_team_summaries', {

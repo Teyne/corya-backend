@@ -62,9 +62,6 @@ vi.mock('../../src/services/pdf.js', () => ({
 const uploadPdfMock = vi.fn<(path: string, bytes: Buffer) => Promise<{ objectPath: string }>>(
   (path: string) => Promise.resolve({ objectPath: path }),
 );
-const createSignedPdfUrlMock = vi.fn<(path: string, ttl?: number) => Promise<string>>(
-  () => Promise.resolve('https://signed/url'),
-);
 vi.mock('../../src/services/storage.js', async () => {
   // Keep the REAL buildPdfObjectPath (pure function, no supabase calls).
   const actual = await vi.importActual<typeof StorageModule>(
@@ -73,7 +70,6 @@ vi.mock('../../src/services/storage.js', async () => {
   return {
     ...actual,
     uploadPdf: uploadPdfMock,
-    createSignedPdfUrl: createSignedPdfUrlMock,
   };
 });
 
@@ -82,9 +78,7 @@ interface SendRecapEmailArgs {
   cc: string | null;
   appel: { id: string };
   cabinet: { nom: string };
-  pdfUrl: string;
   adminUrl: string;
-  pdfBytes: Buffer;
 }
 const sendRecapEmailMock = vi.fn<(args: SendRecapEmailArgs) => Promise<void>>(
   () => Promise.resolve(undefined),
@@ -208,7 +202,6 @@ beforeEach(() => {
   uploadPdfMock
     .mockReset()
     .mockImplementation((path: string) => Promise.resolve({ objectPath: path }));
-  createSignedPdfUrlMock.mockReset().mockResolvedValue('https://signed/url');
   sendRecapEmailMock.mockReset().mockResolvedValue(undefined);
   capture.chunks.length = 0;
 });
@@ -239,7 +232,7 @@ describe('processAppelJob — happy path', () => {
     expect(sendRecapEmailMock.mock.calls[0]?.[0]).toMatchObject({
       to: CABINET_ROW.email_notification,
       cc: null,
-      pdfUrl: 'https://signed/url',
+      adminUrl: `http://localhost:3001/calls/${APPEL_ID}`,
     });
     expect(markAppelEmailSentMock).toHaveBeenCalledWith(APPEL_ID);
     // Two checkpoints: after upload, after email sent.
@@ -365,6 +358,7 @@ describe('processAppelJob — idempotence on retry', () => {
     await processAppelJob(preCheckpointed);
 
     // Upload skipped.
+    expect(renderAppelPdfMock).not.toHaveBeenCalled();
     expect(uploadPdfMock).not.toHaveBeenCalled();
     expect(setAppelPdfPathMock).not.toHaveBeenCalled();
     // Email still sent.

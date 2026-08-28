@@ -47,13 +47,12 @@ const { __setReceiptTransporterForTests } = await import(
 const EMAIL_TEMPLATE = `
 <html><body>
 <h1>{{CABINET_NOM}}</h1>
-<p>{{DATE_HEURE}} - {{DUREE}} - {{MOTIF}} - {{RESULTAT_LABEL}} - {{ACTION}}</p>
-<a href="{{PDF_URL}}">pdf</a><a href="{{ADMIN_URL}}">admin</a>
+<a href="{{ADMIN_URL}}">admin</a>
 </body></html>`;
 
 // Storage helpers are mocked at the top of each block that needs them.
-// The worker's appel-processor calls uploadPdf + createSignedPdfUrl on
-// the happy path; we short-circuit those to keep the harness hermetic.
+// The worker's appel-processor uploads the PDF on the happy path; we
+// short-circuit Storage to keep the harness hermetic.
 const { default: puppeteerMock } = await import('puppeteer');
 void puppeteerMock; // silence unused import warning
 
@@ -71,11 +70,6 @@ type StorageWithSetters = typeof storageModule & {
 // namespace object at test time (module records live in a mutable Map).
 Object.defineProperty(storageModule, 'uploadPdf', {
   value: (path: string) => Promise.resolve({ objectPath: path }),
-  writable: true,
-  configurable: true,
-});
-Object.defineProperty(storageModule, 'createSignedPdfUrl', {
-  value: () => Promise.resolve('https://signed-e2e/url'),
   writable: true,
   configurable: true,
 });
