@@ -2,9 +2,11 @@
 
 État revu le 25 août 2026. Le schéma versionné couvre Wave 7, l'intake Retell
 atomique, le portail multi-tenant et le registre/réconciliation Cal.com. Les
-environnements Jelastic API et worker sont déployés depuis le même artefact
-précompilé immuable ; leur provenance exacte et leurs condensats sont relevés
-dans chaque rapport de déploiement. L'environnement reste une démonstration
+environnements Jelastic API et worker sont déployés depuis le même paquet
+précompilé et vérifié ; le SHA Git et les condensats de chaque fichier livré
+sont inscrits dans son manifeste. Comme les dépendances de production sont
+encore installées sur chaque cible, il s'agit d'une transition traçable et non
+d'une immutabilité binaire de bout en bout. L'environnement reste une démonstration
 contrôlée, sans ouverture à de vrais patients.
 
 ## Composants

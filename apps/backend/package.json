@@ -2,16 +2,19 @@
   "name": "@corya/backend",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "npm@11.15.0",
   "description": "Corya backend api.corya.ch — webhooks Retell, PDF, email, purges nLPD.",
   "type": "module",
   "engines": {
-    "node": "^24.0.0"
+    "node": "24.18.0"
   },
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "worker": "node dist/worker.js",
     "worker:dev": "tsx watch src/worker.ts",
     "build": "tsc -p tsconfig.build.json && node scripts/copy-templates.mjs",
+    "artifact:create": "node scripts/create-release-artifact.mjs",
+    "artifact:verify": "node scripts/verify-release-artifact.mjs",
     "start": "node dist/server.js",
     "test": "vitest run",
     "test:watch": "vitest",

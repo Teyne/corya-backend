@@ -13,6 +13,8 @@ node_modules/
 # Build outputs
 dist/
 build/
+apps/backend/release-artifact/
+apps/backend/release-output/
 .next/
 out/
 

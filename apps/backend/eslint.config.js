@@ -46,6 +46,9 @@ export default tseslint.config(
       'eslint.config.js',
       'scripts/preflight-jelastic.mjs',
       'scripts/smoke-puppeteer.mjs',
+      'scripts/create-release-artifact.mjs',
+      'scripts/release-artifact-lib.mjs',
+      'scripts/verify-release-artifact.mjs',
     ],
     ...tseslint.configs.disableTypeChecked,
     languageOptions: {
