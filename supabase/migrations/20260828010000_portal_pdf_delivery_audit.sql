@@ -14,13 +14,22 @@ ALTER TABLE public.portal_audit_events
     CHECK (action IN (
       'settings_updated',
       'assistant_updated',
+      'team_member_invited',
+      'team_member_role_updated',
+      'team_member_disabled',
       'pdf_download_authorized'
     )),
   ADD CONSTRAINT portal_audit_events_changed_fields_shape_check
     CHECK (
       pg_catalog.array_position(changed_fields, NULL) IS NULL
       AND (
-        (action IN ('settings_updated', 'assistant_updated')
+        (action IN (
+          'settings_updated',
+          'assistant_updated',
+          'team_member_invited',
+          'team_member_role_updated',
+          'team_member_disabled'
+        )
           AND pg_catalog.cardinality(changed_fields) BETWEEN 1 AND 13)
         OR
         (action = 'pdf_download_authorized'
@@ -41,6 +50,15 @@ ALTER TABLE public.portal_audit_events
         'transferRules', 'maskedTransferNumber', 'emergencyProtocol',
         'shareableInformation', 'minimalCollection', 'confirmAppointments'
       ]::TEXT[])
+      OR
+      (action = 'team_member_invited'
+        AND changed_fields <@ ARRAY['role', 'status']::TEXT[])
+      OR
+      (action = 'team_member_role_updated'
+        AND changed_fields <@ ARRAY['role']::TEXT[])
+      OR
+      (action = 'team_member_disabled'
+        AND changed_fields <@ ARRAY['status']::TEXT[])
       OR
       (action = 'pdf_download_authorized' AND changed_fields = ARRAY[]::TEXT[])
     ),
