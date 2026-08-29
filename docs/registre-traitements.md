@@ -261,7 +261,7 @@ tout envoi de journaux.
 
 ## Traitement n° 6 — Authentification des administrateurs Corya *(traitement PRÉVU, NON ACTIF)*
 
-**Statut** : **prévu, non encore actif à la date de ce registre**. Le mécanisme applicatif d'authentification par lien magique (Supabase Auth) est planifié pour une prochaine étape du projet (session de développement n° 5) et le back-office admin `app.corya.ch` n'est pas exposé à ce jour. Une table technique de comptes administrateurs existe en base pour préparer ce futur déploiement mais n'est référencée par aucun flux d'authentification actif. Cette entrée est publiée par anticipation ; elle sera revue et confirmée lors de la mise en service.
+**Statut** : **prévu, non encore actif à la date de ce registre**. Le mécanisme applicatif d'authentification par lien magique (Supabase Auth) est planifié pour une prochaine étape du projet (session de développement n° 5) et le back-office admin `portail.corya.ch` n'est pas exposé à ce jour. Une table technique de comptes administrateurs existe en base pour préparer ce futur déploiement mais n'est référencée par aucun flux d'authentification actif. Cette entrée est publiée par anticipation ; elle sera revue et confirmée lors de la mise en service.
 
 **Finalité (envisagée)** : contrôler l'accès au back-office d'administration de Corya, restreint à un nombre très limité de personnes désignées (fondateur et, le cas échéant, un second administrateur).
 

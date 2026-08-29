@@ -81,7 +81,7 @@ Base : `@typescript-eslint` preset `recommended-type-checked`, plus :
 | `@typescript-eslint/no-floating-promises` | error | Critique : une promesse non attendue dans le flow webhook = PDF ou email perdu silencieusement |
 | `@typescript-eslint/consistent-type-imports` | warn | Imports de types explicites |
 
-## Frontend app.corya.ch
+## Frontend portail.corya.ch
 
 | Composant | Choix verrouillé | Alternative écartée |
 |---|---|---|
